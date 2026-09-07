@@ -151,6 +151,15 @@ export interface TTSStatus {
   implemented: boolean
   message: string
 }
+export interface TTSSynthesizeOptions {
+  speaker?: string
+  language?: string
+  instruct?: string
+}
+export interface TTSSynthesizeResult {
+  file: string
+  path: string
+}
 
 // ------------------------------ tasks ------------------------------
 export type TaskStatus =
@@ -196,9 +205,12 @@ export interface AppConfig {
   }
   tts: {
     enabled: boolean
+    model: string
+    speaker: string
+    language: string
+    device: string
     api_base: string
     api_key: string
-    model: string
     voice: string
     concurrency: number
   }

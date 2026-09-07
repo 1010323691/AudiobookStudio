@@ -250,36 +250,39 @@ async function save() {
         </CardContent>
       </Card>
 
-      <!-- TTS (reserved) -->
+      <!-- TTS（本地 Qwen3-TTS 引擎） -->
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2">
             <Mic class="h-5 w-5" />TTS 合成
-            <Badge variant="secondary" class="ml-1">即将推出</Badge>
+            <Badge variant="success" class="ml-1">本地引擎</Badge>
           </CardTitle>
         </CardHeader>
-        <CardContent class="space-y-3 opacity-70">
-          <div class="flex items-center gap-3">
-            <Label class="w-24 shrink-0">启用</Label>
-            <Switch v-model="draft.tts.enabled" :disabled="true" />
-            <span class="text-xs text-muted-foreground">实装后方可启用</span>
-          </div>
+        <CardContent class="space-y-3">
+          <p class="text-xs text-muted-foreground">
+            本地 Qwen3-TTS 引擎，运行在独立的 <code class="text-xs">.venv-tts</code> 环境（Python 3.10 · GPU）。
+            若尚未安装，请在项目根目录运行 <code class="text-xs">install_tts_env.ps1</code>。
+          </p>
           <div class="grid gap-3 sm:grid-cols-2">
             <div class="space-y-1.5">
-              <Label>API 地址</Label>
-              <Input v-model="draft.tts.api_base" disabled placeholder="预留" />
-            </div>
-            <div class="space-y-1.5">
               <Label>模型</Label>
-              <Input v-model="draft.tts.model" disabled placeholder="预留" />
+              <Input v-model="draft.tts.model" placeholder="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" />
             </div>
             <div class="space-y-1.5">
-              <Label>音色</Label>
-              <Input v-model="draft.tts.voice" disabled placeholder="预留" />
+              <Label>音色 (speaker)</Label>
+              <Input v-model="draft.tts.speaker" placeholder="serena" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>语言</Label>
+              <Input v-model="draft.tts.language" placeholder="chinese" />
             </div>
             <div class="flex items-center gap-3">
-              <Label class="w-16 shrink-0">并发</Label>
-              <Input v-model.number="draft.tts.concurrency" type="number" min="1" disabled class="max-w-[100px]" />
+              <Label class="w-16 shrink-0">设备</Label>
+              <Select v-model="draft.tts.device" class="max-w-[150px]">
+                <option value="auto">自动 (auto)</option>
+                <option value="cuda">CUDA（GPU）</option>
+                <option value="cpu">CPU</option>
+              </Select>
             </div>
           </div>
         </CardContent>

@@ -1,12 +1,17 @@
 import { http } from './client'
-import type { TTSStatus } from '@/types'
+import type { TTSStatus, TTSSynthesizeOptions } from '@/types'
 
-/** Report whether TTS is implemented, so the UI shows an accurate badge. */
+/** Report whether TTS is implemented (ready vs. engine-not-installed). */
 export function ttsStatus(): Promise<TTSStatus> {
   return http.get<TTSStatus>('/api/tts/status')
 }
 
-/** Placeholder — the backend returns 501 until a provider is added. */
-export function synthesize(path: string): Promise<unknown> {
-  return http.post<unknown>('/api/tts/synthesize', { path })
+/** Start a TTS synthesis Task; returns ``{ task_id }`` to stream via the task store. */
+export function synthesize(text: string, opts: TTSSynthesizeOptions = {}): Promise<{ task_id: string }> {
+  return http.post<{ task_id: string }>('/api/tts/synthesize', {
+    text,
+    speaker: opts.speaker ?? '',
+    language: opts.language ?? '',
+    instruct: opts.instruct ?? '',
+  })
 }

@@ -47,11 +47,18 @@ class AudioConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    # Placeholder for the future TTS module.
-    enabled: bool = False
+    # Local Qwen3-TTS engine — runs in the isolated ``.venv-tts`` (Python 3.10) as a
+    # one-shot subprocess (see ``backend/engines/tts.py``); the 3.14 app backend never
+    # imports torch.
+    enabled: bool = True
+    model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"  # HuggingFace model id
+    speaker: str = "serena"  # default voice / speaker
+    language: str = "chinese"  # default language
+    device: str = "auto"  # auto | cuda | cpu | mps
+    # Legacy API-provider fields, unused by the local engine, kept so an existing
+    # config/app.json still loads (and round-trips) cleanly.
     api_base: str = ""
     api_key: str = ""
-    model: str = ""
     voice: str = ""
     concurrency: int = 1
 
