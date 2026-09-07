@@ -1,0 +1,23 @@
+# --- Node / 前端 ---
+node_modules
+dist
+dist-ssr
+*.local
+npm-debug.log*
+yarn-error.log*
+
+# --- Python 后端 ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- Tauri / Rust 构建产物（可再生，约 5GB）---
+src-tauri/target
+src-tauri/gen
+
+# --- 有声书运行时数据（input/output/temp/logs/config）---
+workspace/
+
+# --- 系统 / 编辑器 ---
+.DS_Store

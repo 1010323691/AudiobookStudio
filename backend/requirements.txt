@@ -1,0 +1,8 @@
+# AudiobookStudio backend
+# Kept minimal to stay compatible with recent CPython (incl. 3.14) and avoid
+# platform-specific native wheels (no uvloop/httptools — plain uvicorn).
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.8
+# Required by FastAPI for the browser file-upload endpoint (multipart/form-data).
+python-multipart>=0.0.9
