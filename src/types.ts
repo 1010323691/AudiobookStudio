@@ -161,6 +161,19 @@ export interface TTSSynthesizeResult {
   path: string
 }
 
+// ------------------------------ script (LLM -> JSON) ------------------------------
+export interface ScriptEntry {
+  speaker: string
+  text: string
+  instruct: string
+}
+export interface ScriptGenerateResult {
+  entries: ScriptEntry[]
+  output_path: string
+  count: number
+  speakers: string[]
+}
+
 // ------------------------------ tasks ------------------------------
 export type TaskStatus =
   | 'pending'
@@ -213,6 +226,25 @@ export interface AppConfig {
     api_key: string
     voice: string
     concurrency: number
+  }
+  llm: {
+    base_url: string
+    api_key: string
+    model_name: string
+  }
+  prompts: {
+    system_prompt: string
+    user_prompt: string
+  }
+  generation: {
+    chunk_size: number
+    max_tokens: number
+    temperature: number
+    top_p: number
+    top_k: number
+    min_p: number
+    presence_penalty: number
+    banned_tokens: number[]
   }
   ffmpeg: { ffmpeg_path: string; ffprobe_path: string }
   log: { level: string }

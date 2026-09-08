@@ -25,6 +25,12 @@ const router = createRouter({
           meta: { title: '文本排版' },
         },
         {
+          path: 'script',
+          name: 'script',
+          component: () => import('@/views/ScriptParse.vue'),
+          meta: { title: '文本解析' },
+        },
+        {
           path: 'book',
           name: 'book',
           component: () => import('@/views/BookSplit.vue'),

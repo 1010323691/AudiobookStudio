@@ -4,14 +4,26 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from ..core import config as core_config
+from ..engines.script_prompts import load_default_prompts
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
 
 @router.get("")
 def get_config() -> dict:
-    """Return the full config (all sections)."""
-    return core_config.get_config().model_dump()
+    """Return the full config (all sections).
+
+    Empty ``prompts`` are seeded from the bundled defaults (mirroring the source
+    ``get_config``) so the 文本解析 page can show and edit the full prompt on first
+    open. This only affects the response — the stored config is left untouched.
+    """
+    data = core_config.get_config().model_dump()
+    prompts = data.setdefault("prompts", {})
+    if not prompts.get("system_prompt"):
+        prompts["system_prompt"] = load_default_prompts()[0]
+    if not prompts.get("user_prompt"):
+        prompts["user_prompt"] = load_default_prompts()[1]
+    return data
 
 
 @router.put("")

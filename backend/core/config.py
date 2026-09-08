@@ -76,12 +76,41 @@ class UIConfig(BaseModel):
     theme: str = "system"  # system | light | dark
 
 
+class LLMConfig(BaseModel):
+    # OpenAI-compatible ``chat/completions`` endpoint (default: a local Ollama server).
+    # The LLM HTTP call uses stdlib ``urllib`` — see ``backend/engines/script.py``.
+    base_url: str = "http://localhost:11434/v1"
+    api_key: str = "local"  # local servers ignore it; remote APIs need the real key
+    model_name: str = ""  # left blank on purpose — the user sets their own model
+
+
+class PromptsConfig(BaseModel):
+    # Empty values fall back to the bundled defaults
+    # (``backend/resources/default_prompts.txt``) at read time — see ``backend/api/config.py``.
+    system_prompt: str = ""
+    user_prompt: str = ""
+
+
+class GenerationConfig(BaseModel):
+    chunk_size: int = 3000  # chars per chunk sent to the LLM
+    max_tokens: int = 4096  # max completion tokens per call
+    temperature: float = 0.6
+    top_p: float = 0.8
+    top_k: int = 0  # 0 -> not sent (OpenAI ignores it; some local servers use it)
+    min_p: float = 0.0  # 0 -> not sent
+    presence_penalty: float = 0.0
+    banned_tokens: list = Field(default_factory=list)
+
+
 class AppConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     text: TextConfig = Field(default_factory=TextConfig)
     book: BookConfig = Field(default_factory=BookConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+    prompts: PromptsConfig = Field(default_factory=PromptsConfig)
+    generation: GenerationConfig = Field(default_factory=GenerationConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     ui: UIConfig = Field(default_factory=UIConfig)

@@ -19,6 +19,7 @@ from .api import audio as api_audio
 from .api import book as api_book
 from .api import config as api_config
 from .api import files as api_files
+from .api import script as api_script
 from .api import tasks as api_tasks
 from .api import text as api_text
 from .api import tts as api_tts
@@ -28,8 +29,8 @@ from .core.paths import get_layout
 
 PORT = 8642
 
-# All four module routers (tts is a placeholder that reports 501) plus the
-# cross-cutting task / config / files routers.
+# All module routers (tts drives the isolated local engine; script drives the
+# LLM → JSON pipeline) plus the cross-cutting task / config / files routers.
 ROUTERS = [
     api_tasks.router,
     api_config.router,
@@ -38,6 +39,7 @@ ROUTERS = [
     api_book.router,
     api_audio.router,
     api_tts.router,
+    api_script.router,
 ]
 
 

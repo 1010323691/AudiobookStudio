@@ -3,6 +3,7 @@ import { useRoute } from 'vue-router'
 import {
   LayoutDashboard,
   Type,
+  ScanText,
   BookOpen,
   Mic,
   AudioLines,
@@ -19,6 +20,7 @@ const app = useAppStore()
 const items = [
   { to: '/dashboard', label: '概览', icon: LayoutDashboard },
   { to: '/text', label: '文本排版', icon: Type },
+  { to: '/script', label: '文本解析', icon: ScanText },
   { to: '/book', label: '分册切割', icon: BookOpen },
   { to: '/tts', label: 'TTS 合成', icon: Mic },
   { to: '/audio', label: '音频分集', icon: AudioLines },
