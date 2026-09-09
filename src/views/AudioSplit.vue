@@ -1,12 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { cutAudio, detectSilences, exportAudio, planAudio, probeAudio, zipAudio } from '@/api/audio'
-import { isTauri, downloadFile, reveal, pickFile } from '@/utils/tauri'
+import { downloadFile, pickFile } from '@/utils/fileops'
 import { formatBytes, formatDuration } from '@/utils/format'
 import type {
   AudioCutResult,
@@ -20,7 +19,6 @@ import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
 import CardContent from '@/components/ui/CardContent.vue'
-import CardFooter from '@/components/ui/CardFooter.vue'
 import Input from '@/components/ui/Input.vue'
 import Label from '@/components/ui/Label.vue'
 import Switch from '@/components/ui/Switch.vue'
@@ -28,6 +26,8 @@ import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import Progress from '@/components/ui/Progress.vue'
 import ScrollArea from '@/components/ui/ScrollArea.vue'
+import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import Table from '@/components/ui/Table.vue'
 import TableHeader from '@/components/ui/TableHeader.vue'
 import TableBody from '@/components/ui/TableBody.vue'
@@ -38,21 +38,18 @@ import {
   AudioLines,
   Scissors,
   Wand2,
-  FolderOpen,
   Download,
   Loader2,
   XCircle,
-  ListTodo,
   Package,
   FolderOutput,
 } from 'lucide-vue-next'
 
-const router = useRouter()
 const settings = useSettingsStore()
 const project = useProjectStore()
 const taskStore = useTaskStore()
+const { workspaceSet } = useWorkspaceGate()
 const { push: toast } = useToast()
-const inTauri = isTauri()
 
 const file = ref<{ path: string; name: string } | null>(null)
 const probe = ref<AudioProbeResult | null>(null)
@@ -234,13 +231,9 @@ async function doZip() {
   try {
     const base = (file.value?.name || '').replace(/\.[^.]+$/, '')
     const r = await zipAudio({ base, files: cutFilesSpec() })
-    // 浏览器：下载 zip；桌面壳：打开 zip 所在文件夹（文件本就在本机）。
+    // 浏览器：下载 zip（后端回 Content-Disposition: attachment，存到下载目录）。
     download(r.zip_path)
-    if (inTauri) {
-      toast({ title: '已打包', variant: 'success', description: `打包 ${r.file_count} 个文件，已打开所在文件夹` })
-    } else {
-      toast({ title: '打包已开始下载', variant: 'success', description: `打包 ${r.file_count} 个文件` })
-    }
+    toast({ title: '打包已开始下载', variant: 'success', description: `打包 ${r.file_count} 个文件` })
   } catch (e: any) {
     error.value = e?.message || '打包失败'
     toast({ title: '打包失败', variant: 'destructive', description: error.value })
@@ -254,11 +247,9 @@ async function doExport() {
   if (!file.value || !cutResult.value || busyExport.value) return
   busyExport.value = true
   error.value = ''
-  let destDir = ''
   try {
     const r = await exportAudio(file.value.path, { files: cutFilesSpec() })
-    destDir = r.dest_dir
-    // 文件已落到磁盘——这本身就是成功；"打开文件夹"只是附带动作，绝不能反过来判定为失败。
+    // 文件已落到磁盘——这本身就是成功。
     toast({ title: '已输出到源文件夹', variant: 'success', description: `${r.file_count} 个文件 → ${r.dest_dir}` })
   } catch (e: any) {
     error.value = e?.message || '输出失败'
@@ -266,12 +257,10 @@ async function doExport() {
   } finally {
     busyExport.value = false
   }
-  // 桌面壳：顺带在资源管理器里打开「分集」文件夹（浏览器中为无操作）。
-  reveal(destDir)
 }
 
 function download(path: string) {
-  downloadFile('audio', path)
+  downloadFile('07_output', path)
 }
 </script>
 
@@ -280,10 +269,12 @@ function download(path: string) {
     <div>
       <h1 class="text-2xl font-bold tracking-tight">音频分集</h1>
       <p class="text-muted-foreground mt-1">
-        把长音频无损切分为若干集（<code class="text-xs">-c copy</code> 不重编码），输出到
-        <code class="text-xs">output/audio/</code>。可选「智能对齐」把切点对齐到停顿处。
+        把长音频无损切分为若干集（<code class="text-xs">-c copy</code> 不重编码），输出到工作空间的
+        <code class="text-xs">07_output/</code>。可选「智能对齐」把切点对齐到停顿处。
       </p>
     </div>
+
+    <WorkspaceGateAlert />
 
     <!-- 选择文件 -->
     <Card>
@@ -415,16 +406,16 @@ function download(path: string) {
       </CardHeader>
       <CardContent class="space-y-4">
         <div class="flex flex-wrap items-center gap-3">
-          <Button @click="doCut" :disabled="busyCut || !plan">
+          <Button @click="doCut" :disabled="busyCut || !plan || !workspaceSet">
             <Loader2 v-if="busyCut" class="h-4 w-4 animate-spin" />
             <Scissors v-else class="h-4 w-4" />
             {{ busyCut ? '切割中…' : '开始切割' }}
           </Button>
-          <Button variant="outline" @click="doZip" :disabled="busyZip || !cutResult">
+          <Button variant="outline" @click="doZip" :disabled="busyZip || !cutResult || !workspaceSet">
             <Package class="h-4 w-4" />
             打包下载
           </Button>
-          <Button variant="outline" @click="doExport" :disabled="busyExport || !cutResult">
+          <Button variant="outline" @click="doExport" :disabled="busyExport || !cutResult || !workspaceSet">
             <FolderOutput class="h-4 w-4" />
             输出到音频源文件夹
           </Button>
@@ -465,9 +456,6 @@ function download(path: string) {
                       <Button variant="ghost" size="sm" @click="download(f.path)">
                         <Download class="h-3.5 w-3.5" />
                       </Button>
-                      <Button v-if="inTauri" variant="ghost" size="sm" @click="reveal(f.path)">
-                        <FolderOpen class="h-3.5 w-3.5" />
-                      </Button>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -476,14 +464,6 @@ function download(path: string) {
           </ScrollArea>
         </div>
       </CardContent>
-      <CardFooter class="justify-between">
-        <Button v-if="inTauri && cutResult" variant="outline" size="sm" @click="reveal(cutResult.output_dir)">
-          <FolderOpen class="h-4 w-4" />打开输出目录
-        </Button>
-        <Button variant="outline" size="sm" @click="router.push('/tasks')">
-          <ListTodo class="h-4 w-4" />查看任务中心
-        </Button>
-      </CardFooter>
     </Card>
 
     <Alert v-if="error" variant="destructive">

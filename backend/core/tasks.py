@@ -91,8 +91,11 @@ class Task:
         self._emit({"type": "progress", "progress": self.progress, "current": self.current})
 
     def log(self, msg: str, level: str = "INFO") -> None:
+        # Append in chronological order (oldest → newest). The UI renders the newest
+        # line at the bottom, and the snapshot replays this same order, so the live
+        # stream and a reconnect's replayed log always agree on ordering.
         entry = {"level": level, "msg": msg, "t": time.time()}
-        self.logs.appendleft(entry)
+        self.logs.append(entry)
         self._emit({"type": "log", **entry})
 
     def _set_status(self, status: TaskStatus) -> None:

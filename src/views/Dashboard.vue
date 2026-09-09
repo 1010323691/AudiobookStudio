@@ -1,179 +1,150 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { Component } from 'vue'
-import { useRouter } from 'vue-router'
-import { Type, BookOpen, Mic, AudioLines, ArrowRight, Circle, Check } from 'lucide-vue-next'
+import { computed, onMounted, ref } from 'vue'
+import { Folder, FolderOpen, Trash2 } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Badge from '@/components/ui/Badge.vue'
-import { useProjectStore } from '@/stores/project'
-import { formatNumber } from '@/utils/format'
+import Input from '@/components/ui/Input.vue'
+import { useSettingsStore } from '@/stores/settings'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
+import { getWorkspace, setWorkspace } from '@/api/workspace'
+import { useToast } from '@/components/ui/toast'
+import type { WorkspaceInfo } from '@/types'
 
-type StageStatus = 'done' | 'pending' | 'soon'
+const settings = useSettingsStore()
+const { workspaceSet } = useWorkspaceGate()
+const { push: toast } = useToast()
 
-interface Stage {
-  to: string
-  icon: Component
-  title: string
-  desc: string
-  status: StageStatus
-  badge: string
-  badgeVariant: 'success' | 'secondary' | 'warning'
-  summary: string | null
+// ------------------------------ 工作空间 ------------------------------
+const ws = ref<WorkspaceInfo | null>(null)
+const manualPath = ref('')
+const wsBusy = ref(false)
+
+const WS_DIR_LABELS: [string, string][] = [
+  ['00_temp', '临时文件'],
+  ['01_input', '原始输入 / 排版文本'],
+  ['02_split_text', '分册切割结果'],
+  ['03_parsed_json', '文本解析 JSON'],
+  ['04_voice_profiles', '角色配音配置'],
+  ['05_audio_chunk', '音频合成片段'],
+  ['06_audio_merge', '音频合并成品'],
+  ['07_output', '最终分集'],
+]
+
+const wsPath = computed(() => ws.value?.path || settings.config?.paths?.working_dir || '')
+
+onMounted(async () => {
+  if (!settings.loaded) await settings.load()
+  try {
+    ws.value = await getWorkspace()
+  } catch {
+    /* 后端未启动 —— 保持 null */
+  }
+})
+
+async function applyWorkspace(path: string) {
+  const p = path.trim()
+  if (!p || wsBusy.value) return
+  wsBusy.value = true
+  try {
+    ws.value = await setWorkspace(p)
+    await settings.load() // 刷新全局配置 → 解除全站锁定门
+    manualPath.value = ''
+    toast({ title: '工作空间已设置', variant: 'success', description: ws.value.path })
+  } catch (e: any) {
+    toast({ title: '设置工作空间失败', variant: 'destructive', description: e?.message || String(e) })
+  } finally {
+    wsBusy.value = false
+  }
 }
 
-const router = useRouter()
-const project = useProjectStore()
+async function clearWorkspace() {
+  if (wsBusy.value) return
+  wsBusy.value = true
+  try {
+    ws.value = await setWorkspace('')
+    await settings.load()
+    toast({ title: '工作空间已清除', description: '流水线已重新锁定' })
+  } catch (e: any) {
+    toast({ title: '清除失败', variant: 'destructive', description: e?.message || String(e) })
+  } finally {
+    wsBusy.value = false
+  }
+}
 
-// basename of a (Windows or POSIX) path — for a compact "输出：xxx.txt" line.
-const base = (p: string | null) => (p ? (p.split(/[\\/]/).pop() ?? p) : '')
-
-const stages = computed<Stage[]>(() => {
-  const textDone = !!project.textOutput
-  const bookDone = project.bookOutputs.length > 0
-  const audioDone = project.audioOutputs.length > 0
-  return [
-    {
-      to: '/text',
-      icon: Type,
-      title: '文本排版',
-      desc: '清理原文的标点、空行、断段与章节识别。',
-      status: textDone ? 'done' : 'pending',
-      badge: textDone ? '已完成' : '待处理',
-      badgeVariant: textDone ? 'success' : 'secondary',
-      summary:
-        textDone && project.textResult
-          ? `${base(project.textOutput)} · ${project.textResult.stats.chapters} 章 · ${formatNumber(
-              project.textResult.stats.chars,
-            )} 字`
-          : null,
-    },
-    {
-      to: '/book',
-      icon: BookOpen,
-      title: '分册切割',
-      desc: '按章节把长文切成若干分册，文件名自动编号。',
-      status: bookDone ? 'done' : 'pending',
-      badge: bookDone ? '已完成' : '待处理',
-      badgeVariant: bookDone ? 'success' : 'secondary',
-      summary: project.bookResult ? `已切出 ${project.bookResult.file_count} 个分册` : null,
-    },
-    {
-      to: '/tts',
-      icon: Mic,
-      title: 'TTS 合成',
-      desc: '把文字合成为语音。',
-      status: 'soon',
-      badge: '即将推出',
-      badgeVariant: 'warning',
-      summary: '本版暂不可用，可先跳过。',
-    },
-    {
-      to: '/audio',
-      icon: AudioLines,
-      title: '音频分集',
-      desc: '把长音频无损切成若干集，支持停顿智能对齐。',
-      status: audioDone ? 'done' : 'pending',
-      badge: audioDone ? '已完成' : '待处理',
-      badgeVariant: audioDone ? 'success' : 'secondary',
-      summary: project.audioResult ? `已切出 ${project.audioResult.file_count} 集` : null,
-    },
-  ]
-})
-
-const next = computed(() => {
-  if (!project.textOutput) return { to: '/text', title: '文本排版' }
-  if (project.bookOutputs.length === 0) return { to: '/book', title: '分册切割' }
-  // TTS is a placeholder this version — the actionable next step after book is audio.
-  if (project.audioOutputs.length === 0) return { to: '/audio', title: '音频分集' }
-  return null
-})
 </script>
 
 <template>
   <div class="space-y-8">
     <header>
-      <h1 class="text-2xl font-bold tracking-tight">概览</h1>
+      <h1 class="text-2xl font-bold tracking-tight">开始</h1>
       <p class="mt-1 text-muted-foreground">
         小说原文 → 最终有声书音频，一个窗口走完整个流程。
       </p>
     </header>
 
-    <!-- 下一步 / 全部完成 -->
+    <!-- 工作空间（流程运行的前提） -->
     <section
-      v-if="next"
-      class="flex flex-col gap-3 rounded-xl border border-primary/40 bg-primary/5 p-5 sm:flex-row sm:items-center sm:justify-between"
+      class="rounded-xl border p-5"
+      :class="workspaceSet ? 'border-primary/40 bg-primary/5' : 'border-amber-500/60 bg-amber-500/10'"
     >
-      <div>
-        <p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">下一步</p>
-        <h2 class="mt-1 text-lg font-semibold">{{ next.title }}</h2>
-        <p class="mt-1 text-sm text-muted-foreground">从这里继续你的有声书制作流程。</p>
-      </div>
-      <Button size="lg" class="shrink-0" @click="router.push(next.to)">
-        前往{{ next.title }}
-        <ArrowRight class="h-4 w-4" />
-      </Button>
-    </section>
-
-    <section
-      v-else
-      class="flex items-center gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-5"
-    >
-      <Check class="h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-      <div>
-        <h2 class="text-base font-semibold">流程已完成</h2>
-        <p class="mt-1 text-sm text-muted-foreground">
-          文本、分册与音频分集都已处理完毕，可随时回到任一模块重跑。
-        </p>
-      </div>
-    </section>
-
-    <!-- 模块卡片（含实时状态） -->
-    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-      <div
-        v-for="(s, i) in stages"
-        :key="s.to"
-        class="flex flex-col rounded-xl border bg-card p-5 shadow-sm"
-      >
-        <div class="flex items-start justify-between gap-3">
-          <div class="flex items-center gap-3">
-            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-accent text-accent-foreground">
-              <component :is="s.icon" class="h-5 w-5" />
-            </div>
-            <div class="flex items-center gap-2">
-              <span
-                class="flex h-5 w-5 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground"
-              >
-                {{ i + 1 }}
-              </span>
-              <h2 class="text-base font-semibold">{{ s.title }}</h2>
-            </div>
-          </div>
-          <Badge :variant="s.badgeVariant">{{ s.badge }}</Badge>
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="flex items-center gap-2 text-base font-semibold">
+          <Folder class="h-5 w-5 text-primary" />
+          工作空间
+          <Badge :variant="workspaceSet ? 'success' : 'warning'">
+            {{ workspaceSet ? '已设置' : '未设置' }}
+          </Badge>
+        </h2>
+        <div v-if="workspaceSet" class="flex gap-2">
+          <Button variant="outline" size="sm" :disabled="wsBusy" @click="clearWorkspace">
+            <Trash2 class="h-4 w-4" />清除
+          </Button>
         </div>
-        <p class="mt-3 text-sm text-muted-foreground">{{ s.desc }}</p>
-        <p
-          v-if="s.summary"
-          class="mt-2 rounded-md bg-accent/50 px-2 py-1 font-mono text-xs text-foreground"
+      </div>
+
+      <p
+        v-if="!workspaceSet"
+        class="mt-3 text-sm font-medium text-amber-700 dark:text-amber-400"
+      >
+        尚未设置工作空间 —— 流水线已锁定，请先选择一个本地文件夹。
+      </p>
+      <p v-else class="mt-3 text-sm text-muted-foreground">
+        流水线的所有产物都会按固定结构保存在该目录下。
+      </p>
+
+      <!-- 设置 / 更换 -->
+      <div class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+        <Input
+          v-model="manualPath"
+          class="min-w-0 flex-1 font-mono text-sm"
+          placeholder="请输入文件夹路径，如 D:\AudiobookProjects\MyBook"
+          :disabled="wsBusy"
+        />
+        <Button
+          class="shrink-0"
+          :disabled="wsBusy || !manualPath.trim()"
+          @click="applyWorkspace(manualPath)"
         >
-          {{ s.summary }}
-        </p>
-        <div class="flex-1" />
-        <Button :variant="s.status === 'done' ? 'outline' : 'default'" class="mt-4" @click="router.push(s.to)">
-          <span v-if="s.status === 'done'">再次打开</span>
-          <span v-else>进入模块</span>
-          <ArrowRight class="h-4 w-4" />
+          {{ wsBusy ? '处理中…' : workspaceSet ? '更新' : '确认设置' }}
         </Button>
       </div>
-    </div>
-
-    <section class="rounded-xl border bg-card p-5">
-      <h3 class="flex items-center gap-2 text-sm font-semibold">
-        <Circle class="h-4 w-4 text-primary" />
-        流程衔接
-      </h3>
-      <p class="mt-2 text-sm text-muted-foreground">
-        每完成一步，点击「前往下一步」即可把输出文件自动带入下一个模块，全程无需手动搬文件。上方卡片会实时显示各模块的完成状态。
+      <p class="mt-2 text-xs text-muted-foreground">
+        请手动输入工作空间文件夹的完整路径。
       </p>
+
+      <!-- 当前路径 + 子目录结构 -->
+      <template v-if="workspaceSet">
+        <div class="mt-4 flex items-center gap-2 rounded-md bg-accent/50 px-3 py-2">
+          <FolderOpen class="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span class="break-all font-mono text-sm" :title="wsPath">{{ wsPath }}</span>
+        </div>
+        <dl v-if="ws" class="mt-3 grid grid-cols-1 gap-x-8 gap-y-1 sm:grid-cols-2">
+          <div v-for="[name, label] in WS_DIR_LABELS" :key="name" class="flex items-baseline gap-2 text-xs">
+            <dt class="w-32 shrink-0 font-mono text-foreground">{{ name }}/</dt>
+            <dd class="text-muted-foreground">{{ label }}</dd>
+          </div>
+        </dl>
+      </template>
     </section>
   </div>
 </template>

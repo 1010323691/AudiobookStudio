@@ -1,25 +1,23 @@
 # --- Node / 前端 ---
 node_modules
 dist
-dist-ssr
 *.local
 npm-debug.log*
 yarn-error.log*
 
 # --- Python 后端 ---
 .venv/
+# TTS 独立环境（Python 3.10 + torch，数 GB，由 install_tts_env.ps1 重建）
+.venv-tts/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 # TTS 环境安装脚本的运行日志（每次运行重写）
 install_tts_env.log
 
-# --- Tauri / Rust 构建产物（可再生，约 5GB）---
-src-tauri/target
-src-tauri/gen
-
-# --- 有声书运行时数据（input/output/temp/logs/config）---
-workspace/
+# --- 运行时配置 / 工作空间指针（含本机路径与密钥，不入库）---
+# 根目录 app.json = 通用配置模板 + 当前工作空间指针；产物 / 日志 / 工程配置都在用户工作空间内
+/app.json
 
 # --- 系统 / 编辑器 ---
 .DS_Store

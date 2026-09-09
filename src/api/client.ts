@@ -1,10 +1,9 @@
 /** Thin HTTP client for the Python backend.
 
-All calls go to the absolute backend origin (CORS is wide open on the backend),
-so the same code works in the Tauri WebView and in a plain browser. Override the
-origin with ``VITE_API_BASE`` if the backend ever moves.
+All calls go to the absolute backend origin (CORS is wide open on the backend).
+Override the origin with ``VITE_API_BASE`` if the backend ever moves.
 */
-const API_BASE: string = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8642'
+export const API_BASE: string = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8642'
 
 export class ApiError extends Error {
   status: number

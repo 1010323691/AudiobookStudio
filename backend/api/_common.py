@@ -8,12 +8,25 @@ from fastapi import HTTPException
 from ..engines.book import decode_buffer
 
 
+def require_workspace() -> None:
+    """Guard for endpoints that write pipeline artifacts.
+
+    A run without a chosen workspace would scatter files into the project
+    directory, so the pipeline stays locked until the user sets one on the
+    dashboard (开始). Read-only endpoints do not call this.
+    """
+    from ..core.paths import is_workspace_set
+
+    if not is_workspace_set():
+        raise HTTPException(409, "尚未设置工作空间——请先在「开始」页选择文件夹。")
+
+
 def read_decoded_file(path: str) -> tuple[str, str, Path]:
     """Read the file at ``path`` and auto-detect its encoding.
 
     The frontend is a thin client: it hands the backend an absolute file path
-    (picked via the Tauri dialog); the backend does the reading / decoding.
-    Returns ``(text, encoding_label, resolved_path)``.
+    (the file is uploaded into ``01_input/`` first); the backend does the reading
+    / decoding. Returns ``(text, encoding_label, resolved_path)``.
     """
     p = Path(path)
     if not p.exists():

@@ -40,7 +40,7 @@ export interface CutOptions {
   segments?: AudioSegment[]
 }
 
-/** Long-running: lossless ``-c copy`` cut to output/audio/. Returns a task id. */
+/** Long-running: lossless ``-c copy`` cut to the workspace's 07_output/. Returns a task id. */
 export function cutAudio(path: string, opts: CutOptions = {}): Promise<{ task_id: string }> {
   return http.post<{ task_id: string }>('/api/audio/cut', {
     path,
@@ -64,8 +64,8 @@ export interface AudioZipResult {
   file_count: number
 }
 
-/** Build a STORE zip of the given cut files into output/audio/; the result's
- *  ``zip_path`` is served by ``/api/files/download/audio/<name>`` for download. */
+/** Build a zip of the given cut files into the workspace's 07_output/; the result's
+ *  ``zip_path`` is served by ``/api/files/download/07_output/<name>`` for download. */
 export function zipAudio(opts: { base?: string; files: CutFileSpec[] }): Promise<AudioZipResult> {
   return http.post<AudioZipResult>('/api/audio/zip', {
     base: opts.base ?? null,

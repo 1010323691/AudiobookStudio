@@ -1,23 +1,36 @@
-"""Unified, persistent configuration (``config/app.json``).
+"""Unified, persistent configuration.
 
-One JSON file, loaded at startup and rewritten on every save, so the console
-restores its settings on restart (requirement #4). The file lives in a fixed
-location (the default workspace) independent of the working directory, which
-avoids a config-file-chasing-its-own-setting cycle.
+Two files, one pointer:
+
+* ``<project>/app.json`` — the root file. It is both the *generic default
+  template* (its non-pointer fields seed every new workspace's config) and the
+  *bootstrap pointer*: ``paths.working_dir`` names the active workspace. The
+  pointer is the ONLY field the app ever writes there — all other values are
+  read-only at runtime.
+* ``<workspace>/config/app.json`` — the active project's config, created by
+  copying the root template when a workspace is set (never overwritten if it
+  already exists). Once a workspace exists, every config read and write targets
+  this file, and it is rewritten on each save (requirement #4).
+
+The pointer must live in the root file: to load the workspace config the app
+must first know *which* workspace is active, and that can only be read from a
+stable location that does not itself depend on the workspace (otherwise it is a
+chicken-and-egg loop — the config file chasing its own setting).
 """
 from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .paths import DEFAULT_WORKSPACE
+from .paths import PROJECT_ROOT
 
 
 class PathsConfig(BaseModel):
-    working_dir: str = ""  # empty -> default workspace
+    working_dir: str = ""  # the workspace pointer (empty -> no workspace, pipeline locked)
 
 
 class TextConfig(BaseModel):
@@ -51,16 +64,33 @@ class TTSConfig(BaseModel):
     # one-shot subprocess (see ``backend/engines/tts.py``); the 3.14 app backend never
     # imports torch.
     enabled: bool = True
-    model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"  # HuggingFace model id
+    model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"  # CustomVoice model id
+    # The other two Qwen3-TTS 1.7B variants, loaded by the worker for clone / design.
+    base_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"  # voice cloning
+    design_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"  # text -> voice
     speaker: str = "serena"  # default voice / speaker
     language: str = "chinese"  # default language
     device: str = "auto"  # auto | cuda | cpu | mps
+    # Merge pause defaults (ported from the source project's TTS config): silence
+    # inserted between segments, per-speaker vs. speaker-change (ms).
+    pause_between_speakers_ms: int = 500
+    pause_same_speaker_ms: int = 250
+    # Placeholder for later concurrency work (native list batching / thread pool).
+    parallel_workers: int = 1
     # Legacy API-provider fields, unused by the local engine, kept so an existing
     # config/app.json still loads (and round-trips) cleanly.
     api_base: str = ""
     api_key: str = ""
     voice: str = ""
     concurrency: int = 1
+
+
+class PersonaPromptsConfig(BaseModel):
+    # Voice-design (persona) prompts for the "角色配音" stage. Empty values fall back
+    # to the bundled defaults in ``backend/engines/persona_prompts.py``.
+    system_prompt: str = ""
+    user_prompt: str = ""
+    advanced_prompt: str = ""
 
 
 class FFmpegConfig(BaseModel):
@@ -110,32 +140,159 @@ class AppConfig(BaseModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
+    persona_prompts: PersonaPromptsConfig = Field(default_factory=PersonaPromptsConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
 
 
-_CONFIG_FILE = DEFAULT_WORKSPACE / "config" / "app.json"
+# The root file: generic default config template + the workspace pointer (the only writable field).
+TEMPLATE_FILE = PROJECT_ROOT / "app.json"
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _config: AppConfig | None = None
 
 
+class WorkspaceNotSetError(RuntimeError):
+    """A config write was attempted with no workspace selected (-> HTTP 409)."""
+
+
+# -- bootstrap pointer (the only thing read from the root before the workspace) -- #
+
+def _read_root_pointer() -> str:
+    """Read ``paths.working_dir`` from the root file (empty when absent/invalid)."""
+    if not TEMPLATE_FILE.exists():
+        return ""
+    try:
+        data = json.loads(TEMPLATE_FILE.read_text("utf-8"))
+    except Exception:
+        return ""
+    paths = data.get("paths") if isinstance(data, dict) else None
+    if not isinstance(paths, dict):
+        return ""
+    return str(paths.get("working_dir") or "")
+
+
+def _workspace_path() -> Path | None:
+    """The active workspace as an absolute path, or ``None`` when unset.
+
+    This is the single bootstrap-safe source of truth for "which workspace".
+    Relative pointers resolve against ``PROJECT_ROOT``.
+    """
+    working = _read_root_pointer().strip()
+    if not working:
+        return None
+    ws = Path(working)
+    if not ws.is_absolute():
+        ws = PROJECT_ROOT / ws
+    return ws
+
+
+def _active_config_file() -> Path:
+    """The file that is the source of truth for the full config."""
+    ws = _workspace_path()
+    if ws is None:
+        return TEMPLATE_FILE  # unset -> the (read-only) root template
+    return ws / "config" / "app.json"
+
+
+# -- loading ------------------------------------------------------------------ #
+
+def _load_config_file(file: Path) -> AppConfig | None:
+    if not file.exists():
+        return None
+    try:
+        return AppConfig.model_validate(json.loads(file.read_text("utf-8")))
+    except Exception:
+        return None
+
+
+def _load_unlocked() -> AppConfig:
+    """Resolve the active config without acquiring the lock (callers hold it).
+
+    Workspace set -> the workspace's ``config/app.json``; otherwise the root
+    template (a read-only view). A missing workspace file falls back to the root
+    template's values, then to pure code defaults — reads never write.
+    """
+    return (
+        _load_config_file(_active_config_file())
+        or _load_config_file(TEMPLATE_FILE)
+        or AppConfig()
+    )
+
+
 def get_config() -> AppConfig:
-    """Return the in-memory config, loading from disk on first access."""
+    """Return the in-memory config, loading it on first access (see ``_load_unlocked``)."""
     global _config
     with _lock:
         if _config is None:
-            _config = AppConfig()
-            if _CONFIG_FILE.exists():
-                try:
-                    _config = AppConfig.model_validate(
-                        json.loads(_CONFIG_FILE.read_text("utf-8"))
-                    )
-                except Exception:
-                    _config = AppConfig()
+            _config = _load_unlocked()
         return _config
+
+
+def reset_config_cache() -> None:
+    """Drop the in-memory config; the next read re-resolves the source file.
+
+    Called after the workspace pointer changes (set / clear) so reads switch from
+    the old workspace's config to the new one (or the root template).
+    """
+    global _config
+    with _lock:
+        _config = None
+
+
+# -- writing ------------------------------------------------------------------ #
+
+def _write_config_file(file: Path, config: AppConfig) -> None:
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(
+        json.dumps(config.model_dump(), ensure_ascii=False, indent=2), "utf-8"
+    )
+
+
+def _ensure_template() -> None:
+    """Seed the root ``app.json`` from code defaults on a fresh clone (missing file)."""
+    if not TEMPLATE_FILE.exists():
+        _write_config_file(TEMPLATE_FILE, AppConfig())
+
+
+def set_workspace_pointer(path: str) -> None:
+    """Persist the workspace pointer in the ROOT file (its only writable field).
+
+    Every other template value is preserved verbatim; the config cache is reset so
+    subsequent reads target the (new) workspace.
+    """
+    with _lock:
+        _ensure_template()
+        try:
+            data = json.loads(TEMPLATE_FILE.read_text("utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data.setdefault("paths", {})["working_dir"] = path
+        _write_config_file(TEMPLATE_FILE, AppConfig.model_validate(data))
+        reset_config_cache()
+
+
+def clear_workspace() -> None:
+    """Clear the pointer (re-locks the pipeline); config falls back to the template."""
+    set_workspace_pointer("")
+
+
+def init_workspace_config(ws: Path) -> None:
+    """Give a fresh workspace its own ``config/app.json`` — a copy of the root
+    template with ``working_dir`` set to the workspace. NEVER overwrites an
+    existing workspace config."""
+    with _lock:
+        _ensure_template()
+        target = ws / "config" / "app.json"
+        if target.exists():
+            return
+        base = _load_config_file(TEMPLATE_FILE) or AppConfig()
+        base.paths.working_dir = str(ws)
+        _write_config_file(target, base)
 
 
 def _deep_update(base: dict, patch: dict) -> None:
@@ -147,15 +304,23 @@ def _deep_update(base: dict, patch: dict) -> None:
 
 
 def update_config(patch: dict[str, Any]) -> AppConfig:
-    """Merge a (possibly partial) update into the config and persist it."""
+    """Merge a (possibly partial) update into the ACTIVE (workspace) config and
+    persist it there. Requires a workspace (raises ``WorkspaceNotSetError`` ->
+    HTTP 409). ``paths.working_dir`` is forced to the workspace itself, so the
+    workspace can only be changed via the workspace endpoint, never a settings
+    write. The root template is never touched."""
     global _config
     with _lock:
-        current = _config or AppConfig()
+        ws = _workspace_path()
+        if ws is None:
+            raise WorkspaceNotSetError(
+                "尚未设置工作空间——配置随工程，请先在「开始」页选择文件夹。"
+            )
+        current = _config if _config is not None else _load_unlocked()
         data = current.model_dump()
         _deep_update(data, patch)
-        _config = AppConfig.model_validate(data)
-        _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_FILE.write_text(
-            json.dumps(_config.model_dump(), ensure_ascii=False, indent=2), "utf-8"
-        )
-        return _config
+        new = AppConfig.model_validate(data)
+        new.paths.working_dir = str(ws)
+        _config = new
+        _write_config_file(ws / "config" / "app.json", new)
+        return new

@@ -3,11 +3,12 @@ import { useRoute } from 'vue-router'
 import {
   LayoutDashboard,
   Type,
-  ScanText,
   BookOpen,
-  Mic,
+  ScanText,
+  Users,
+  Layers,
+  Combine,
   AudioLines,
-  ListTodo,
   Settings,
   Headphones,
 } from 'lucide-vue-next'
@@ -18,13 +19,14 @@ const route = useRoute()
 const app = useAppStore()
 
 const items = [
-  { to: '/dashboard', label: '概览', icon: LayoutDashboard },
+  { to: '/dashboard', label: '开始', icon: LayoutDashboard },
   { to: '/text', label: '文本排版', icon: Type },
-  { to: '/script', label: '文本解析', icon: ScanText },
   { to: '/book', label: '分册切割', icon: BookOpen },
-  { to: '/tts', label: 'TTS 合成', icon: Mic },
+  { to: '/script', label: '文本解析', icon: ScanText },
+  { to: '/voices', label: '角色配音', icon: Users },
+  { to: '/batch', label: '音频合成', icon: Layers },
+  { to: '/merge', label: '音频合并', icon: Combine },
   { to: '/audio', label: '音频分集', icon: AudioLines },
-  { to: '/tasks', label: '任务', icon: ListTodo },
   { to: '/settings', label: '设置', icon: Settings },
 ]
 

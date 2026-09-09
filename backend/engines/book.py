@@ -435,20 +435,3 @@ def build_zip(files: list[tuple[str, bytes]], out_path: Path) -> None:
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
         for name, data in files:
             zf.writestr(name, data)
-
-
-# ======================= Utils =======================
-
-def format_number(n) -> str:
-    """Group a number with commas for display (mirrors the JS helper)."""
-    if n is None or (isinstance(n, float) and math.isnan(n)):
-        return "–"
-    neg = n < 0
-    n = abs(math.trunc(n))
-    s = str(n)
-    parts: list[str] = []
-    while len(s) > 3:
-        parts.insert(0, s[-3:])
-        s = s[:-3]
-    parts.insert(0, s)
-    return ("-" if neg else "") + ",".join(parts)

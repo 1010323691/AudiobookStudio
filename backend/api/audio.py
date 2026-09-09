@@ -6,9 +6,9 @@ Two fast, synchronous endpoints and two long-running tasks:
 * ``POST /plan``     — even-distribution plan (sync, pure math after a probe).
 * ``POST /silences`` — pause detection + pause-aligned plan (**task**: long,
   cancellable, streamed) for the "智能对齐" preview.
-* ``POST /cut``      — lossless ``-c copy`` cut to ``output/audio/`` (**task**:
-  the main work; re-detects pauses when smart-align is on unless a plan is passed
-  in).
+* ``POST /cut``      — lossless ``-c copy`` cut to the workspace's ``07_output/``
+  (**task**: the main work; re-detects pauses when smart-align is on unless a
+  plan is passed in).
 
 FFmpeg/ffprobe come from ``config.ffmpeg`` (empty → resolved from PATH).
 """
@@ -25,6 +25,7 @@ from ..core.config import get_config
 from ..core.paths import get_layout
 from ..core.tasks import get_task_manager
 from ..engines import audio as A
+from . import _common
 
 router = APIRouter(prefix="/api/audio", tags=["audio"])
 
@@ -126,8 +127,8 @@ def _silences_worker(handle, path, target, tolerance, ffmpeg_path, ffprobe_path)
 
 def _cut_worker(handle, path, target, smart_align, tolerance, naming, start_number,
                 ffmpeg_path, ffprobe_path, ext, segments=None) -> dict:
-    """Cut to ``output/audio/``. Reuses a client-supplied plan if given; otherwise
-    probes (and re-detects pauses for smart-align) to build one."""
+    """Cut to the workspace's ``07_output/``. Reuses a client-supplied plan if given;
+    otherwise probes (and re-detects pauses for smart-align) to build one."""
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise RuntimeError("输入文件不存在。")
@@ -164,7 +165,7 @@ def _cut_worker(handle, path, target, smart_align, tolerance, naming, start_numb
     if len(segments) > A.MAX_SEGMENTS:
         raise RuntimeError(f"段数 {len(segments)} 超过上限 {A.MAX_SEGMENTS}。")
 
-    out_dir = get_layout().output_audio
+    out_dir = get_layout().output
     base = p.stem  # 原文件名（去扩展名）
     handle.progress(0.32, "开始切割")
     files = A.cut_segments(
@@ -220,6 +221,7 @@ class CutRequest(BaseModel):
 
 @router.post("/cut")
 def cut(req: CutRequest) -> dict:
+    _common.require_workspace()
     cfg = get_config()
     a = cfg.audio
     target = req.target_duration or a.target_duration
@@ -252,8 +254,10 @@ class ZipRequest(BaseModel):
 
 @router.post("/zip")
 def zip_files(req: ZipRequest) -> dict:
-    """Package already-cut files into a STORE zip under ``output/audio/`` so the
-    browser can download it (mirrors the book module's optional ``.zip`` output)."""
+    """Package already-cut files into a STORE zip under the workspace's
+    ``07_output/`` so the browser can download it (mirrors the book module's
+    optional ``.zip`` output)."""
+    _common.require_workspace()
     if not req.files:
         raise HTTPException(400, "没有可打包的文件。")
     layout = get_layout()
@@ -264,7 +268,7 @@ def zip_files(req: ZipRequest) -> dict:
         if not p.exists() or not p.is_file():
             raise HTTPException(400, f"文件不存在：{spec.name or p.name}")
         entries.append((spec.name or p.name, p))
-    zip_path = layout.output_audio / f"{base}.zip"
+    zip_path = layout.output / f"{base}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
         for name, p in entries:
             zf.write(p, arcname=name)  # STORED: no re-encode, matches book build_zip
@@ -280,6 +284,7 @@ class ExportRequest(BaseModel):
 def export_to_source(req: ExportRequest) -> dict:
     """Copy the cut files into a ``分集`` folder created beside the source audio, so
     the results land in the user's own folder next to the original file."""
+    _common.require_workspace()
     src = Path(req.source_path)
     if not src.exists() or not src.is_file():
         raise HTTPException(400, "源音频文件不存在。")

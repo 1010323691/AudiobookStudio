@@ -424,8 +424,8 @@ def generate(handle, text, llm: LLMConfig, prompts: PromptsConfig, generation: G
 
     Contract: first arg is the :class:`TaskHandle``. Streams per-chunk progress and
     logs over SSE, honours cooperative cancel between chunks, and writes the result to
-    ``output/tts/annotated_script.json`` (the TTS input dir, served by the existing
-    ``GET /api/files/download/tts/...`` route). ``llm`` / ``prompts`` / ``generation``
+    ``03_parsed_json/annotated_script.json`` (served by the shared
+    ``GET /api/files/download/03_parsed_json/{name}`` route). ``llm`` / ``prompts`` / ``generation``
     are the config section objects; empty ``prompts`` fall back to the bundled defaults.
     """
     body = (text or "").strip()
@@ -472,7 +472,7 @@ def generate(handle, text, llm: LLMConfig, prompts: PromptsConfig, generation: G
     if not all_entries:
         raise RuntimeError("未生成任何脚本条目。")
 
-    out_path = get_layout().output_tts / "annotated_script.json"
+    out_path = get_layout().parsed_json / "annotated_script.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(all_entries, indent=2, ensure_ascii=False), encoding="utf-8")
 

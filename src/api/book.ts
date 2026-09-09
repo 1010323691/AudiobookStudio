@@ -9,7 +9,7 @@ export function analyzeBook(path: string, targetChars?: number): Promise<BookAna
   })
 }
 
-/** Write the volumes to output/books/ (optionally a STORE zip too). */
+/** Write the volumes to the workspace's 02_split_text/ (optionally a zip too). */
 export function splitBook(
   path: string,
   opts: { targetChars?: number; base?: string; asZip?: boolean } = {},

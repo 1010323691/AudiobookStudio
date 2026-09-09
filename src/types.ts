@@ -2,15 +2,6 @@
 // Keeping these in one place so the views, api modules and stores agree.
 
 // ------------------------------ files ------------------------------
-export interface FileItem {
-  name: string
-  is_dir: boolean
-  size: number | null
-}
-export interface FileList {
-  path: string
-  items: FileItem[]
-}
 export interface UploadResult {
   path: string
   name: string
@@ -151,14 +142,48 @@ export interface TTSStatus {
   implemented: boolean
   message: string
 }
-export interface TTSSynthesizeOptions {
-  speaker?: string
-  language?: string
-  instruct?: string
+
+// ------------------------------ tts: 角色配音 / 音频合成 / 音频合并 ------------------------------
+export interface VoiceItem {
+  name: string
+  line_count: number
+  status: 'ready' | 'pending'
+  type: string // clone | design | custom | ''
+  alias_of: string // non-empty -> this label points at another character's voice
+  description: string
+  preview: string // path relative to 04_voice_profiles/ (playable via downloadUrl('04_voice_profiles', preview)); '' if none
 }
-export interface TTSSynthesizeResult {
+export interface VoicesListResult {
+  has_script: boolean
+  script_path: string
+  voice_config_path: string
+  speakers: VoiceItem[]
+}
+export interface PrepareVoicesOptions {
+  speakers?: string[]
+  new_only?: boolean
+  overrides?: Record<string, string>
+}
+export interface PrepareVoicesResult {
+  count: number
+  aliases: number
+  speakers: string[]
+  voice_config_path: string
+  output_dir: string
+  results: { speaker: string; ok: boolean; type: string; preview: string; description: string }[]
+}
+export interface BatchResult {
+  total: number
+  completed: number
+  failed: { index: number; speaker: string; reason: string }[]
+  output_dir: string
+  manifest_path: string
+}
+export interface MergeResult {
   file: string
   path: string
+  segments: number
+  size: number
 }
 
 // ------------------------------ script (LLM -> JSON) ------------------------------
@@ -219,9 +244,14 @@ export interface AppConfig {
   tts: {
     enabled: boolean
     model: string
+    base_model: string
+    design_model: string
     speaker: string
     language: string
     device: string
+    pause_between_speakers_ms: number
+    pause_same_speaker_ms: number
+    parallel_workers: number
     api_base: string
     api_key: string
     voice: string
@@ -236,6 +266,11 @@ export interface AppConfig {
     system_prompt: string
     user_prompt: string
   }
+  persona_prompts: {
+    system_prompt: string
+    user_prompt: string
+    advanced_prompt: string
+  }
   generation: {
     chunk_size: number
     max_tokens: number
@@ -249,4 +284,15 @@ export interface AppConfig {
   ffmpeg: { ffmpeg_path: string; ffprobe_path: string }
   log: { level: string }
   ui: { theme: string }
+}
+
+/** Workspace state from ``GET /api/workspace``. */
+export interface WorkspaceInfo {
+  set: boolean
+  /** The workspace folder; empty string when no workspace is set. */
+  path: string
+  /** True when no user workspace is set yet (pipeline is locked). */
+  is_default: boolean
+  /** Artifact directory name → absolute path (01_input, 02_split_text, …); empty when unset. */
+  dirs: Record<string, string>
 }

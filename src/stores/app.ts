@@ -1,6 +1,5 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { useIntervalFn } from '@vueuse/core'
 import { health } from '@/api/client'
 
 /** Global app state: backend connectivity (drives the sidebar status dot). */
@@ -19,7 +18,8 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
-  useIntervalFn(ping, 3000)
+  // The store is an app-lifetime singleton — the interval never needs clearing.
+  window.setInterval(ping, 3000)
   ping()
 
   return { backendUp, lastError, ping }

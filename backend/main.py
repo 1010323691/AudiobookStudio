@@ -3,8 +3,7 @@
 Run (API only):      ``python -m backend.main``  →  http://127.0.0.1:8642
 Run (whole app):     ``npm run build`` then the same command, and open
                      http://127.0.0.1:8642 — the backend also serves the built
-                     frontend, so the full console runs with no Rust and no Vite.
-The Tauri shell (when built) launches this process and polls ``/api/health``.
+                     frontend, so the full console runs on the backend alone.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ from .api import script as api_script
 from .api import tasks as api_tasks
 from .api import text as api_text
 from .api import tts as api_tts
+from .api import workspace as api_workspace
 from .core import config as core_config
 from .core import logging_setup
 from .core.paths import get_layout
@@ -40,6 +40,7 @@ ROUTERS = [
     api_audio.router,
     api_tts.router,
     api_script.router,
+    api_workspace.router,
 ]
 
 
@@ -52,7 +53,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="AudiobookStudio Backend", version="0.1.0", lifespan=lifespan)
 
-# Local desktop client; origins are loopback / the Tauri webview.
+# Local client on this machine; origins are loopback addresses.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,7 +75,7 @@ def health() -> dict:
 # Static frontend (optional fallback).
 #
 # Serves the Vite build (``dist/``) so the entire console can run from the
-# backend alone — no Rust toolchain and no Vite dev server required:
+# backend alone, without a Vite dev server:
 #
 #     npm run build            #  →  dist/
 #     python -m backend.main   #  →  open http://127.0.0.1:8642
@@ -82,7 +83,7 @@ def health() -> dict:
 # Registered LAST, so every ``/api/...`` route (added above) still wins. Real
 # assets resolve from ``dist/``; any other path falls back to ``index.html``
 # so the client-side router can handle deep links (``/text``, ``/book`` …).
-# When ``dist/`` is absent (e.g. during ``tauri dev``, where Vite serves the UI)
+# When ``dist/`` is absent (e.g. during ``npm run dev``, where Vite serves the UI)
 # these routes simply return 503 and the API is unaffected.
 # ---------------------------------------------------------------------------
 DIST_DIR = Path(__file__).resolve().parent.parent / "dist"
@@ -115,6 +116,20 @@ def spa(full_path: str) -> Response:
         media_type="text/plain; charset=utf-8",
         content="index.html missing in dist/. Run `npm run build`.",
     )
+
+
+# The GET catch-all above only covers GET, so a non-GET request to an unknown
+# /api/... path would otherwise fall through to FastAPI's 405 ("method not
+# allowed" — wrong: the *route* doesn't exist). Answer 404 for those too, so
+# every unknown /api/... is an honest "Not Found" regardless of verb. Real API
+# routes are registered earlier and always win.
+@app.api_route(
+    "/api/{full_path:path}",
+    methods=["POST", "PUT", "PATCH", "DELETE"],
+    include_in_schema=False,
+)
+def api_not_found(full_path: str) -> Response:
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 
 if __name__ == "__main__":

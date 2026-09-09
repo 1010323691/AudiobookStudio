@@ -8,13 +8,14 @@ const alertVariants = cva('relative flex items-start gap-3 rounded-lg border p-3
       default: 'border-border bg-card text-foreground',
       destructive: 'border-destructive/50 bg-destructive/10 text-destructive',
       info: 'border-primary/30 bg-primary/10 text-primary',
+      warning: 'border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-400',
     },
   },
   defaultVariants: { variant: 'default' },
 })
 
 interface Props {
-  variant?: 'default' | 'destructive' | 'info'
+  variant?: 'default' | 'destructive' | 'info' | 'warning'
   class?: string
 }
 const props = withDefaults(defineProps<Props>(), { variant: 'default' })

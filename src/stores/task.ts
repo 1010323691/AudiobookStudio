@@ -38,8 +38,10 @@ export const useTaskStore = defineStore('task', () => {
         if (e.current) t.current = e.current
         break
       case 'log':
-        t.logs.unshift({ level: e.level, msg: e.msg, t: e.t })
-        if (t.logs.length > 1000) t.logs.length = 1000
+        // Append chronologically (oldest first) so the UI shows the newest line at the
+        // bottom; the snapshot replay uses the same order. Trim the OLDEST lines first.
+        t.logs.push({ level: e.level, msg: e.msg, t: e.t })
+        if (t.logs.length > 1000) t.logs.splice(0, t.logs.length - 1000)
         break
       case 'status':
         // A terminal status arrives with the full snapshot (result / error); apply it

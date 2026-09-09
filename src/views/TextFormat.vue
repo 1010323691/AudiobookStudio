@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useToast } from '@/components/ui/toast'
 import { formatText } from '@/api/text'
-import { isTauri, downloadFile, reveal, pickFile } from '@/utils/tauri'
+import { downloadFile, pickFile } from '@/utils/fileops'
 import { formatNumber } from '@/utils/format'
 import type { TextFormatResult, TextToggles } from '@/types'
 
@@ -19,14 +19,15 @@ import Label from '@/components/ui/Label.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Alert from '@/components/ui/Alert.vue'
 import ScrollArea from '@/components/ui/ScrollArea.vue'
-import { FileText, ArrowRight, RefreshCw, FolderOpen, Download } from 'lucide-vue-next'
+import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
+import { FileText, ArrowRight, RefreshCw, Download } from 'lucide-vue-next'
 
 const router = useRouter()
 const settings = useSettingsStore()
 const project = useProjectStore()
+const { workspaceSet } = useWorkspaceGate()
 const { push: toast } = useToast()
-
-const inTauri = isTauri()
 
 const file = ref<{ path: string; name: string } | null>(null)
 const toggles = reactive<TextToggles>({
@@ -104,7 +105,7 @@ function goNext() {
 }
 
 function download(p: string) {
-  downloadFile('text', p)
+  downloadFile('01_input', p)
 }
 </script>
 
@@ -113,9 +114,11 @@ function download(p: string) {
     <div>
       <h1 class="text-2xl font-bold tracking-tight">文本排版</h1>
       <p class="text-muted-foreground mt-1">
-        将小说原文规整为段落与标点，输出到 <code class="text-xs">output/text/</code>。
+        将小说原文规整为段落与标点，输出到工作空间的 <code class="text-xs">01_input/</code>（自动加 <code class="text-xs">_排版</code> 新名，原件保留）。
       </p>
     </div>
+
+    <WorkspaceGateAlert />
 
     <!-- 选择文件 -->
     <Card>
@@ -151,7 +154,7 @@ function download(p: string) {
 
     <!-- 操作 -->
     <div class="flex flex-wrap items-center gap-3">
-      <Button @click="run()" :disabled="busy || !file">
+      <Button @click="run()" :disabled="busy || !file || !workspaceSet">
         <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': busy }" />
         {{ busy ? '排版中…' : '开始排版' }}
       </Button>
@@ -194,9 +197,6 @@ function download(p: string) {
         <div class="flex items-center gap-2">
           <Button variant="outline" size="sm" @click="download(result.output_path)">
             <Download class="h-4 w-4" />下载
-          </Button>
-          <Button v-if="inTauri" variant="outline" size="sm" @click="reveal(result.output_path)">
-            <FolderOpen class="h-4 w-4" />打开
           </Button>
         </div>
         <Button size="sm" @click="goNext">前往下一步（分册切割）<ArrowRight class="h-4 w-4" /></Button>

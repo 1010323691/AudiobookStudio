@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { useSettingsStore } from '@/stores/settings'
+import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { generateScript, getScriptResult } from '@/api/script'
-import { isTauri, downloadFile, reveal } from '@/utils/tauri'
+import { downloadFile } from '@/utils/fileops'
+import { useLogAutoFollow } from '@/utils/log-follow'
 import type { AppConfig, ScriptGenerateResult } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
@@ -21,6 +22,8 @@ import Label from '@/components/ui/Label.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import Progress from '@/components/ui/Progress.vue'
+import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
   Server,
   SlidersHorizontal,
@@ -32,15 +35,13 @@ import {
   XCircle,
   CheckCircle2,
   Download,
-  FolderOpen,
-  ListTodo,
 } from 'lucide-vue-next'
 
-const router = useRouter()
 const settings = useSettingsStore()
+const project = useProjectStore()
 const taskStore = useTaskStore()
+const { workspaceSet } = useWorkspaceGate()
 const { push: toast } = useToast()
-const inTauri = isTauri()
 
 // Config sections (local drafts; each is saved independently via settings.save so
 // the values persist to config/app.json and survive a restart — requirement #2/#3).
@@ -65,8 +66,10 @@ const taskId = ref<string | null>(null)
 const result = ref<ScriptGenerateResult | null>(null)
 
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value))
-// Newest-first log lines (the store prepends live log events) — latest activity on top.
-const logLines = computed(() => (task.value?.logs ?? []).slice(0, 8).map((l) => l.msg))
+// Newest lines at the bottom (the store appends chronologically) — latest activity last.
+const logLines = computed(() => (task.value?.logs ?? []).slice(-8).map((l) => l.msg))
+// Follow the live log to its bottom while the user is reading the tail.
+const { bind: bindLog } = useLogAutoFollow(() => task.value?.logs ?? [])
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
@@ -131,6 +134,7 @@ watch(
       result.value = t.result as ScriptGenerateResult
       taskId.value = null
       busy.value = false
+      project.recordScript(result.value)
       toast({ title: '解析完成', variant: 'success', description: `共 ${result.value?.count ?? 0} 条` })
     } else if (st === 'failed') {
       error.value = t.error || '解析失败'
@@ -150,13 +154,7 @@ function cancel() {
 }
 
 function download() {
-  if (result.value) downloadFile('tts', result.value.output_path)
-}
-function openDir() {
-  if (!result.value?.output_path) return
-  const p = result.value.output_path
-  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
-  reveal(i > 0 ? p.slice(0, i) : p)
+  if (result.value) downloadFile('03_parsed_json', result.value.output_path)
 }
 </script>
 
@@ -169,9 +167,11 @@ function openDir() {
       <p class="mt-1 text-muted-foreground">
         输入小说原文，调用 LLM 按 Prompt 生成
         <code class="text-xs">speaker / text / instruct</code> 的 JSON（迁移自源项目），
-        结果直接对接本地 TTS 合成。
+        结果直接用于音频合成。
       </p>
     </div>
+
+    <WorkspaceGateAlert />
 
     <!-- LLM 配置 -->
     <Card>
@@ -265,7 +265,7 @@ function openDir() {
         <Textarea v-model="text" rows="10" placeholder="在此粘贴要解析的小说文本…" :disabled="busy" />
 
         <div class="flex flex-wrap items-center gap-3">
-          <Button @click="doParse" :disabled="busy || !text.trim()">
+          <Button @click="doParse" :disabled="busy || !text.trim() || !workspaceSet">
             <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
             <ScanText v-else class="h-4 w-4" />
             {{ busy ? '解析中…' : '开始解析' }}
@@ -283,6 +283,7 @@ function openDir() {
             </div>
             <Progress :value="task.progress" />
             <div
+              :ref="bindLog"
               class="max-h-40 space-y-0.5 overflow-y-auto rounded bg-black/20 p-2 font-mono text-xs text-muted-foreground"
             >
               <div v-for="(l, i) in logLines" :key="i" class="truncate">{{ l }}</div>
@@ -298,7 +299,6 @@ function openDir() {
               解析完成：共 {{ result.count }} 条 · 讲者：{{ result.speakers.join('、') }}
             </span>
             <Button variant="outline" size="sm" @click="download"><Download class="h-3.5 w-3.5" />下载 JSON</Button>
-            <Button v-if="inTauri" variant="outline" size="sm" @click="openDir"><FolderOpen class="h-3.5 w-3.5" />打开目录</Button>
           </Alert>
 
           <div class="overflow-x-auto rounded-md border">
@@ -323,11 +323,10 @@ function openDir() {
           </div>
         </div>
       </CardContent>
-      <CardFooter class="justify-between">
+      <CardFooter>
         <span class="text-xs text-muted-foreground">
-          输出：<code class="text-xs">output/tts/annotated_script.json</code>（可直接用于 TTS 合成）
+          输出：<code class="text-xs">03_parsed_json/annotated_script.json</code>（可直接用于音频合成）
         </span>
-        <Button variant="outline" size="sm" @click="router.push('/tasks')"><ListTodo class="h-4 w-4" />任务中心</Button>
       </CardFooter>
     </Card>
 

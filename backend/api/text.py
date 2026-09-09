@@ -1,8 +1,10 @@
 """Text-formatting endpoint (module: 文本排版).
 
-Reads a TXT, formats it with the ported engine, writes the result to
-``output/text/<原文件名>`` and returns stats + a preview (the preview pane is a
-deliberate enhancement over the source tool, which only showed stats).
+Reads a TXT, formats it with the ported engine, writes the result to the
+workspace's ``01_input/`` under a *new* name (``<原基名>_排版<扩展名>`` — the
+original upload is preserved alongside it) and returns stats + a preview (the
+preview pane is a deliberate enhancement over the source tool, which only showed
+stats).
 """
 from __future__ import annotations
 
@@ -26,12 +28,14 @@ class FormatRequest(BaseModel):
 
 @router.post("/format")
 def format_text_endpoint(req: FormatRequest) -> dict:
+    _common.require_workspace()
     text, enc, src = _common.read_decoded_file(req.path)
 
     cfg = _common.partial_copy(get_config().text, req.config)
     result = format_text(text, cfg)
 
-    out_path: Path = get_layout().output_text / src.name
+    # New name (``<基名>_排版<扩展名>``) so the original upload in 01_input/ is kept.
+    out_path: Path = get_layout().input / f"{src.stem}_排版{src.suffix}"
     # write_bytes: keep the formatted text's line endings as-is (no CRLF translation).
     out_path.write_bytes(result["text"].encode("utf-8"))
 

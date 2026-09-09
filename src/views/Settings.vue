@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useAppStore } from '@/stores/app'
 import { useToast } from '@/components/ui/toast'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import { health } from '@/api/client'
 import type { AppConfig, TextToggles } from '@/types'
 
@@ -37,6 +38,7 @@ import {
 const settings = useSettingsStore()
 const app = useAppStore()
 const { push: toast } = useToast()
+const { workspaceSet } = useWorkspaceGate()
 
 const draft = ref<AppConfig | null>(null)
 const saving = ref(false)
@@ -83,7 +85,7 @@ async function save() {
   saving.value = true
   const ok = await settings.save(draft.value)
   saving.value = false
-  if (ok) toast({ title: '设置已保存', variant: 'success', description: '已写入 config/app.json，重启后自动恢复。' })
+  if (ok) toast({ title: '设置已保存', variant: 'success', description: '已写入工作空间的 config/app.json，重启后自动恢复。' })
   else toast({ title: '保存失败', variant: 'destructive' })
 }
 </script>
@@ -93,9 +95,9 @@ async function save() {
     <div class="flex items-center justify-between">
       <div>
         <h1 class="text-2xl font-bold tracking-tight">设置</h1>
-        <p class="mt-1 text-muted-foreground">统一配置（<code class="text-xs">config/app.json</code>），持久化并在重启后恢复。</p>
+        <p class="mt-1 text-muted-foreground">统一配置（工作空间目录下的 <code class="text-xs">config/app.json</code>），持久化并在重启后恢复。</p>
       </div>
-      <Button @click="save" :disabled="saving || !draft">
+      <Button @click="save" :disabled="saving || !draft || !workspaceSet">
         <Save class="h-4 w-4" />{{ saving ? '保存中…' : '保存设置' }}
       </Button>
     </div>
@@ -105,6 +107,11 @@ async function save() {
     </Alert>
 
     <template v-else>
+      <!-- 未设工作空间时提示（配置随工程，未开工不可保存） -->
+      <Alert v-if="!workspaceSet" variant="warning">
+        尚未选择工作空间。配置按工程（工作空间）管理，需先在「开始」页选择一个文件夹后才能保存设置。
+      </Alert>
+
       <!-- 后端状态 -->
       <Card>
         <CardHeader>
@@ -143,16 +150,20 @@ async function save() {
         </CardContent>
       </Card>
 
-      <!-- 工作目录 -->
+      <!-- 工作空间（在「开始」页设置，此处只读） -->
       <Card>
         <CardHeader>
-          <CardTitle class="flex items-center gap-2"><FolderCog class="h-5 w-5" />工作目录</CardTitle>
+          <CardTitle class="flex items-center gap-2"><FolderCog class="h-5 w-5" />工作空间</CardTitle>
         </CardHeader>
         <CardContent class="space-y-2">
           <Label>目录</Label>
-          <Input v-model="draft.paths.working_dir" placeholder="留空使用默认 workspace/" />
+          <Input
+            :model-value="draft.paths.working_dir"
+            readonly
+            :placeholder="workspaceSet ? '' : '未设置——请在「开始」页选择文件夹'"
+          />
           <p class="text-xs text-muted-foreground">
-            统一布局：input/ · output/{text,books,tts,audio} · temp/ · logs/ · config/。留空则使用应用内默认目录。
+            工作空间在「开始」页选择。配置、日志与全部产物都按固定子目录保存在该目录下：config/ · logs/ · 00_temp/ … 07_output/。
           </p>
         </CardContent>
       </Card>
@@ -254,7 +265,7 @@ async function save() {
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2">
-            <Mic class="h-5 w-5" />TTS 合成
+            <Mic class="h-5 w-5" />TTS 引擎
             <Badge variant="success" class="ml-1">本地引擎</Badge>
           </CardTitle>
         </CardHeader>
@@ -289,7 +300,7 @@ async function save() {
       </Card>
 
       <div class="flex justify-end">
-        <Button @click="save" :disabled="saving">
+        <Button @click="save" :disabled="saving || !workspaceSet">
           <Save class="h-4 w-4" />{{ saving ? '保存中…' : '保存设置' }}
         </Button>
       </div>

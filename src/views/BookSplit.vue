@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useToast } from '@/components/ui/toast'
 import { analyzeBook, splitBook } from '@/api/book'
-import { isTauri, downloadFile, reveal, pickFile } from '@/utils/tauri'
+import { downloadFile, pickFile } from '@/utils/fileops'
 import { formatNumber } from '@/utils/format'
 import type { BookAnalyzeResult, BookSplitResult } from '@/types'
 
@@ -21,6 +21,8 @@ import Switch from '@/components/ui/Switch.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import ScrollArea from '@/components/ui/ScrollArea.vue'
+import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
+import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import Table from '@/components/ui/Table.vue'
 import TableHeader from '@/components/ui/TableHeader.vue'
 import TableBody from '@/components/ui/TableBody.vue'
@@ -32,7 +34,6 @@ import {
   ArrowRight,
   Search,
   Scissors,
-  FolderOpen,
   Download,
   AlertTriangle,
   ArrowLeft,
@@ -41,8 +42,8 @@ import {
 const router = useRouter()
 const settings = useSettingsStore()
 const project = useProjectStore()
+const { workspaceSet } = useWorkspaceGate()
 const { push: toast } = useToast()
-const inTauri = isTauri()
 
 const file = ref<{ path: string; name: string } | null>(null)
 const targetChars = ref<number>(0) // 0 -> fall back to the config default
@@ -119,7 +120,7 @@ async function split() {
 }
 
 function goNext() {
-  if (project.bookOutputs.length) router.push('/tts')
+  if (project.bookOutputs.length) router.push('/script')
   else toast({ title: '请先完成分册', variant: 'destructive' })
 }
 
@@ -133,9 +134,11 @@ function download(path: string, module: string) {
     <div>
       <h1 class="text-2xl font-bold tracking-tight">分册切割</h1>
       <p class="text-muted-foreground mt-1">
-        按章节边界把长文均衡切分为若干分册，输出到 <code class="text-xs">output/books/</code>。仅在章节处切割、绝不重编号。
+        按章节边界把长文均衡切分为若干分册，输出到工作空间的 <code class="text-xs">02_split_text/</code>。仅在章节处切割、绝不重编号。
       </p>
     </div>
+
+    <WorkspaceGateAlert />
 
     <!-- 选择文件 -->
     <Card>
@@ -185,7 +188,7 @@ function download(path: string, module: string) {
       <Button variant="outline" @click="analyze" :disabled="busyAnalyze || !file">
         <Search class="h-4 w-4" />{{ busyAnalyze ? '分析中…' : '分析' }}
       </Button>
-      <Button @click="split" :disabled="busySplit || !file || !analysis || !!analysis.error">
+      <Button @click="split" :disabled="busySplit || !file || !analysis || !!analysis.error || !workspaceSet">
         <Scissors class="h-4 w-4" />{{ busySplit ? '分册中…' : '开始分册' }}
       </Button>
       <Button variant="outline" @click="goNext" :disabled="!splitResult">
@@ -293,11 +296,8 @@ function download(path: string, module: string) {
               <TableCell class="text-right">{{ formatNumber(f.chars) }}</TableCell>
               <TableCell class="text-right">
                 <div class="flex items-center justify-end gap-1">
-                  <Button variant="ghost" size="sm" @click="download(f.path, 'books')">
+                  <Button variant="ghost" size="sm" @click="download(f.path, '02_split_text')">
                     <Download class="h-3.5 w-3.5" />
-                  </Button>
-                  <Button v-if="inTauri" variant="ghost" size="sm" @click="reveal(f.path)">
-                    <FolderOpen class="h-3.5 w-3.5" />
                   </Button>
                 </div>
               </TableCell>
@@ -306,10 +306,10 @@ function download(path: string, module: string) {
         </Table>
       </CardContent>
       <CardFooter class="justify-between">
-        <Button v-if="splitResult.zip_path" variant="outline" size="sm" @click="download(splitResult.zip_path!, 'books')">
+        <Button v-if="splitResult.zip_path" variant="outline" size="sm" @click="download(splitResult.zip_path!, '02_split_text')">
           <Download class="h-4 w-4" />下载 zip
         </Button>
-        <Button size="sm" @click="goNext">前往下一步（TTS 合成）<ArrowRight class="h-4 w-4" /></Button>
+        <Button size="sm" @click="goNext">前往下一步（文本解析）<ArrowRight class="h-4 w-4" /></Button>
       </CardFooter>
     </Card>
   </div>

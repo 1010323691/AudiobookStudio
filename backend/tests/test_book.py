@@ -322,15 +322,3 @@ def test_build_zip_roundtrip(tmp_path):
         assert zf.read("分册01.txt") == "第一章内容".encode("utf-8")
         # STORED (no compression) -> compress_type is ZIP_STORED
         assert zf.infolist()[0].compress_type == zipfile.ZIP_STORED
-
-
-# --------------------------------------------------------------------------- #
-# format_number
-# --------------------------------------------------------------------------- #
-
-def test_format_number():
-    assert B.format_number(1234567) == "1,234,567"
-    assert B.format_number(1000) == "1,000"
-    assert B.format_number(999) == "999"
-    assert B.format_number(-1234) == "-1,234"
-    assert B.format_number(None) == "–"

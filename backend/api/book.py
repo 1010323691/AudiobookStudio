@@ -1,8 +1,8 @@
 """Book-splitting endpoints (module: 分册切割).
 
 ``POST /api/book/analyze`` previews the split (chapters + volume plan + filenames,
-no files written); ``POST /api/book/split`` writes the volumes to
-``output/books/`` (optionally a STORE zip as well). Both honour the "no chapters
+no files written); ``POST /api/book/split`` writes the volumes to the workspace's
+``02_split_text/`` (optionally a STORE zip as well). Both honour the "no chapters
 -> stop, never force-split" invariant.
 """
 from __future__ import annotations
@@ -91,6 +91,7 @@ def analyze(req: AnalyzeRequest) -> dict:
 
 @router.post("/split")
 def split(req: SplitRequest) -> dict:
+    _common.require_workspace()
     prep = _prepare(req.path, _target(req))
     chapters, volumes = prep["chapters"], prep["volumes"]
     if not chapters:
@@ -103,7 +104,7 @@ def split(req: SplitRequest) -> dict:
     written = []
     for v, name in zip(volumes, filenames):
         content = B.volume_content(prep["analysis"], v)
-        out_path = layout.output_books / name
+        out_path = layout.split_text / name
         # Write raw bytes (no newline translation) so the volume reproduces the
         # source's line endings exactly — Path.write_text would turn \n into \r\n
         # on Windows and corrupt the round-trip guarantee.
@@ -111,12 +112,12 @@ def split(req: SplitRequest) -> dict:
         written.append({"name": name, "path": str(out_path), "chars": v["chars"]})
 
     result: dict = {
-        "output_dir": str(layout.output_books),
+        "output_dir": str(layout.split_text),
         "file_count": len(written),
         "files": written,
     }
     if req.as_zip:
-        zip_path = layout.output_books / f"{base}.zip"
+        zip_path = layout.split_text / f"{base}.zip"
         B.build_zip(
             [(w["name"], B.volume_content(prep["analysis"], v).encode("utf-8"))
              for v, w in zip(volumes, written)],

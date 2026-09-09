@@ -1,15 +1,9 @@
-import { http } from './client'
+import { API_BASE, http } from './client'
 import type { TaskControl, TaskSnapshot } from '@/types'
 
 /** List all tasks (newest first). */
 export function listTasks(): Promise<TaskSnapshot[]> {
   return http.get<TaskSnapshot[]>('/api/tasks')
-}
-
-/** Get one task's snapshot. */
-export function getTask(id: string): Promise<TaskSnapshot> {
-  return http.get<TaskSnapshot>(`/api/tasks/${id}`
-)
 }
 
 /** cancel / pause / resume / retry. */
@@ -27,8 +21,7 @@ export function streamTask(
   onEvent: (e: { type: string; [k: string]: any }) => void,
   onDone?: () => void,
 ): () => void {
-  const base = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8642'
-  const es = new EventSource(`${base}/api/tasks/${id}/stream`)
+  const es = new EventSource(`${API_BASE}/api/tasks/${id}/stream`)
 
   // The backend emits every frame as a plain `data:` line (no `event:` field),
   // so the browser delivers them all as `message` events — dispatch on the JSON
