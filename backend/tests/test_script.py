@@ -230,8 +230,8 @@ class _Handle:
     def llm_chunk(self, text: str) -> None:
         self.chunks.append(text)
 
-    def llm_rate(self, tps: float) -> None:
-        self.rates.append(tps)
+    def llm_rate(self, chars: int, cps: float) -> None:
+        self.rates.append(cps)
 
     def log(self, *a, **k):
         pass

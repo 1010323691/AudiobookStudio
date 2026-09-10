@@ -165,8 +165,8 @@ def _cut_worker(handle, path, target, smart_align, tolerance, naming, start_numb
     if len(segments) > A.MAX_SEGMENTS:
         raise RuntimeError(f"段数 {len(segments)} 超过上限 {A.MAX_SEGMENTS}。")
 
-    out_dir = get_layout().output
-    base = p.stem  # 原文件名（去扩展名）
+    base = p.stem  # 原文件名（去扩展名）= 包名；切集产物落到 07_output/<包名>/
+    out_dir = get_layout().output / base
     handle.progress(0.32, "开始切割")
     files = A.cut_segments(
         p, segments, out_dir, base, naming, start_number,
@@ -268,7 +268,10 @@ def zip_files(req: ZipRequest) -> dict:
         if not p.exists() or not p.is_file():
             raise HTTPException(400, f"文件不存在：{spec.name or p.name}")
         entries.append((spec.name or p.name, p))
-    zip_path = layout.output / f"{base}.zip"
+    # 打包 zip 与分集产物同处一个按源命名的子文件夹（07_output/<base>/）。
+    out_dir = layout.output / base
+    out_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = out_dir / f"{base}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
         for name, p in entries:
             zf.write(p, arcname=name)  # STORED: no re-encode, matches book build_zip

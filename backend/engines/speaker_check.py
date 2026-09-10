@@ -9,10 +9,13 @@ EVERY target entry's ``speaker`` in that single call.
 
 Per batch:
 - **no disagreement** (the re-judged batch matches the originals) → accept and move on;
-- **disagreement** → re-sample the SAME batch segment 3 times (never the wider context),
-  then vote per discrepant entry: a speaker holding ≥2 of the 3 votes wins; an entry whose
-  3 samples show no majority gets a 4th sample and is then resolved from all 4 (strict
-  majority, else its original speaker is kept).
+- **disagreement** → resolve by dynamic majority voting. Every discrepant entry starts with
+  two independent judgments already in hand — the 解析结果 (the original speaker) and the
+  检查结果 (the first check pass) — and a single retry adds a third; the three are voted. A
+  2:1 majority settles the entry with no further work; only a 1:1:1 tie escalates to a 2nd,
+  then a 3rd, retry, each folding its new sample into the running vote. An entry still tied
+  after the 3rd retry keeps its original speaker. This replaces the old unconditional 3×
+  re-sample (+ 4× tie-break): a clean 2:1 now costs one retry instead of always three.
 
 Only a target entry's ``speaker`` may change — ``text``/``instruct`` and every context
 neighbour are untouched, and every window is built from the ORIGINAL speakers (a batch is
@@ -41,7 +44,8 @@ from .script import _llm_chat_completion, _llm_chat_completion_stream
 
 
 # How many entries are re-judged per LLM call. A batch whose re-judged speakers disagree
-# with the originals is re-sampled (3×, then a 4× tie-break) — see ``check_file``.
+# with the originals is resolved by dynamic majority voting (1–3 retries, stopping at the
+# first 2:1) — see ``check_file``.
 BATCH_SIZE = 20
 
 
@@ -330,7 +334,8 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
     Contract: first arg is the :class:`TaskHandle`; the second is the absolute path of the
     ORIGINAL ``<stem>.json`` in ``03_parsed_json/``. Entries are re-judged ``BATCH_SIZE``
     at a time (one LLM call each); a batch whose re-judged speakers disagree with the
-    originals is re-sampled 3× (then a 4× tie-break) and resolved by majority. Concurrency
+    originals is resolved by dynamic majority voting (original + first check + 1–3 retries,
+    stopping at the first 2:1). Concurrency
     is bounded by the shared gate (``generation.max_concurrency``) like parsing — one slot
     held for the whole file. Only a target entry's ``speaker`` may change; the original
     file is never modified (a new ``<stem>_checked.json`` is written once at the end).
@@ -385,7 +390,7 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
 
             handle.check()  # cooperative cancel / pause before the batch
             handle.progress(start / total, f"检查第 {start + 1}-{start + size} 条")
-            handle.llm_rate(0.0)  # reset the 吞吐 gauge for this call
+            handle.llm_rate(0, 0.0)  # reset the 吞吐 gauge for this call
             handle.log(f"检查第 {start + 1}-{start + size} 条（{size} 条/批）…")
 
             # -- First pass: re-judge the whole batch in one call -------------------
@@ -396,6 +401,7 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             except Exception as e:  # noqa: BLE001 — unreadable first pass → keep originals
                 handle.log(f"  首批解析失败，本批保留原 speaker：{e}", "WARNING")
                 first_map = {}
+            window_chars += len(context)  # this call sent the window to the model
 
             # Discrepant targets: a valid re-judged speaker that differs from the original.
             discrepant = [
@@ -404,49 +410,51 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             ]
 
             if discrepant:
-                # -- Branch 2: disagreement → re-sample the SAME batch 3× (then 4×) --
+                # -- Branch 2: disagreement → dynamic majority voting ----------------
+                # Each discrepant entry already holds two independent judgments: the 解析结果
+                # (the original speaker) and the 检查结果 (this first check pass). A retry adds
+                # a third sample; vote over the running total and stop the instant a 2:1
+                # majority forms. Only a 1:1:1 tie escalates to a 2nd, then a 3rd, retry — an
+                # entry still tied after the 3rd keeps its original speaker (per-item safety).
                 rechecked += len(discrepant)
-                handle.log(f"  检测到 {len(discrepant)} 条分歧，重新解析本片段（3 次投票）…")
-                samples = []  # one {index: speaker} map per re-run
-                for run in range(1, 4):  # 共 3 次解析
+                handle.log(f"  检测到 {len(discrepant)} 条分歧，进入动态投票…")
+                # votes[t] = the accumulated speaker judgments, in order:
+                # [解析结果, 检查结果, 重试1, (重试2), (重试3)].
+                votes: dict = {t: [original[t].get("speaker"), first_map[t]] for t in discrepant}
+
+                def retry_once(run: int, pending: list) -> list:
+                    """Re-send this batch's window (retry #run) and fold the new judgments
+                    into the votes of the ``pending`` entries; return the ones still tied."""
                     handle.check()
-                    handle.llm_rate(0.0)
-                    handle.log(f"  重新解析第 {run}/3 次…")
+                    handle.llm_rate(0, 0.0)
                     try:
-                        samples.append(parse_speaker_map(_llm_call(llm, generation, messages, handle), targets))
+                        m = parse_speaker_map(_llm_call(llm, generation, messages, handle), targets)
                     except TaskCancelled:
                         raise
-                    except Exception as e:  # noqa: BLE001 — a failed re-run just adds no votes
-                        handle.log(f"  重新解析第 {run}/3 次失败：{e}", "WARNING")
-                        samples.append({})
+                    except Exception as e:  # noqa: BLE001 — a failed retry adds no votes
+                        handle.log(f"  重试第 {run} 次失败，无新票：{e}", "WARNING")
+                        m = {}
+                    for t in pending:
+                        votes[t].append(m.get(t))  # a missing/failed entry contributes no vote
+                    return [t for t in pending if _pick_majority(votes[t]) is None]
 
-                # Resolve each entry from its 3 samples; remember which ones stay in a tie.
-                resolved: dict = {}
-                need_fourth = []
-                for t in discrepant:
-                    w = _pick_majority([s.get(t) for s in samples])
-                    resolved[t] = w
-                    if w is None:
-                        need_fourth.append(t)
-
-                # A 4th sample, run once, for the entries still in a tie after 3.
-                if need_fourth:
-                    handle.check()
-                    handle.llm_rate(0.0)
-                    handle.log(f"  {len(need_fourth)} 条三次无共识，进行第 4 次解析…")
-                    try:
-                        samples.append(parse_speaker_map(_llm_call(llm, generation, messages, handle), targets))
-                    except TaskCancelled:
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        handle.log(f"  第 4 次解析失败：{e}", "WARNING")
-                        samples.append({})
-                    for t in need_fourth:
-                        resolved[t] = _pick_majority([s.get(t) for s in samples])
+                handle.log(f"  重试第 1 次（3 样本：解析结果 + 检查结果 + 重试结果）…")
+                still = retry_once(1, discrepant)
+                window_chars += len(context)
+                if still:
+                    handle.log(f"  {len(still)} 条 1:1:1 无共识 → 重试第 2 次…")
+                    still = retry_once(2, still)
+                    window_chars += len(context)
+                    if still:
+                        handle.log(f"  {len(still)} 条仍无共识 → 重试第 3 次（末次）…")
+                        still = retry_once(3, still)
+                        window_chars += len(context)
+                        if still:
+                            handle.log(f"  {len(still)} 条重试 3 次仍无共识，保留原 speaker")
 
                 # Apply: adopt the majority only if it beats the original; else keep original.
                 for t in discrepant:
-                    winner = resolved[t]
+                    winner = _pick_majority(votes[t])
                     orig_sp = original[t].get("speaker")
                     if winner is not None and winner != orig_sp:
                         result[t]["speaker"] = winner  # only `speaker` changes
@@ -456,7 +464,6 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             # (no disagreement → the batch matches the originals; nothing to change)
 
             # Advance the cumulative metrics + progress for both branches.
-            window_chars += len(context)
             handle.llm_chars(window_chars, time.monotonic() - proc_start)
             handle.progress((start + size) / total, f"已检查 {start + size}/{total} 条")
 

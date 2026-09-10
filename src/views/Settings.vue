@@ -11,10 +11,12 @@ import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
+import CardDescription from '@/components/ui/CardDescription.vue'
 import CardContent from '@/components/ui/CardContent.vue'
 import CardFooter from '@/components/ui/CardFooter.vue'
 import Input from '@/components/ui/Input.vue'
 import Label from '@/components/ui/Label.vue'
+import Textarea from '@/components/ui/Textarea.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Select from '@/components/ui/Select.vue'
 import Badge from '@/components/ui/Badge.vue'
@@ -29,6 +31,10 @@ import {
   FolderCog,
   Type,
   BookOpen,
+  Server,
+  SlidersHorizontal,
+  MessageSquareText,
+  ShieldCheck,
   AudioLines,
   FileVideo,
   ScrollText,
@@ -192,6 +198,119 @@ async function save() {
           <Label class="w-28 shrink-0">目标字数</Label>
           <Input v-model.number="draft.book.target_chars" type="number" min="1" class="max-w-[180px]" />
           <span class="text-xs text-muted-foreground">每分册约多少字</span>
+        </CardContent>
+      </Card>
+
+      <!-- LLM 配置 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><Server class="h-5 w-5" />LLM 配置</CardTitle>
+          <CardDescription>
+            OpenAI 兼容端点（chat/completions）。本地 Ollama 默认为
+            <code class="text-xs">http://localhost:11434/v1</code>。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div class="space-y-1.5">
+            <Label>API 地址</Label>
+            <Input v-model="draft.llm.base_url" placeholder="http://localhost:11434/v1" />
+          </div>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <div class="space-y-1.5">
+              <Label>API Key</Label>
+              <Input v-model="draft.llm.api_key" placeholder="local" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>模型名称</Label>
+              <Input v-model="draft.llm.model_name" placeholder="如 qwen3:14b（必填）" />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- 生成参数 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><SlidersHorizontal class="h-5 w-5" />生成参数</CardTitle>
+          <CardDescription>分段大小与采样设置，作用于文本解析 / Speaker 检查的每次 LLM 请求。</CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div class="space-y-1.5">
+              <Label>分段大小（字）</Label>
+              <Input v-model.number="draft.generation.chunk_size" type="number" min="1" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>最大返回（tokens）</Label>
+              <Input v-model.number="draft.generation.max_tokens" type="number" min="1" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>温度</Label>
+              <Input v-model.number="draft.generation.temperature" type="number" step="0.1" min="0" max="2" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>Top-P</Label>
+              <Input v-model.number="draft.generation.top_p" type="number" step="0.05" min="0" max="1" />
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <Label>并发数（同时解析的文件数）</Label>
+            <div class="flex flex-wrap items-center gap-3">
+              <Input v-model.number="draft.generation.max_concurrency" type="number" min="1" step="1" class="max-w-[8rem]" />
+              <span class="text-xs text-muted-foreground">
+                受 LLM 服务 / 资源限制；超出并发的文件会排队，待有槽位时逐个进行。
+              </span>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- Prompt 配置 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><MessageSquareText class="h-5 w-5" />Prompt 配置</CardTitle>
+          <CardDescription>文本解析的默认 Prompt 来自源项目；可在此查看、修改并保存。留空则使用内置默认。</CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div class="space-y-1.5">
+            <Label>System Prompt</Label>
+            <Textarea v-model="draft.prompts.system_prompt" rows="8" class="font-mono text-xs" />
+          </div>
+          <div class="space-y-1.5">
+            <Label>User Prompt（模板，含 <code class="text-xs">context</code> / <code class="text-xs">chunk</code> 占位符）</Label>
+            <Textarea v-model="draft.prompts.user_prompt" rows="8" class="font-mono text-xs" />
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- Speaker 检查（独立于解析提示词 / 生成参数） -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><ShieldCheck class="h-5 w-5" />Speaker 检查</CardTitle>
+          <CardDescription>
+            解析完成后，对每条用「前后各 N 条」的上下文让 LLM 重新判断 <code class="text-xs">speaker</code>，
+            不同则只改 <code class="text-xs">speaker</code>，结果写入 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>
+            （原始 <code class="text-xs">.json</code> 不变）。检查提示词与上方解析提示词完全独立。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div class="space-y-1.5">
+            <Label>上下文窗口大小（当前条前后各取 N 条，共 2N+1 条）</Label>
+            <div class="flex flex-wrap items-center gap-3">
+              <Input v-model.number="draft.speaker_check.context_window" type="number" min="0" step="1" class="max-w-[8rem]" />
+              <span class="text-xs text-muted-foreground">
+                例如 4 → 前 4 条 + 当前条 + 后 4 条，共 9 条送入 LLM。
+              </span>
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <Label>检查 System Prompt</Label>
+            <Textarea v-model="draft.speaker_check.system_prompt" rows="6" class="font-mono text-xs" />
+          </div>
+          <div class="space-y-1.5">
+            <Label>检查 User Prompt（模板，含 <code class="text-xs">context</code> 占位符）</Label>
+            <Textarea v-model="draft.speaker_check.user_prompt" rows="6" class="font-mono text-xs" />
+          </div>
         </CardContent>
       </Card>
 

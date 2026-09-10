@@ -7,7 +7,7 @@ import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { runMerge, ttsStatus } from '@/api/tts'
 import { downloadFile, downloadUrl } from '@/utils/fileops'
-import type { MergeResult, TTSStatus } from '@/types'
+import type { DirListResult, MergeResult, TTSStatus } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -19,6 +19,7 @@ import CardFooter from '@/components/ui/CardFooter.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
+import DirPicker from '@/components/DirPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
@@ -46,6 +47,12 @@ const manifestChecked = ref(false)
 const manifestReady = ref(false)
 const manifestCount = ref(0)
 
+// Which audio package (a sub-folder in 05_audio_chunk/, one per parsed JSON) to
+// merge; '' = the most recent package (backend fallback). ``packages`` lists the
+// available package folders (captured from the picker's scan).
+const pkg = ref('')
+const packages = ref<string[]>([])
+
 const busy = ref(false)
 const error = ref('')
 const taskId = ref<string | null>(null)
@@ -54,20 +61,50 @@ const result = ref<MergeResult | null>(null)
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
 const playUrl = computed(() => (result.value ? downloadUrl('06_audio_merge', result.value.file) : ''))
 
-async function checkManifest() {
+// Human label for what will be merged (the selected package, or the most recent one).
+const manifestLabel = computed(() => {
+  if (!pkg.value) {
+    if (packages.value.length > 0) return `最近的包（共 ${packages.value.length} 个包可选）`
+    return manifestReady.value ? `已合成的 ${manifestCount.value} 段` : '合成结果'
+  }
+  return manifestReady.value ? `「${pkg.value}」包的 ${manifestCount.value} 段` : `「${pkg.value}」包`
+})
+
+async function readManifestCount(relName: string): Promise<{ ready: boolean; count: number }> {
   try {
-    const res = await fetch(downloadUrl('05_audio_chunk', 'manifest.json'))
+    const res = await fetch(downloadUrl('05_audio_chunk', relName))
     if (res.ok) {
       const m: any = await res.json()
-      if (Array.isArray(m)) {
-        manifestReady.value = m.length > 0
-        manifestCount.value = m.length
-      }
+      if (Array.isArray(m)) return { ready: m.length > 0, count: m.length }
     }
   } catch {
     /* not ready */
   }
+  return { ready: false, count: 0 }
+}
+
+// Re-check readiness: the selected package's manifest, else the most recent
+// package, else the legacy top-level manifest (older projects).
+async function checkManifest() {
+  if (pkg.value) {
+    const r = await readManifestCount(`${pkg.value}/manifest.json`)
+    manifestReady.value = r.ready
+    manifestCount.value = r.count
+  } else if (packages.value.length > 0) {
+    manifestReady.value = true
+    manifestCount.value = 0
+  } else {
+    const r = await readManifestCount('manifest.json')
+    manifestReady.value = r.ready
+    manifestCount.value = r.count
+  }
   manifestChecked.value = true
+}
+
+// The package list arrives from the DirPicker's scan; capture it, then re-check.
+function onScanned(r: DirListResult) {
+  packages.value = r.items.filter((i) => i.is_dir).map((i) => i.name)
+  checkManifest()
 }
 
 onMounted(async () => {
@@ -77,9 +114,10 @@ onMounted(async () => {
   } catch {
     status.value = { implemented: false, message: '后端未连接' }
   }
-  await checkManifest()
   taskStore.refresh()
 })
+
+watch(pkg, checkManifest)
 
 async function doRun(m4b = false) {
   if (busy.value) return
@@ -87,7 +125,7 @@ async function doRun(m4b = false) {
   error.value = ''
   result.value = null
   try {
-    const { task_id } = await runMerge(m4b)
+    const { task_id } = await runMerge(m4b, pkg.value || undefined)
     taskId.value = task_id
     await taskStore.refresh()
     // Completion is handled by the watcher on task.status.
@@ -139,8 +177,8 @@ function download() {
         </Badge>
       </h1>
       <p class="mt-1 text-muted-foreground">
-        按 JSON 顺序把所有段合并为一整本有声书（换人停顿 500ms / 同人 250ms），
-        输出 <code class="text-xs">cloned_audiobook.mp3</code> 到工作空间的 <code class="text-xs">06_audio_merge/</code>。
+        选择一个「音频包」（音频合成按每个解析 JSON 生成的子文件夹），将其所有段按顺序合并为一整本有声书
+        （换人停顿 500ms / 同人 250ms），输出 <code class="text-xs">06_audio_merge/&lt;包名&gt;.mp3</code> 到工作空间。
       </p>
     </div>
 
@@ -153,21 +191,26 @@ function download() {
 
     <template v-else>
       <Alert v-if="manifestChecked && !manifestReady" variant="warning">
-        未找到合成结果——请先到「音频合成」生成各段音频，再回来合并。
+        未找到合成结果——请先到「音频合成」生成各段音频（当前：{{ pkg ? `「${pkg}」包` : '最近的包' }}），再回来合并。
       </Alert>
 
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Combine class="h-5 w-5" />开始合并</CardTitle>
           <CardDescription>
-            将
-            <span class="font-medium text-foreground">
-              {{ manifestReady ? `已合成的 ${manifestCount} 段` : '合成结果' }}
-            </span>
+            将 <span class="font-medium text-foreground">{{ manifestLabel }}</span>
             按顺序合并为一整本；缺失的段会跳过并告警。
           </CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
+          <DirPicker
+            module="05_audio_chunk"
+            pick-dirs
+            v-model="pkg"
+            label="音频包（05_audio_chunk/）"
+            empty-hint="05_audio_chunk/ 下暂无音频包——请先到「音频合成」生成。"
+            @scanned="onScanned"
+          />
           <div class="flex flex-wrap items-center gap-3">
             <Button :disabled="busy || !workspaceSet" @click="doRun(false)">
               <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />

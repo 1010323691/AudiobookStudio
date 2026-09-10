@@ -30,7 +30,7 @@ import time
 import uuid
 
 from ..core.config import get_config
-from ..core.paths import PROJECT_ROOT, get_layout, resolve_parsed_json
+from ..core.paths import ALL_PARSED_JSON, PROJECT_ROOT, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from .persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT
 from .tts import _child_env, resolve_engine
 
@@ -319,17 +319,39 @@ def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=N
     """
     overrides = overrides or {}
 
-    # 1. Load the parsed script (the chosen file, or the most recent one).
-    script_path = resolve_parsed_json(script_name)
-    if not script_path.exists():
-        raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
-    try:
-        script = json.loads(script_path.read_text("utf-8"))
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"{script_path.name} 无法解析：{e}")
-    if not isinstance(script, list) or not script:
-        raise RuntimeError(f"{script_path.name} 为空——请先生成脚本。")
-    handle.log(f"读入脚本 {script_path.name}：{len(script)} 条")
+    # 1. Load the parsed script(s): the chosen file, the most recent one, or ALL of them.
+    if script_name == ALL_PARSED_JSON:
+        # Whole-book aggregate: concatenate every 分册 (each upgraded to its _checked
+        # copy) in reading order. An unreadable/empty file is skipped — the run continues.
+        script_paths = resolve_parsed_json_all()
+        if not script_paths:
+            raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
+        script = []
+        for sp in script_paths:
+            if not sp.exists():
+                continue
+            try:
+                data = json.loads(sp.read_text("utf-8"))
+            except Exception as e:  # noqa: BLE001 — skip an unreadable file, keep going
+                handle.log(f"{sp.name} 无法解析（{e}），已跳过。", "WARNING")
+                continue
+            if isinstance(data, list):
+                script.extend(data)
+                handle.log(f"读入 {sp.name}：{len(data)} 条")
+        if not script:
+            raise RuntimeError("所有脚本 JSON 均为空——请先生成脚本。")
+        handle.log(f"读入全部 {len(script_paths)} 个脚本：共 {len(script)} 条")
+    else:
+        script_path = resolve_parsed_json(script_name)
+        if not script_path.exists():
+            raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
+        try:
+            script = json.loads(script_path.read_text("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"{script_path.name} 无法解析：{e}")
+        if not isinstance(script, list) or not script:
+            raise RuntimeError(f"{script_path.name} 为空——请先生成脚本。")
+        handle.log(f"读入脚本 {script_path.name}：{len(script)} 条")
 
     # 2. Collect sample lines per speaker, in order of first appearance.
     samples: dict = {}

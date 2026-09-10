@@ -25,8 +25,7 @@ from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, resolve_engine, run_worker
 IMPLEMENTED = True
 
 
-def _load_script(script=None):
-    p = resolve_parsed_json(script)
+def _load_script(p):
     if not p.exists():
         raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
     try:
@@ -88,7 +87,8 @@ def _build_segments(script, indices=None):
 
 def synthesize(handle, indices=None, script=None) -> dict:
     """Task worker: synthesize all (or the selected) script lines, in JSON order."""
-    script = _load_script(script)
+    src = resolve_parsed_json(script)
+    script = _load_script(src)
 
     # voice_config is optional here — a character missing from it becomes a clear
     # per-segment error (the run continues), not a crash.
@@ -117,10 +117,18 @@ def synthesize(handle, indices=None, script=None) -> dict:
     if speakers_in_batch:
         handle.log(f"涉及角色：{'、'.join(speakers_in_batch)}")
 
+    # One package per source JSON: the batch output (segments + manifest) lands in a
+    # sub-folder named after the source's base stem, so 音频合并 can list & pick a
+    # package. A base and its _checked variant share the same package.
+    stem = src.stem
+    if stem.endswith("_checked"):
+        stem = stem[: -len("_checked")]
+    package = stem or "batch"
+
     layout = get_layout()
     seg_file = layout.temp / f"batch_segments_{uuid.uuid4().hex[:12]}.json"
     seg_file.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
-    out_dir = layout.audio_chunk
+    out_dir = layout.audio_chunk / package
     out_dir.mkdir(parents=True, exist_ok=True)
 
     python, worker = resolve_engine()

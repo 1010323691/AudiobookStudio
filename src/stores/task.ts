@@ -57,10 +57,12 @@ export const useTaskStore = defineStore('task', () => {
         break
       }
       case 'llm_rate':
-        // Live LLM generation rate (chars/s, the 吞吐量 / per-window gauge); the backend
-        // computes it from the actual streamed text. A later snapshot / terminal event
-        // replaces the whole task (which also carries llm_cps), so this self-corrects.
+        // Live LLM generation rate: ``cps`` is the instantaneous per-window rate (per-row 字/s
+        // gauge) and ``cps10`` is the 10-second-window average (吞吐量 card). The backend
+        // computes both from the actual streamed text. A later snapshot / terminal event
+        // replaces the whole task (carrying both), so this self-corrects.
         t.llm_cps = typeof e.cps === 'number' ? e.cps : 0
+        t.llm_cps_10s = typeof e.cps10 === 'number' ? e.cps10 : 0
         break
       case 'llm_chars':
         // Cumulative original-text chars (处理速度 numerator) + cumulative processing

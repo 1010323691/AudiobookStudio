@@ -35,6 +35,13 @@ TERMINAL = {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED}
 # sensitive, raise it for more reviewable history.
 LLM_STREAM_CAP = 128 * 1024
 
+# Length of the 文本解析 吞吐量 card's moving window (seconds). The backend keeps, per task,
+# the real streamed chars sampled against a monotonic clock and reports the average rate over
+# the most recent ``RATE_WINDOW`` seconds — a genuinely measured, smooth 10-second average
+# (vs. the instantaneous per-flush rate, which jitters). 10 s is long enough to straddle the
+# per-chunk gaps yet short enough to still read as "now".
+RATE_WINDOW = 10.0
+
 
 class TaskCancelled(Exception):
     """Raised by engine code to abort a task cleanly."""
@@ -65,15 +72,17 @@ class TaskHandle:
         """
         self._t.log_llm(text)
 
-    def llm_rate(self, cps: float) -> None:
-        """Report the current LLM generation rate (chars/s) to the UI.
+    def llm_rate(self, chars: int, cps: float) -> None:
+        """Report one generation-rate sample to the UI.
 
-        The 文本解析 engine computes this from the actual streamed text (content +
-        reasoning) as it arrives and reports it live; like ``llm_chunk`` it is
-        display-only and feeds the per-window 吞吐量 / ``字/s`` gauge (never the
-        parse/JSON pipeline).
+        ``chars`` is the streamed chars (content + reasoning) this flush produced and ``cps``
+        the instantaneous rate over the flush window; the task accumulates ``chars`` into a
+        monotonic total and samples it against the clock so it can report both the
+        instantaneous rate (per-window ``字/s`` gauge) and the 吞吐量 card's 10-second average.
+        Like ``llm_chunk`` it is display-only — never the parse/JSON pipeline. Real streamed
+        chars, never tokens.
         """
-        self._t.set_llm_rate(cps)
+        self._t.record_llm_rate(chars, cps)
 
     def llm_chars(self, chars: int, secs: float) -> None:
         """Report cumulative original-text chars processed + the processing time up to the
@@ -125,6 +134,21 @@ class Task:
     # gauge's denominator. Frozen at each chunk's completion (not a live clock), so the
     # gauge holds steady between chunks instead of decaying.
     llm_secs: float = 0.0
+    # 10-second-window average of the LLM generation rate (chars/s) for the 文本解析 吞吐量
+    # card — (chars generated over the last ``RATE_WINDOW`` s) / that span, computed in the
+    # backend from the real streamed chars (see ``record_llm_rate``) and replayed in the
+    # snapshot / SSE events. The thin client sums this over running tasks for the page total.
+    llm_cps_10s: float = 0.0
+    # Cumulative streamed chars (content + reasoning) for this task — a monotonic running
+    # total that ``record_llm_rate`` advances on every flush (reset on retry). Backs the
+    # 10-second window diff below; not sent to the client on its own.
+    llm_gen_total: int = 0
+    # (monotonic_ts, cumulative_gen_chars) samples retained within the last ``RATE_WINDOW``
+    # seconds — the 吞吐量 window's source. Oldest-first; samples older than the window are
+    # evicted on each update, so the diff (last - first) / (t_last - t_first) is the true
+    # average rate over "as much of the last 10 s as we have samples for" (full 10 s once
+    # steady, less for a young task, empty → 0 when the task has been idle past the window).
+    llm_gen_hist: deque = field(default_factory=deque)
     result: dict = field(default_factory=dict)
     error: str = ""
     created: float = field(default_factory=time.time)
@@ -167,10 +191,43 @@ class Task:
             self.llm_len -= len(self.llm_chunks.popleft())
         self._emit({"type": "llm_chunk", "data": text})
 
-    def set_llm_rate(self, cps: float) -> None:
-        """Set the live LLM generation rate (chars/s) and forward it over SSE (gauge)."""
+    def record_llm_rate(self, chars: int, cps: float) -> None:
+        """Record one generation-rate sample and forward the instantaneous + 10 s rates.
+
+        ``chars`` advances the monotonic streamed-char total; a (timestamp, total) sample is
+        appended and anything older than ``RATE_WINDOW`` is evicted, so the retained span is
+        the last 10 s (or less for a young task). ``llm_cps`` is the instantaneous rate
+        (per-window gauge, unchanged); ``llm_cps_10s`` is (chars over that span) / (span) — a
+        real, unbiased 10-second average the 吞吐量 card sums across running tasks. One
+        ``llm_rate`` SSE event carries both (``cps`` + ``cps10``).
+        """
+        now = time.monotonic()
         self.llm_cps = max(0.0, float(cps))
-        self._emit({"type": "llm_rate", "cps": self.llm_cps})
+        self.llm_gen_total += max(0, int(chars))
+        self.llm_gen_hist.append((now, self.llm_gen_total))
+        cutoff = now - RATE_WINDOW
+        while self.llm_gen_hist and self.llm_gen_hist[0][0] < cutoff:
+            self.llm_gen_hist.popleft()
+        self.llm_cps_10s = self._window_rate(self.llm_gen_hist)
+        self._emit({"type": "llm_rate", "cps": self.llm_cps, "cps10": self.llm_cps_10s})
+
+    @staticmethod
+    def _window_rate(hist: deque) -> float:
+        """Average chars/s over the retained (≤ ``RATE_WINDOW``) span of samples.
+
+        ``hist`` holds (monotonic_ts, cumulative_chars) oldest-first; the cumulative total is
+        monotonic, so (c_last - c_first) is exactly the chars generated within the span and
+        (c_last - c_first) / (t_last - t_first) is the true average rate over it — no bias
+        from how the flushes are spaced in time, and no estimation.
+        """
+        if len(hist) < 2:
+            return 0.0
+        ts0, c0 = hist[0]
+        ts1, c1 = hist[-1]
+        dt = ts1 - ts0
+        if dt <= 1e-3:  # ~zero span (only a flat reset sample, or a brand-new task) → no rate
+            return 0.0
+        return max(0.0, (c1 - c0) / dt)
 
     def set_llm_chars(self, chars: int, secs: float) -> None:
         """Set cumulative original-text chars + processing time and forward over SSE.
@@ -214,6 +271,7 @@ class Task:
             "logs": list(self.logs),
             "llm_stream": "".join(self.llm_chunks),
             "llm_cps": self.llm_cps,
+            "llm_cps_10s": self.llm_cps_10s,
             "llm_chars": self.llm_chars,
             "llm_secs": self.llm_secs,
             "result": self.result,
@@ -305,6 +363,9 @@ class TaskManager:
                 task.llm_chunks.clear()
                 task.llm_len = 0
                 task.llm_cps = 0.0
+                task.llm_cps_10s = 0.0
+                task.llm_gen_total = 0
+                task.llm_gen_hist.clear()
                 task.llm_chars = 0
                 task.llm_secs = 0.0
                 task.result = {}

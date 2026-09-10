@@ -58,7 +58,16 @@ export function downloadUrl(module: string, name: string): string {
  * Hand a backend output file to the user: navigate to the download URL — the
  * backend replies `Content-Disposition: attachment`, so the browser saves the
  * file to its Downloads folder.
+ *
+ * ``path`` may be a full absolute path (e.g. a per-package cut under
+ * ``07_output/<stem>/``) or a bare file name; the module-relative portion (everything
+ * after the last ``/<module>/``) is used, so nested per-package outputs download
+ * correctly. A bare name falls back to its base name.
  */
 export function downloadFile(module: string, path: string): void {
-  window.location.href = downloadUrl(module, path.split(/[\\/]/).pop() || path)
+  const norm = path.replace(/\\/g, '/')
+  const marker = `/${module}/`
+  const idx = norm.lastIndexOf(marker)
+  const name = idx >= 0 ? norm.slice(idx + marker.length) : (norm.split('/').pop() || path)
+  window.location.href = downloadUrl(module, name)
 }

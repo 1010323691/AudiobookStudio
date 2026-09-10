@@ -23,13 +23,44 @@ from .tts import resolve_engine, run_worker
 
 IMPLEMENTED = True
 
+# Windows-illegal filename characters (a package name becomes an output file name).
+_BAD_FILENAME_CHARS = set('\\/:*?"<>|')
 
-def run(handle, m4b: bool = False) -> dict:
-    """Task worker: merge the batch output into the final audiobook file."""
+
+def _find_manifest(layout, package: str | None) -> Path:
+    """The batch manifest to merge: the given package's ``manifest.json``, else the
+    most recent package's, else the legacy top-level ``05_audio_chunk/manifest.json``."""
+    d = layout.audio_chunk
+    if package:
+        return d / package / "manifest.json"
+    if d.exists():
+        cands = [p for p in d.glob("*/manifest.json") if p.is_file()]
+        if cands:
+            return max(cands, key=lambda p: p.stat().st_mtime)
+    return d / "manifest.json"
+
+
+def _output_name(manifest_path: Path, layout) -> str:
+    """``<包>.mp3`` for a package manifest; ``cloned_audiobook.mp3`` for the legacy
+    top-level manifest. Keeps one merged file per source book in ``06_audio_merge/``."""
+    if manifest_path.parent == layout.audio_chunk:  # top-level (pre-package) manifest
+        return "cloned_audiobook.mp3"
+    stem = "".join("_" if c in _BAD_FILENAME_CHARS else c for c in manifest_path.parent.name).strip()
+    return f"{stem or 'audiobook'}.mp3"
+
+
+def run(handle, m4b: bool = False, package: str | None = None) -> dict:
+    """Task worker: merge one package's batch output into the final audiobook file.
+
+    ``package`` names a sub-folder under ``05_audio_chunk/`` (one per source JSON,
+    written by the batch stage); when given, that package's manifest is used. When
+    omitted, the most recent package is merged (falling back to the legacy
+    top-level manifest for older projects).
+    """
     layout = get_layout()
-    manifest_path = layout.audio_chunk / "manifest.json"
+    manifest_path = _find_manifest(layout, package)
     if not manifest_path.exists():
-        raise RuntimeError("未找到合成结果清单（05_audio_chunk/manifest.json）——请先运行「音频合成」。")
+        raise RuntimeError("未找到合成结果清单（05_audio_chunk/<包>/manifest.json）——请先运行「音频合成」。")
     try:
         manifest = json.loads(manifest_path.read_text("utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -74,7 +105,7 @@ def run(handle, m4b: bool = False) -> dict:
 
     seg_file = layout.temp / f"merge_segments_{uuid.uuid4().hex[:12]}.json"
     seg_file.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
-    out_path = layout.audio_merge / "cloned_audiobook.mp3"
+    out_path = layout.audio_merge / _output_name(manifest_path, layout)
 
     python, worker = resolve_engine()
     cmd = [

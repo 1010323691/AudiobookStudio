@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
-import { useToast } from '@/components/ui/toast'
 import { generateScriptFiles, checkScriptFiles } from '@/api/script'
 import { listDir } from '@/api/files'
 import { downloadFile } from '@/utils/fileops'
 import { formatBytes } from '@/utils/format'
-import type { AppConfig, FileItem, TaskSnapshot } from '@/types'
+import type { FileItem, TaskSnapshot } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -16,9 +15,6 @@ import CardTitle from '@/components/ui/CardTitle.vue'
 import CardDescription from '@/components/ui/CardDescription.vue'
 import CardContent from '@/components/ui/CardContent.vue'
 import CardFooter from '@/components/ui/CardFooter.vue'
-import Input from '@/components/ui/Input.vue'
-import Textarea from '@/components/ui/Textarea.vue'
-import Label from '@/components/ui/Label.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import Progress from '@/components/ui/Progress.vue'
@@ -27,13 +23,9 @@ import LiveStreamPanel from '@/components/ui/LiveStreamPanel.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
-  Server,
-  SlidersHorizontal,
-  MessageSquareText,
   FileText,
   ScanText,
   ShieldCheck,
-  Save,
   Loader2,
   XCircle,
   CheckCircle2,
@@ -47,25 +39,9 @@ import {
 const settings = useSettingsStore()
 const taskStore = useTaskStore()
 const { workspaceSet } = useWorkspaceGate()
-const { push: toast } = useToast()
 
-// Config sections (local drafts; each is saved independently via settings.save so
-// the values persist to config/app.json and survive a restart — requirement #2/#3).
-const llm = reactive<AppConfig['llm']>({ base_url: 'http://localhost:11434/v1', api_key: 'local', model_name: '' })
-const generation = reactive<AppConfig['generation']>({
-  chunk_size: 3000,
-  max_tokens: 4096,
-  temperature: 0.6,
-  top_p: 0.8,
-  top_k: 0,
-  min_p: 0.0,
-  presence_penalty: 0.0,
-  banned_tokens: [],
-  max_concurrency: 3,
-})
-const prompts = reactive<AppConfig['prompts']>({ system_prompt: '', user_prompt: '' })
-// Speaker 检查配置 —— 独立于解析提示词（prompts）与生成参数（generation），单独编辑 / 保存。
-const check = reactive<AppConfig['speaker_check']>({ context_window: 4, system_prompt: '', user_prompt: '' })
+// LLM / 生成参数 / Prompt / Speaker 检查 的配置编辑已迁移到「设置」页；本页只从
+// settings.config 读取已保存的值（用于并发数显示与模型名校验），不再本地编辑 / 保存。
 
 // ---- File selection (02_split_text) + per-file parse jobs ------------------------
 // The user checks one or more split .txt files; each becomes an independent backend
@@ -162,7 +138,7 @@ const busy = computed(() => jobRows.value.some((r) => r.active))
 // so mirror it here to warn the user before they launch a batch that can't actually run in
 // parallel. A low value doesn't merely slow the batch: files beyond the cap queue and run
 // one/few at a time, which reads as "the LLM isn't concurrent" when it is.
-const effectiveConcurrency = computed(() => Math.max(1, Number(generation.max_concurrency) || 1))
+const effectiveConcurrency = computed(() => Math.max(1, Number(settings.config?.generation.max_concurrency) || 1))
 
 const concurrencyWarning = computed(() => {
   const n = selectedNames.value.length
@@ -175,29 +151,14 @@ const concurrencyWarning = computed(() => {
 })
 
 // ---- 性能指标（顶部 3 卡）：并发数 / 吞吐量 / 处理速度 ---------------------------
-// 吞吐量 (字/s): the sum of every *running* window's live LLM generation rate
-// (task.llm_cps, streamed in real time by the backend from the actual streamed text).
-// A ~200ms tick re-reads the current rates while any job is in flight; queued /
-// between-chunk windows report 0, so summing over running windows yields the total.
-const totalTps = ref(0)
-let tpsTimer: number | undefined
-function tickTps() {
+// 吞吐量 (字/s): 各运行中窗口「近 10 秒平均」生成速率之和。每个任务的 10 秒窗口速率
+// (task.llm_cps_10s) 由后端按真实流式字符算出（近 10 秒生成字符 ÷ 对应秒数）并经 SSE 实时推送；
+// 前端只把它们相加（同一时间窗口的速率可加：各运行窗口之和 = 总体近 10 秒平均）。用 computed
+// 跟随 SSE 事件重算，无需定时器；无运行中窗口时自然为 0，段间 / 排队窗口随时间在后端衰减。
+const totalTps = computed(() => {
   let sum = 0
-  for (const r of jobRows.value) if (r.task?.status === 'running') sum += r.task.llm_cps ?? 0
-  totalTps.value = sum
-}
-watch(busy, (b) => {
-  if (b) {
-    tickTps()
-    if (tpsTimer === undefined) tpsTimer = window.setInterval(tickTps, 200)
-  } else if (tpsTimer !== undefined) {
-    window.clearInterval(tpsTimer)
-    tpsTimer = undefined
-    totalTps.value = 0
-  }
-})
-onUnmounted(() => {
-  if (tpsTimer !== undefined) window.clearInterval(tpsTimer)
+  for (const r of jobRows.value) if (r.task?.status === 'running') sum += r.task.llm_cps_10s ?? 0
+  return sum
 })
 
 // 一批解析结束后自动刷新文件列表：把刚生成 JSON 的文件标记为「已完成」并收起其勾选。
@@ -223,34 +184,9 @@ const speedCps = computed(() => {
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
-  const c = settings.config
-  if (c) {
-    Object.assign(llm, c.llm)
-    Object.assign(generation, c.generation)
-    Object.assign(prompts, c.prompts) // GET seeds empty prompts from the bundled defaults
-    Object.assign(check, c.speaker_check) // GET seeds empty check prompts from the bundled defaults
-  }
   await loadFiles()
   taskStore.refresh()
 })
-
-async function saveSection(patch: Partial<AppConfig>, title: string) {
-  const ok = await settings.save(patch)
-  if (ok) toast({ title, variant: 'success', description: '已保存到 config/app.json，重启后自动恢复。' })
-  else toast({ title: '保存失败', variant: 'destructive' })
-}
-function saveLLM() {
-  saveSection({ llm: { ...llm } }, 'LLM 配置已保存')
-}
-function saveGeneration() {
-  saveSection({ generation: { ...generation } }, '生成参数已保存')
-}
-function savePrompts() {
-  saveSection({ prompts: { ...prompts } }, 'Prompt 已保存')
-}
-function saveCheck() {
-  saveSection({ speaker_check: { ...check } }, '检查配置已保存')
-}
 
 async function loadFiles() {
   if (!workspaceSet.value) {
@@ -305,7 +241,7 @@ async function startParse() {
   if (busy.value) return
   const names = selectedNames.value
   if (!names.length) return
-  if (!(llm.model_name || '').trim()) {
+  if (!(settings.config?.llm.model_name || '').trim()) {
     error.value = '请先填写 LLM 模型名称（模型不能为空）。'
     return
   }
@@ -321,7 +257,7 @@ async function startParse() {
 
 async function startCheck() {
   if (busy.value) return
-  if (!(llm.model_name || '').trim()) {
+  if (!(settings.config?.llm.model_name || '').trim()) {
     error.value = '请先填写 LLM 模型名称（模型不能为空）。'
     return
   }
@@ -366,131 +302,6 @@ function downloadJob(row: JobRow) {
     </div>
 
     <WorkspaceGateAlert />
-
-    <!-- LLM 配置 -->
-    <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2"><Server class="h-5 w-5" />LLM 配置</CardTitle>
-        <CardDescription>
-          OpenAI 兼容端点（chat/completions）。本地 Ollama 默认为
-          <code class="text-xs">http://localhost:11434/v1</code>。
-        </CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-3">
-        <div class="space-y-1.5">
-          <Label>API 地址</Label>
-          <Input v-model="llm.base_url" placeholder="http://localhost:11434/v1" />
-        </div>
-        <div class="grid gap-4 sm:grid-cols-2">
-          <div class="space-y-1.5">
-            <Label>API Key</Label>
-            <Input v-model="llm.api_key" placeholder="local" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>模型名称</Label>
-            <Input v-model="llm.model_name" placeholder="如 qwen3:14b（必填）" />
-          </div>
-        </div>
-        <div class="flex justify-end">
-          <Button size="sm" @click="saveLLM"><Save class="h-4 w-4" />保存配置</Button>
-        </div>
-      </CardContent>
-    </Card>
-
-    <!-- 生成参数 -->
-    <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2"><SlidersHorizontal class="h-5 w-5" />生成参数</CardTitle>
-        <CardDescription>分段大小与采样设置，作用于每次 LLM 请求。</CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-3">
-        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <div class="space-y-1.5">
-            <Label>分段大小（字）</Label>
-            <Input v-model.number="generation.chunk_size" type="number" min="1" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>最大返回（tokens）</Label>
-            <Input v-model.number="generation.max_tokens" type="number" min="1" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>温度</Label>
-            <Input v-model.number="generation.temperature" type="number" step="0.1" min="0" max="2" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>Top-P</Label>
-            <Input v-model.number="generation.top_p" type="number" step="0.05" min="0" max="1" />
-          </div>
-        </div>
-        <div class="space-y-1.5">
-          <Label>并发数（同时解析的文件数）</Label>
-          <div class="flex flex-wrap items-center gap-3">
-            <Input v-model.number="generation.max_concurrency" type="number" min="1" step="1" class="max-w-[8rem]" />
-            <span class="text-xs text-muted-foreground">
-              受 LLM 服务 / 资源限制；超出并发的文件会排队，待有槽位时逐个进行。
-            </span>
-          </div>
-        </div>
-        <div class="flex justify-end">
-          <Button size="sm" @click="saveGeneration"><Save class="h-4 w-4" />保存参数</Button>
-        </div>
-      </CardContent>
-    </Card>
-
-    <!-- Prompt 编辑 -->
-    <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2"><MessageSquareText class="h-5 w-5" />Prompt 配置</CardTitle>
-        <CardDescription>默认 Prompt 来自源项目；可在此查看、修改并保存。留空则使用内置默认。</CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-3">
-        <div class="space-y-1.5">
-          <Label>System Prompt</Label>
-          <Textarea v-model="prompts.system_prompt" rows="8" class="font-mono text-xs" />
-        </div>
-        <div class="space-y-1.5">
-          <Label>User Prompt（模板，含 <code class="text-xs">context</code> / <code class="text-xs">chunk</code> 占位符）</Label>
-          <Textarea v-model="prompts.user_prompt" rows="8" class="font-mono text-xs" />
-        </div>
-        <div class="flex justify-end">
-          <Button size="sm" @click="savePrompts"><Save class="h-4 w-4" />保存 Prompt</Button>
-        </div>
-      </CardContent>
-    </Card>
-
-    <!-- Speaker 检查（独立于解析提示词 / 生成参数） -->
-    <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2"><ShieldCheck class="h-5 w-5" />Speaker 检查</CardTitle>
-        <CardDescription>
-          解析完成后，对每条用「前后各 N 条」的上下文让 LLM 重新判断 <code class="text-xs">speaker</code>，
-          不同则只改 <code class="text-xs">speaker</code>，结果写入 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>
-          （原始 <code class="text-xs">.json</code> 不变）。检查提示词与上方解析提示词完全独立。
-        </CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-3">
-        <div class="space-y-1.5">
-          <Label>上下文窗口大小（当前条前后各取 N 条，共 2N+1 条）</Label>
-          <div class="flex flex-wrap items-center gap-3">
-            <Input v-model.number="check.context_window" type="number" min="0" step="1" class="max-w-[8rem]" />
-            <span class="text-xs text-muted-foreground">
-              例如 4 → 前 4 条 + 当前条 + 后 4 条，共 9 条送入 LLM。
-            </span>
-          </div>
-        </div>
-        <div class="space-y-1.5">
-          <Label>检查 System Prompt</Label>
-          <Textarea v-model="check.system_prompt" rows="6" class="font-mono text-xs" />
-        </div>
-        <div class="space-y-1.5">
-          <Label>检查 User Prompt（模板，含 <code class="text-xs">context</code> 占位符）</Label>
-          <Textarea v-model="check.user_prompt" rows="6" class="font-mono text-xs" />
-        </div>
-        <div class="flex justify-end">
-          <Button size="sm" @click="saveCheck"><Save class="h-4 w-4" />保存检查配置</Button>
-        </div>
-      </CardContent>
-    </Card>
 
     <!-- 选择待解析文件 -->
     <Card>
@@ -547,7 +358,7 @@ function downloadJob(row: JobRow) {
             已选 {{ selectedNames.length }} / {{ files.length }} 个
             <span v-if="doneCount"> · 已完成 {{ doneCount }} 个</span>
             <span v-if="checkedCount"> · 已检查 {{ checkedCount }} 个</span>
-            · 并发 {{ generation.max_concurrency }}
+            · 并发 {{ settings.config?.generation.max_concurrency ?? '—' }}
           </span>
         </div>
 
@@ -591,18 +402,18 @@ function downloadJob(row: JobRow) {
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
-        <!-- 性能指标（顶部 3 卡）：并发数（当前配置）/ 吞吐量（各窗口 字/s 求和，~200ms 刷新）/ 处理速度（累计已处理字÷距批次开始耗时，每完成一段即刷新） -->
+        <!-- 性能指标（顶部 3 卡）：并发数（当前配置）/ 吞吐量（各运行中窗口「近 10 秒平均」字/s 之和，随 SSE 实时刷新）/ 处理速度（累计已处理字÷累计处理耗时，每完成一段刷新、段间恒定） -->
         <div class="grid gap-3 sm:grid-cols-3">
           <div class="rounded-md border bg-muted/30 px-3 py-2">
             <div class="text-xs text-muted-foreground">并发数</div>
             <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ effectiveConcurrency }}</div>
           </div>
           <div class="rounded-md border bg-muted/30 px-3 py-2">
-            <div class="text-xs text-muted-foreground">吞吐量（字/s）</div>
+            <div class="text-xs text-muted-foreground" title="近 10 秒平均：各运行中窗口「近 10 秒生成字符 ÷ 对应秒数」之和（后端按真实流式字符计算，平滑不抖动）">吞吐量（字/s）</div>
             <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ Math.round(totalTps) }}</div>
           </div>
           <div class="rounded-md border bg-muted/30 px-3 py-2">
-            <div class="text-xs text-muted-foreground">处理速度（字/s）</div>
+            <div class="text-xs text-muted-foreground" title="累计平均：Σ已完成源字符 ÷ Σ累计处理耗时（自批次开始；每完成一段刷新、段间恒定）">处理速度（字/s）</div>
             <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ Math.round(speedCps) }}</div>
           </div>
         </div>
@@ -614,8 +425,8 @@ function downloadJob(row: JobRow) {
             <span
               class="shrink-0 text-xs tabular-nums"
               :class="['解析中', '检查中'].includes(row.state.label) ? 'text-primary' : 'text-muted-foreground'"
-              title="当前窗口实时生成速度（字/s，按 LLM 流式输出实测）"
-            >{{ ['解析中', '检查中'].includes(row.state.label) ? `${Math.round(row.task?.llm_cps ?? 0)} 字/s` : '—' }}</span>
+              title="本窗口近 10 秒平均生成速度（字/s，按 LLM 流式输出实测）"
+            >{{ ['解析中', '检查中'].includes(row.state.label) ? `${Math.round(row.task?.llm_cps_10s ?? 0)} 字/s` : '—' }}</span>
             <span class="shrink-0 w-10 text-right text-xs text-muted-foreground">
               {{ Math.round(row.progress * 100) }}%
             </span>

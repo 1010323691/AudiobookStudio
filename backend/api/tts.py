@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ..core.paths import get_layout, resolve_parsed_json
+from ..core.paths import ALL_PARSED_JSON, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from ..core.tasks import get_task_manager
 from ..engines import merge as Merge
 from ..engines import tts as T
@@ -55,12 +55,13 @@ class PrepareVoicesRequest(BaseModel):
 @router.post("/prepare-voices")
 def prepare_voices(req: PrepareVoicesRequest) -> dict:
     _common.require_workspace()
+    all_scope = "（全部解析文件）" if req.script == ALL_PARSED_JSON else ""
     if req.speakers:
-        label = f"重新生成 {len(req.speakers)} 个角色声音"
+        label = f"重新生成 {len(req.speakers)} 个角色声音{all_scope}"
     elif req.new_only:
-        label = "准备新增角色声音"
+        label = f"准备新增角色声音{all_scope}"
     else:
-        label = "准备所有角色声音"
+        label = f"准备所有角色声音{all_scope}"
     task = get_task_manager().create(
         "voices", label,
         V.prepare,
@@ -81,6 +82,27 @@ def _voice_usable(entry: dict) -> bool:
     return False
 
 
+def _fold_script(order: list[str], counts: dict[str, int], data) -> bool:
+    """Fold one parsed script (a list of entries) into the shared ``order``/``counts``.
+
+    Dedupes by speaker name (falling back to ``type``), sums line counts, and keeps
+    first-appearance order — the same folding the single-file path did inline, now shared
+    with the whole-book aggregate. Returns True when the file held a non-empty list (the
+    ``has_script`` signal).
+    """
+    if not isinstance(data, list) or not data:
+        return False
+    for entry in data:
+        sp = (entry.get("speaker") or entry.get("type") or "").strip()
+        if not sp:
+            continue
+        if sp not in counts:
+            counts[sp] = 0
+            order.append(sp)
+        counts[sp] += 1
+    return True
+
+
 @router.get("/voices")
 def list_voices(script: str | None = None) -> dict:
     """Detected characters + their voice-config state (ready/pending) + preview paths.
@@ -95,27 +117,29 @@ def list_voices(script: str | None = None) -> dict:
     if layout.parsed_json is None:  # no workspace: nothing to read (read-only, degrades)
         return {"has_script": False, "script_path": "", "voice_config_path": "", "speakers": []}
     out_voices = layout.voice_profiles
-    script_path = resolve_parsed_json(script)
     vc_path = out_voices / "voice_config.json"
+
+    # Which script(s) to read: every parsed JSON (the whole-book "all files" request) or
+    # the single named / most-recent one. ``script_path_out`` is only a display label.
+    if script == ALL_PARSED_JSON:
+        script_paths = resolve_parsed_json_all()
+        script_path_out = ""
+    else:
+        script_paths = [resolve_parsed_json(script)]
+        script_path_out = str(script_paths[0])
 
     has_script = False
     order: list[str] = []
     counts: dict[str, int] = {}
-    if script_path.exists():
+    for sp in script_paths:
+        if not sp.exists():
+            continue
         try:
-            script = json.loads(script_path.read_text("utf-8"))
-        except Exception:  # noqa: BLE001 — a corrupt script just means "no speakers"
-            script = []
-        if isinstance(script, list) and script:
+            data = json.loads(sp.read_text("utf-8"))
+        except Exception:  # noqa: BLE001 — a corrupt file just contributes no speakers
+            data = []
+        if _fold_script(order, counts, data):
             has_script = True
-            for entry in script:
-                sp = (entry.get("speaker") or entry.get("type") or "").strip()
-                if not sp:
-                    continue
-                if sp not in counts:
-                    counts[sp] = 0
-                    order.append(sp)
-                counts[sp] += 1
 
     voice_config: dict = {}
     if vc_path.exists():
@@ -157,7 +181,7 @@ def list_voices(script: str | None = None) -> dict:
 
     return {
         "has_script": has_script,
-        "script_path": str(script_path),
+        "script_path": script_path_out,
         "voice_config_path": str(vc_path),
         "speakers": speakers,
     }
@@ -177,6 +201,8 @@ class BatchRequest(BaseModel):
 @router.post("/batch")
 def run_batch(req: BatchRequest) -> dict:
     _common.require_workspace()
+    if req.script == ALL_PARSED_JSON:
+        raise HTTPException(status_code=400, detail="音频合成仅支持单个解析 JSON（“全部”只用于「角色配音」）。")
     label = "音频合成（全部）" if not req.indices else f"音频合成（{len(req.indices)} 段）"
     task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script)
     return {"task_id": task.id}
@@ -184,11 +210,14 @@ def run_batch(req: BatchRequest) -> dict:
 
 class MergeRequest(BaseModel):
     m4b: bool = False  # M4B output is a later phase; MP3 is produced for now.
+    # Which package (a sub-folder in 05_audio_chunk/, one per source JSON) to merge;
+    # None -> the most recent package (see merge._find_manifest).
+    package: str | None = None
 
 
 @router.post("/merge")
 def run_merge(req: MergeRequest) -> dict:
     _common.require_workspace()
-    label = "合并 M4B" if req.m4b else "合并音频（Merge）"
-    task = get_task_manager().create("merge", label, Merge.run, req.m4b)
+    label = ("合并 M4B" if req.m4b else "合并音频（Merge）") + (f"：{req.package}" if req.package else "")
+    task = get_task_manager().create("merge", label, Merge.run, req.m4b, req.package)
     return {"task_id": task.id}

@@ -18,7 +18,7 @@ import CardContent from '@/components/ui/CardContent.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
-import ScriptPicker from '@/components/ScriptPicker.vue'
+import DirPicker from '@/components/DirPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
@@ -158,9 +158,9 @@ watch(
         </Badge>
       </h1>
       <p class="mt-1 text-muted-foreground">
-        按 JSON 顺序为整本书的所有段合成语音（模型只加载一次），单段失败会记录而不中断；
-        进度、当前段与当前角色实时刷新，音频段与 <code class="text-xs">manifest.json</code> 保存到工作空间的
-        <code class="text-xs">05_audio_chunk/</code>。
+        按 JSON 顺序为所选解析 JSON 的所有段合成语音（模型只加载一次），单段失败会记录而不中断；
+        进度、当前段与当前角色实时刷新。每个 JSON 合成成一个「包」：音频段与
+        <code class="text-xs">manifest.json</code> 一起保存到 <code class="text-xs">05_audio_chunk/&lt;JSON 基名&gt;/</code>。
       </p>
     </div>
 
@@ -179,7 +179,13 @@ watch(
           <CardDescription>来自所选解析 JSON（03_parsed_json/）与角色配音配置。</CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
-          <ScriptPicker v-model="project.activeScript" label="解析 JSON（03_parsed_json/）" />
+          <DirPicker
+            module="03_parsed_json"
+            :extensions="['json']"
+            exclude-suffix="_checked.json"
+            v-model="project.activeScript"
+            label="解析 JSON（03_parsed_json/）"
+          />
           <div class="flex flex-wrap items-center gap-x-10 gap-y-2">
             <div>
               <div class="text-2xl font-bold">{{ segmentCount ?? '—' }}</div>

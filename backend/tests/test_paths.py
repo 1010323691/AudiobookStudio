@@ -256,3 +256,58 @@ def test_resolve_parsed_json_autopick_only_checked(sandbox, set_pointer):
     os.utime(c1, (5, 5)); os.utime(c2, (10, 10))
     # No base files at all -> degrade to the most recent _checked file.
     assert core_paths.resolve_parsed_json() == c2
+
+
+# -- resolve_parsed_json_all (whole-book "all files" aggregate) -----------------
+
+def test_resolve_parsed_json_all_unset_is_empty(sandbox, set_pointer):
+    set_pointer("")
+    assert core_paths.resolve_parsed_json_all() == []
+
+
+def test_resolve_parsed_json_all_empty_dir_is_empty(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    (ws / "03_parsed_json").mkdir(parents=True, exist_ok=True)
+    assert core_paths.resolve_parsed_json_all() == []
+
+
+def test_resolve_parsed_json_all_order_is_mtime_then_name(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    # Names sort a < b < c < d, but the mtimes are the reverse — so reading order
+    # (mtime) yields d, c, b, a, proving mtime (not name) drives the order.
+    a = d / "a.json"; a.write_text("[]", encoding="utf-8")
+    b = d / "b.json"; b.write_text("[]", encoding="utf-8")
+    c = d / "c.json"; c.write_text("[]", encoding="utf-8")
+    (d / "c_checked.json").write_text("[]", encoding="utf-8")
+    dd = d / "d.json"; dd.write_text("[]", encoding="utf-8")
+    os.utime(a, (30, 30)); os.utime(b, (20, 20))
+    os.utime(c, (10, 10)); os.utime(dd, (5, 5))
+    # c has a _checked copy -> upgraded; the rest return their base file.
+    assert core_paths.resolve_parsed_json_all() == [dd, d / "c_checked.json", b, a]
+
+
+def test_resolve_parsed_json_all_orphan_checked_degrades_to_them(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    x = d / "x_checked.json"; x.write_text("[]", encoding="utf-8")
+    y = d / "y_checked.json"; y.write_text("[]", encoding="utf-8")
+    os.utime(x, (5, 5)); os.utime(y, (10, 10))
+    # No base files -> return the standalone _checked files (mtime order).
+    assert core_paths.resolve_parsed_json_all() == [x, y]
+
+
+def test_resolve_parsed_json_all_ignores_non_json_and_dirs(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    good = d / "good.json"; good.write_text("[]", encoding="utf-8")
+    (d / "notes.txt").write_text("not json", encoding="utf-8")
+    (d / "weird.json").mkdir()  # a *directory* named *.json -> excluded by is_file()
+    assert core_paths.resolve_parsed_json_all() == [good]

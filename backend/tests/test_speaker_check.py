@@ -322,20 +322,18 @@ def test_check_file_disagreement_resolved_by_majority(tmp_path, monkeypatch):
     entries = [_entry("NARRATOR", "a"), _entry("BOB", "b"), _entry("NARRATOR", "c")]
     src = _write(tmp_path, "ch.json", entries)
     before = src.read_bytes()
-    same = [(0, "NARRATOR"), (1, "BOB"), (2, "NARRATOR")]
-    flip = [(0, "NARRATOR"), (1, "ALICE"), (2, "NARRATOR")]
-    # First pass flips entry 1 (BOB -> ALICE); 3 re-runs: 2 say ALICE, 1 says BOB.
+    flip = [(0, "NARRATOR"), (1, "ALICE"), (2, "NARRATOR")]  # entry 1 flips BOB -> ALICE
+    # First pass flips entry 1 (BOB -> ALICE); the vote is [BOB(解析), ALICE(检查), ALICE(重试1)]
+    # → 2:1 for ALICE, so it settles after ONE retry (two LLM calls total, no 2nd/3rd retry).
     calls = _seq_urlopen(monkeypatch, [
-        _map_completion(flip),   # first pass (disagreement on entry 1)
-        _map_completion(flip),   # re-run 1: ALICE
-        _map_completion(flip),   # re-run 2: ALICE
-        _map_completion(same),   # re-run 3: BOB (the odd one out)
+        _map_completion(flip),  # first pass (检查结果)
+        _map_completion(flip),  # retry 1 (重试结果) → ALICE wins 2:1
     ])
 
     result = check_file(_Handle(), str(src), _llm_cfg(),
                         SpeakerCheckConfig(context_window=1), GenerationConfig())
 
-    assert calls["n"] == 4  # 1 first pass + 3 re-runs (no 4th: ALICE already holds 2 votes)
+    assert calls["n"] == 2  # 1 first pass + 1 retry (a 2:1 majority forms immediately)
     assert src.read_bytes() == before
     checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
     assert checked[1] == {"speaker": "ALICE", "text": "b", "instruct": "tone"}
@@ -344,18 +342,16 @@ def test_check_file_disagreement_resolved_by_majority(tmp_path, monkeypatch):
     assert result["changed"] == 1
 
 
-def test_check_file_three_way_tie_triggers_fourth(tmp_path, monkeypatch):
+def test_check_file_three_way_tie_triggers_second_retry(tmp_path, monkeypatch):
     entries = [_entry("NARRATOR", "a"), _entry("BOB", "b"), _entry("NARRATOR", "c")]
     src = _write(tmp_path, "ch.json", entries)
     base = [(0, "NARRATOR"), (2, "NARRATOR")]  # entries 0 and 2 always match the original
-    # First pass + 3 re-runs all disagree with each other on entry 1 → a 4th is forced,
-    # which then pairs with re-run 1 (ALICE) to reach a 2-vote majority.
+    # [BOB(解析), ALICE(检查), CARL(重试1)] is a 1:1:1 tie → escalate to a 2nd retry, which
+    # returns ALICE → [BOB, ALICE, CARL, ALICE] = 2:1 for ALICE → settled (3 LLM calls).
     _seq_urlopen(monkeypatch, [
-        _map_completion(base + [(1, "ALICE")]),  # first pass
-        _map_completion(base + [(1, "ALICE")]),  # re-run 1
-        _map_completion(base + [(1, "BOB")]),    # re-run 2
-        _map_completion(base + [(1, "CARL")]),   # re-run 3  → 3-way tie
-        _map_completion(base + [(1, "ALICE")]),  # 4th      → ALICE wins 2 of 4
+        _map_completion(base + [(1, "ALICE")]),  # first pass (检查)
+        _map_completion(base + [(1, "CARL")]),   # retry 1 → 1:1:1 tie
+        _map_completion(base + [(1, "ALICE")]),   # retry 2 → ALICE wins 2:1
     ])
 
     result = check_file(_Handle(), str(src), _llm_cfg(),
@@ -372,18 +368,19 @@ def test_check_file_no_consensus_keeps_original(tmp_path, monkeypatch):
     src = _write(tmp_path, "ch.json", entries)
     before = src.read_bytes()
     base = [(0, "NARRATOR"), (2, "NARRATOR")]
-    # All four samples disagree on entry 1 (ALICE, BOB, CARL, DAN) → no majority → keep it.
-    _seq_urlopen(monkeypatch, [
-        _map_completion(base + [(1, "ALICE")]),
-        _map_completion(base + [(1, "ALICE")]),
-        _map_completion(base + [(1, "BOB")]),
-        _map_completion(base + [(1, "CARL")]),
-        _map_completion(base + [(1, "DAN")]),
+    # All five samples differ on entry 1 (BOB 解析, ALICE 检查, CARL/DAN/EDD retries) → no
+    # majority even after the 3rd retry → the original is kept (4 LLM calls total).
+    calls = _seq_urlopen(monkeypatch, [
+        _map_completion(base + [(1, "ALICE")]),  # first pass
+        _map_completion(base + [(1, "CARL")]),   # retry 1
+        _map_completion(base + [(1, "DAN")]),    # retry 2
+        _map_completion(base + [(1, "EDD")]),    # retry 3
     ])
 
     result = check_file(_Handle(), str(src), _llm_cfg(),
                         SpeakerCheckConfig(context_window=1), GenerationConfig())
 
+    assert calls["n"] == 4  # first pass + all 3 retries (never reached a majority)
     assert src.read_bytes() == before
     checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
     assert checked[1]["speaker"] == "BOB"  # original kept (no consensus)
@@ -397,9 +394,7 @@ def test_check_file_only_speaker_changes_text_instruct_intact(tmp_path, monkeypa
     before = src.read_bytes()
     _seq_urlopen(monkeypatch, [
         _map_completion([(0, "ALICE"), (1, "NARRATOR")]),  # first pass flips entry 0
-        _map_completion([(0, "ALICE"), (1, "NARRATOR")]),  # re-run 1
-        _map_completion([(0, "ALICE"), (1, "NARRATOR")]),  # re-run 2
-        _map_completion([(0, "BOB"), (1, "NARRATOR")]),    # re-run 3
+        _map_completion([(0, "ALICE"), (1, "NARRATOR")]),  # retry 1 → ALICE wins 2:1
     ])
     result = check_file(_Handle(), str(src), _llm_cfg(),
                         SpeakerCheckConfig(context_window=0), GenerationConfig())
@@ -411,21 +406,22 @@ def test_check_file_only_speaker_changes_text_instruct_intact(tmp_path, monkeypa
     assert result["changed"] == 1
 
 
-def test_check_file_failed_rerun_keeps_majority(tmp_path, monkeypatch):
-    # A re-run whose reply can't be parsed contributes no votes but must not abort the
-    # batch or corrupt the others (per-item isolation).
+def test_check_file_failed_retry_escalates_and_keeps_majority(tmp_path, monkeypatch):
+    # A failed retry contributes no votes (per-item isolation) and must not abort the batch;
+    # the resulting short vote is a 1:1 tie, which escalates to a 2nd retry that restores a
+    # 2:1 majority (3 LLM calls: first pass + failed retry 1 + retry 2).
     entries = [_entry("NARRATOR", "a"), _entry("BOB", "b"), _entry("NARRATOR", "c")]
     src = _write(tmp_path, "ch.json", entries)
     base = [(0, "NARRATOR"), (2, "NARRATOR")]
     good = _map_completion(base + [(1, "ALICE")])
-    _seq_urlopen(monkeypatch, [
-        _map_completion(base + [(1, "ALICE")]),  # first pass
-        good,                                     # re-run 1: ALICE
-        _completion("garbage, no JSON here"),     # re-run 2: unparseable → {} (no votes)
-        good,                                     # re-run 3: ALICE  → 2 of the 3 valid votes
+    calls = _seq_urlopen(monkeypatch, [
+        _map_completion(base + [(1, "ALICE")]),  # first pass → [BOB, ALICE]
+        _completion("garbage, no JSON here"),     # retry 1: unparseable → no vote → 1:1 tie
+        good,                                      # retry 2: ALICE → 2:1 majority
     ])
     result = check_file(_Handle(), str(src), _llm_cfg(),
                         SpeakerCheckConfig(context_window=1), GenerationConfig())
+    assert calls["n"] == 3
     checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
     assert checked[1]["speaker"] == "ALICE"  # two valid ALICE votes beat the gap
     assert result["changed"] == 1

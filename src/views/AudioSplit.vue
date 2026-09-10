@@ -5,13 +5,14 @@ import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { cutAudio, detectSilences, exportAudio, planAudio, probeAudio, zipAudio } from '@/api/audio'
-import { downloadFile, pickFile } from '@/utils/fileops'
+import { downloadFile } from '@/utils/fileops'
 import { formatBytes, formatDuration } from '@/utils/format'
 import type {
   AudioCutResult,
   AudioProbeResult,
   AudioSegment,
   AudioSilencesResult,
+  DirListResult,
 } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
@@ -34,6 +35,7 @@ import TableBody from '@/components/ui/TableBody.vue'
 import TableRow from '@/components/ui/TableRow.vue'
 import TableHead from '@/components/ui/TableHead.vue'
 import TableCell from '@/components/ui/TableCell.vue'
+import DirPicker from '@/components/DirPicker.vue'
 import {
   AudioLines,
   Scissors,
@@ -53,6 +55,11 @@ const { push: toast } = useToast()
 
 const file = ref<{ path: string; name: string } | null>(null)
 const probe = ref<AudioProbeResult | null>(null)
+
+// The 06_audio_merge directory the picker scans: its absolute path (from the scan)
+// + the selected file name combine into the file the pipeline operates on.
+const selectedName = ref('')
+const dirPath = ref('')
 
 // Form fields (seeded from config.audio on load).
 const targetDuration = ref('10:00')
@@ -96,19 +103,22 @@ onMounted(async () => {
   }
 })
 
-async function choose() {
-  const picked = await pickFile([
-    { name: '音频文件', extensions: ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac', 'webm'] },
-  ])
-  if (picked) {
-    file.value = { path: picked.path, name: picked.name }
-    probe.value = null
-    plan.value = null
-    cutResult.value = null
-    error.value = ''
-    await doProbe()
-  }
+// Capture the 06_audio_merge directory's absolute path from each picker scan, so a
+// selection can be turned into a full file path (the backend reads by absolute path).
+function onScanned(r: DirListResult) {
+  dirPath.value = r.path
 }
+
+// A selection in the picker sets the file to operate on and probes it.
+watch(selectedName, (name) => {
+  if (!name || !dirPath.value) return
+  file.value = { path: `${dirPath.value}/${name}`, name }
+  probe.value = null
+  plan.value = null
+  cutResult.value = null
+  error.value = ''
+  doProbe()
+})
 
 async function doProbe() {
   if (!file.value) return
@@ -269,8 +279,9 @@ function download(path: string) {
     <div>
       <h1 class="text-2xl font-bold tracking-tight">音频分集</h1>
       <p class="text-muted-foreground mt-1">
-        把长音频无损切分为若干集（<code class="text-xs">-c copy</code> 不重编码），输出到工作空间的
-        <code class="text-xs">07_output/</code>。可选「智能对齐」把切点对齐到停顿处。
+        选择一个已合并的有声书（<code class="text-xs">06_audio_merge/</code>），无损切分为若干集
+        （<code class="text-xs">-c copy</code> 不重编码），输出到工作空间的 <code class="text-xs">07_output/&lt;源名&gt;/</code>。
+        可选「智能对齐」把切点对齐到停顿处。
       </p>
     </div>
 
@@ -284,13 +295,18 @@ function download(path: string) {
         </CardTitle>
       </CardHeader>
       <CardContent class="space-y-3">
-        <div class="flex flex-wrap items-center gap-3">
-          <Button @click="choose" :disabled="busyProbe">选择音频文件</Button>
-          <template v-if="file">
-            <span class="text-sm font-medium">{{ file.name }}</span>
-            <span class="text-xs text-muted-foreground truncate max-w-[240px]" :title="file.path">{{ file.path }}</span>
-          </template>
-          <span v-else class="text-sm text-muted-foreground">支持 mp3 / wav / m4a / aac / ogg / flac</span>
+        <DirPicker
+          module="06_audio_merge"
+          :extensions="['mp3', 'wav', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac', 'webm']"
+          :show-default="false"
+          v-model="selectedName"
+          label="待分集音频（06_audio_merge/）"
+          empty-hint="06_audio_merge/ 下暂无音频——请先到「音频合并」生成有声书。"
+          @scanned="onScanned"
+        />
+        <div v-if="file" class="flex flex-wrap items-center gap-3 rounded-md bg-muted/50 px-3 py-2 text-sm">
+          <span class="font-medium">{{ file.name }}</span>
+          <span class="text-xs text-muted-foreground truncate max-w-[320px]" :title="file.path">{{ file.path }}</span>
         </div>
         <div v-if="probe" class="flex flex-wrap gap-4 rounded-md bg-muted/50 px-3 py-2 text-sm">
           <span>时长 <b>{{ formatDuration(probe.duration) }}</b></span>

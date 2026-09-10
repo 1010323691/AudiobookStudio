@@ -416,7 +416,7 @@ def _llm_chat_completion_stream(base_url, api_key, model, messages,
             emitted.append(content_slice)
         if handle is not None:
             handle.llm_chunk("".join(pending))
-            handle.llm_rate(cps)
+            handle.llm_rate(chars, cps)
         content_buf.clear()
         pending.clear()
 
@@ -470,7 +470,7 @@ def _llm_chat_completion_stream(base_url, api_key, model, messages,
 
     flush(force=True)  # push any trailing buffer so the panel shows the full output
     if handle is not None and cps:
-        handle.llm_rate(cps)  # final rate (resting value is already 0; skip a no-op)
+        handle.llm_rate(0, cps)  # final rate (resting value is already 0; skip a no-op)
 
     return "".join(emitted).strip(), finish_reason, usage
 
@@ -650,7 +650,7 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             handle.check()  # cooperative cancel / pause between chunks
             handle.log(f"处理第 {i}/{total} 段（{len(chunk)} 字）…")
             handle.progress((i - 1) / total, f"处理第 {i}/{total} 段")
-            handle.llm_rate(0.0)  # reset the 字/s gauge per chunk (0 until the stream reports)
+            handle.llm_rate(0, 0.0)  # reset the 字/s gauge per chunk (0 until the stream reports)
             previous = all_entries if all_entries else None
             entries = process_chunk(
                 handle, llm, llm.model_name, chunk, i, total,

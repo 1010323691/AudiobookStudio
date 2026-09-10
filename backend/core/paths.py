@@ -120,6 +120,12 @@ def get_layout() -> Layout:
     return layout
 
 
+# Sentinel: a 角色配音 request to operate over *every* parsed JSON at once
+# (aggregate the whole book's characters). Distinct from any real file name
+# (which ends in ``.json``); the frontend uses the same literal.
+ALL_PARSED_JSON = "__all__"
+
+
 def _checked_variant(base: Path) -> Path:
     """``<stem>_checked.json`` next to ``base`` if it exists, else ``base`` itself.
 
@@ -165,3 +171,30 @@ def resolve_parsed_json(script: str | None = None) -> Path:
         if checked:
             return max(checked, key=lambda p: p.stat().st_mtime)
     return d / "annotated_script.json"
+
+
+def resolve_parsed_json_all() -> list[Path]:
+    """Every parsed script a 角色配音 "all files" request should read (whole-book aggregate).
+
+    Returns the base ``*.json`` files in ``03_parsed_json/`` (never a bare ``_checked``
+    copy) in reading order, each transparently upgraded to its ``_checked`` variant when
+    one exists — so the aggregate reads the same (checked-preferred) files the single-file
+    path would. Order is by ``(mtime, name)``: mtime ≈ the order the volumes were generated
+    (≈ reading order), which is robust to Chinese-numeral stems that ``name`` alone would
+    scramble, with name as a deterministic tiebreaker — the same mtime semantic the
+    single-file "most recent" fallback uses. With no base files present it degrades to the
+    standalone ``_checked`` files (mirroring :func:`resolve_parsed_json`); with no workspace
+    set or an empty directory it returns ``[]`` so callers degrade cleanly.
+    """
+    layout = get_layout()
+    d = layout.parsed_json
+    if d is None or not d.exists():
+        return []
+    base = [p for p in d.glob("*.json") if p.is_file() and not p.name.endswith("_checked.json")]
+    if base:
+        base.sort(key=lambda p: (p.stat().st_mtime, p.name))
+        return [_checked_variant(p) for p in base]
+    # Only _checked copies present (no base to anchor an upgrade) -> degrade to those.
+    checked = [p for p in d.glob("*_checked.json") if p.is_file()]
+    checked.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    return checked

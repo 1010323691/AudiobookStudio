@@ -35,7 +35,8 @@ export function runBatch(opts: BatchRunOptions = {}): Promise<{ task_id: string 
   })
 }
 
-/** 音频合并：start a merge Task (MP3 now; M4B is a later phase). */
-export function runMerge(m4b = false): Promise<{ task_id: string }> {
-  return http.post<{ task_id: string }>('/api/tts/merge', { m4b })
+/** 音频合并：start a merge Task for one package (MP3 now; M4B is a later phase).
+ *  ``pkg`` names the sub-folder in 05_audio_chunk/ to merge; omitted → most recent. */
+export function runMerge(m4b = false, pkg?: string): Promise<{ task_id: string }> {
+  return http.post<{ task_id: string }>('/api/tts/merge', { m4b, package: pkg ?? null })
 }

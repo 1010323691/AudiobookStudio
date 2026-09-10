@@ -19,7 +19,7 @@ import Input from '@/components/ui/Input.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
-import ScriptPicker from '@/components/ScriptPicker.vue'
+import DirPicker from '@/components/DirPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
@@ -31,6 +31,7 @@ import {
   RefreshCw,
   Play,
   ArrowRight,
+  FolderOpen,
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -53,8 +54,13 @@ const taskId = ref<string | null>(null)
 const result = ref<PrepareVoicesResult | null>(null)
 
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
-// Which parsed JSON to read (shared with 音频合成 via the project store; '' → most recent).
-const script = computed(() => project.activeScript)
+// The parsed-JSON selection on THIS page. Local (not the shared store) so the whole-book
+// "全部文件" scope ('__all__') never leaks into 音频合成, which is per-file.
+// '' = most recent; a file name = that file; '__all__' = every file in 03_parsed_json/.
+const ALL_SCRIPT = '__all__'
+const scope = ref(project.activeScript || '')
+// Which parsed JSON(s) to read (mirrors the picker; '__all__' aggregates every file).
+const script = computed(() => scope.value)
 const activePreview = ref<{ name: string; url: string } | null>(null)
 const readyCount = computed(() => speakers.value.filter((s) => s.status === 'ready').length)
 
@@ -74,9 +80,16 @@ async function loadVoices() {
   }
 }
 
-// Re-list the characters when the user picks a different parsed JSON.
-watch(script, () => {
+// Local → store: a concrete file / most-recent keeps 音频合成 in step; the "all files"
+// scope is Voices-local and must not be written to the shared selection.
+watch(scope, (v) => {
   loadVoices()
+  if (v !== ALL_SCRIPT) project.activeScript = v
+})
+// Store → local: under keep-alive this page is cached, so a pick made on 音频合成 must
+// refresh the (cached) character list. Guarded so an active "all files" view is kept.
+watch(() => project.activeScript, (v) => {
+  if (scope.value !== ALL_SCRIPT && v !== scope.value) scope.value = v
 })
 
 onMounted(async () => {
@@ -178,7 +191,67 @@ watch(
         尚未检测到角色——请先在「文本解析」生成解析 JSON（03_parsed_json/）。
       </Alert>
 
-      <!-- 角色列表 -->
+      <!-- 生成 / 重新生成 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><Sparkles class="h-5 w-5" />生成 / 重新生成</CardTitle>
+          <CardDescription>
+            一键为所有角色生成声音（LLM 描述 + 预览克隆）；也可仅处理新增，或对单个角色按提示词重生成。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-4">
+          <div class="flex flex-wrap items-center gap-3">
+            <Button :disabled="busy || !hasScript || !workspaceSet" @click="doPrepare({})">
+              <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
+              <Sparkles v-else class="h-4 w-4" />
+              {{ busy ? '生成中…' : '一键准备所有角色声音' }}
+            </Button>
+            <Button variant="outline" :disabled="busy || !hasScript || !workspaceSet" @click="doPrepare({ new_only: true })">
+              <Users class="h-4 w-4" />仅新增角色
+            </Button>
+            <Button variant="outline" size="sm" @click="loadVoices">
+              <RefreshCw class="h-4 w-4" />刷新
+            </Button>
+          </div>
+
+          <LiveLogPanel :task="task" :max-height-class="'h-80'">
+            <template #actions>
+              <Button v-if="task" variant="outline" size="sm" @click="cancel">
+                <XCircle class="h-3.5 w-3.5" />取消
+              </Button>
+            </template>
+          </LiveLogPanel>
+
+          <div
+            v-if="result"
+            class="flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400"
+          >
+            <CheckCircle2 class="h-4 w-4 shrink-0" />
+            完成：处理 {{ result.count }} 个角色，识别 {{ result.aliases }} 个别名。
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- 工作区目录 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><FolderOpen class="h-5 w-5" />工作区目录</CardTitle>
+          <CardDescription>选择要配音的解析脚本；下方「角色」列表与配音操作都基于它。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <DirPicker
+            module="03_parsed_json"
+            :extensions="['json']"
+            exclude-suffix="_checked.json"
+            v-model="scope"
+            :show-all="true"
+            :all-value="ALL_SCRIPT"
+            label="解析 JSON（03_parsed_json/）"
+          />
+        </CardContent>
+      </Card>
+
+      <!-- 角色 -->
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2">
@@ -187,7 +260,6 @@ watch(
           <CardDescription v-if="speakers.length">已就绪 {{ readyCount }} / {{ speakers.length }}</CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
-          <ScriptPicker v-model="project.activeScript" label="解析 JSON（03_parsed_json/）" />
           <div v-if="speakers.length" class="overflow-x-auto">
             <table class="w-full text-sm">
               <thead>
@@ -239,47 +311,6 @@ watch(
             </table>
           </div>
           <p v-else class="text-sm text-muted-foreground">（暂无角色）</p>
-        </CardContent>
-      </Card>
-
-      <!-- 操作 + 实时日志 -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><Sparkles class="h-5 w-5" />生成 / 重新生成</CardTitle>
-          <CardDescription>
-            一键为所有角色生成声音（LLM 描述 + 预览克隆）；也可仅处理新增，或对单个角色按提示词重生成。
-          </CardDescription>
-        </CardHeader>
-        <CardContent class="space-y-4">
-          <div class="flex flex-wrap items-center gap-3">
-            <Button :disabled="busy || !hasScript || !workspaceSet" @click="doPrepare({})">
-              <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
-              <Sparkles v-else class="h-4 w-4" />
-              {{ busy ? '生成中…' : '一键准备所有角色声音' }}
-            </Button>
-            <Button variant="outline" :disabled="busy || !hasScript || !workspaceSet" @click="doPrepare({ new_only: true })">
-              <Users class="h-4 w-4" />仅新增角色
-            </Button>
-            <Button variant="outline" size="sm" @click="loadVoices">
-              <RefreshCw class="h-4 w-4" />刷新
-            </Button>
-          </div>
-
-          <LiveLogPanel :task="task" :max-height-class="'h-80'">
-            <template #actions>
-              <Button v-if="task" variant="outline" size="sm" @click="cancel">
-                <XCircle class="h-3.5 w-3.5" />取消
-              </Button>
-            </template>
-          </LiveLogPanel>
-
-          <div
-            v-if="result"
-            class="flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400"
-          >
-            <CheckCircle2 class="h-4 w-4 shrink-0" />
-            完成：处理 {{ result.count }} 个角色，识别 {{ result.aliases }} 个别名。
-          </div>
         </CardContent>
       </Card>
 
