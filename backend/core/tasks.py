@@ -29,6 +29,12 @@ class TaskStatus(str, Enum):
 
 TERMINAL = {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED}
 
+# Max chars of raw LLM stream retained per task (the 「流式反馈」 panel's source of truth).
+# Tasks are kept in memory for the life of the process, so this bounds how much a long
+# parse can accumulate; the oldest chunks are dropped first. Lower it if you're memory
+# sensitive, raise it for more reviewable history.
+LLM_STREAM_CAP = 128 * 1024
+
 
 class TaskCancelled(Exception):
     """Raised by engine code to abort a task cleanly."""
@@ -51,6 +57,37 @@ class TaskHandle:
     def log(self, msg: str, level: str = "INFO") -> None:
         self._t.log(msg, level)
 
+    def llm_chunk(self, text: str) -> None:
+        """Forward a (coalesced) slice of the raw LLM stream to the 「流式反馈」 panel.
+
+        Display-only: the engine calls this as the model streams so the UI can show the
+        model's working state live. It is never read back by the parse/JSON pipeline.
+        """
+        self._t.log_llm(text)
+
+    def llm_rate(self, cps: float) -> None:
+        """Report the current LLM generation rate (chars/s) to the UI.
+
+        The 文本解析 engine computes this from the actual streamed text (content +
+        reasoning) as it arrives and reports it live; like ``llm_chunk`` it is
+        display-only and feeds the per-window 吞吐量 / ``字/s`` gauge (never the
+        parse/JSON pipeline).
+        """
+        self._t.set_llm_rate(cps)
+
+    def llm_chars(self, chars: int, secs: float) -> None:
+        """Report cumulative original-text chars processed + the processing time up to the
+        most recently completed chunk (per chunk).
+
+        The 文本解析 engine calls this after each text chunk is fully processed, so the
+        page's 处理速度 gauge (Σ chars ÷ Σ processing-time) steps up on every chunk and
+        stays *stable* in between — the time base is frozen at each chunk's completion
+        (reported by the backend), not a live clock, so the value never decays while the
+        next chunk is still generating. Display-only, like ``llm_rate`` — real chars,
+        never tokens.
+        """
+        self._t.set_llm_chars(chars, secs)
+
     def check(self) -> None:
         """Cooperative cancellation + pause point. Call between units of work."""
         if self._t.cancel_event.is_set():
@@ -70,6 +107,24 @@ class Task:
     progress: float = 0.0
     current: str = ""
     logs: deque = field(default_factory=lambda: deque(maxlen=1000))
+    # Raw LLM stream (the 「流式反馈」 panel). A char-capped buffer of the coalesced
+    # deltas, oldest dropped first when over ``LLM_STREAM_CAP`` — see ``log_llm``.
+    # Kept on the Task so the on-connect snapshot / terminal events can replay it and
+    # the panel survives a page reload (restored via ``GET /api/tasks``).
+    llm_chunks: deque = field(default_factory=deque)
+    llm_len: int = 0
+    # Live LLM generation rate (chars/s) for the 文本解析 吞吐量 / per-window gauge.
+    # Updated from the streamed text and replayed in the snapshot / terminal events, so
+    # a reconnect or a finished window still carries its most recent rate.
+    llm_cps: float = 0.0
+    # Cumulative original-text chars processed so far — stepped up per completed chunk by
+    # the 文本解析 engine (the 处理速度 gauge's numerator). Real chars, never tokens.
+    # Kept on the Task so the snapshot / terminal events replay it (survives a reload).
+    llm_chars: int = 0
+    # Cumulative processing time (s) up to the last completed chunk — the 处理速度
+    # gauge's denominator. Frozen at each chunk's completion (not a live clock), so the
+    # gauge holds steady between chunks instead of decaying.
+    llm_secs: float = 0.0
     result: dict = field(default_factory=dict)
     error: str = ""
     created: float = field(default_factory=time.time)
@@ -97,6 +152,36 @@ class Task:
         entry = {"level": level, "msg": msg, "t": time.time()}
         self.logs.append(entry)
         self._emit({"type": "log", **entry})
+
+    def log_llm(self, text: str) -> None:
+        """Append a (coalesced) slice of the raw LLM stream and forward it over SSE.
+
+        The 文本解析 engine calls this as the model streams, so the 「流式反馈」 panel
+        fills in real time. The text is also kept on the Task (char-capped, oldest
+        dropped first) so the on-connect snapshot / terminal events can replay the whole
+        stream — the panel survives a page reload and self-heals any dropped live event.
+        """
+        self.llm_chunks.append(text)
+        self.llm_len += len(text)
+        while self.llm_len > LLM_STREAM_CAP and self.llm_chunks:
+            self.llm_len -= len(self.llm_chunks.popleft())
+        self._emit({"type": "llm_chunk", "data": text})
+
+    def set_llm_rate(self, cps: float) -> None:
+        """Set the live LLM generation rate (chars/s) and forward it over SSE (gauge)."""
+        self.llm_cps = max(0.0, float(cps))
+        self._emit({"type": "llm_rate", "cps": self.llm_cps})
+
+    def set_llm_chars(self, chars: int, secs: float) -> None:
+        """Set cumulative original-text chars + processing time and forward over SSE.
+
+        Both advance together (one event per completed chunk) so the client's
+        处理速度 = Σ chars ÷ Σ secs is always internally consistent and stable between
+        chunks (the time base is whatever the backend measured at that chunk's end).
+        """
+        self.llm_chars = max(0, int(chars))
+        self.llm_secs = max(0.0, float(secs))
+        self._emit({"type": "llm_chars", "chars": self.llm_chars, "secs": self.llm_secs})
 
     def _set_status(self, status: TaskStatus) -> None:
         self.status = status
@@ -127,6 +212,10 @@ class Task:
             "progress": self.progress,
             "current": self.current,
             "logs": list(self.logs),
+            "llm_stream": "".join(self.llm_chunks),
+            "llm_cps": self.llm_cps,
+            "llm_chars": self.llm_chars,
+            "llm_secs": self.llm_secs,
             "result": self.result,
             "error": self.error,
             "created": self.created,
@@ -213,6 +302,11 @@ class TaskManager:
                 task.error = ""
                 task.progress = 0.0
                 task.logs.clear()
+                task.llm_chunks.clear()
+                task.llm_len = 0
+                task.llm_cps = 0.0
+                task.llm_chars = 0
+                task.llm_secs = 0.0
                 task.result = {}
                 task.started = time.time()
                 task.finished = 0.0

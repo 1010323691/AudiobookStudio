@@ -112,11 +112,27 @@ class LLMConfig(BaseModel):
     base_url: str = "http://localhost:11434/v1"
     api_key: str = "local"  # local servers ignore it; remote APIs need the real key
     model_name: str = ""  # left blank on purpose — the user sets their own model
+    # Stream the completion (``stream: true``) so the 文本解析 page can show the model's
+    # raw output token-by-token (the 「流式反馈」 panel). When a server rejects
+    # ``stream: true``, set this false in ``config/app.json`` to fall back to the
+    # non-streaming call (the stream panel then stays empty).
+    stream: bool = True
 
 
 class PromptsConfig(BaseModel):
     # Empty values fall back to the bundled defaults
     # (``backend/resources/default_prompts.txt``) at read time — see ``backend/api/config.py``.
+    system_prompt: str = ""
+    user_prompt: str = ""
+
+
+class SpeakerCheckConfig(BaseModel):
+    # Speaker 检查 (post-parse) settings — fully independent of the 解析 prompts above.
+    # context_window: how many surrounding entries (on EACH side) are sent as context when
+    # checking one entry (N=4 → 9 entries total: 前 4 条 / 当前条 / 后 4 条).
+    context_window: int = 4
+    # Dedicated 检查 prompts. Empty values fall back to the bundled defaults
+    # (``backend/engines/check_prompts.py`` / ``resources/default_check_prompts.txt``).
     system_prompt: str = ""
     user_prompt: str = ""
 
@@ -130,6 +146,9 @@ class GenerationConfig(BaseModel):
     min_p: float = 0.0  # 0 -> not sent
     presence_penalty: float = 0.0
     banned_tokens: list = Field(default_factory=list)
+    # Max files parsed in parallel (LLM jobs); the rest of a batch queue behind a
+    # shared gate (see ``core/concurrency.py``). 0 / negative is clamped to 1.
+    max_concurrency: int = 3
 
 
 class AppConfig(BaseModel):
@@ -141,6 +160,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     persona_prompts: PersonaPromptsConfig = Field(default_factory=PersonaPromptsConfig)
+    speaker_check: SpeakerCheckConfig = Field(default_factory=SpeakerCheckConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)

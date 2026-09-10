@@ -1,5 +1,5 @@
-import { API_BASE } from './client'
-import type { UploadResult } from '@/types'
+import { API_BASE, http } from './client'
+import type { UploadResult, DirListResult } from '@/types'
 
 /**
  * File selection: upload a chosen file into the backend's ``01_input/`` directory
@@ -23,4 +23,13 @@ export async function uploadFile(file: File): Promise<UploadResult> {
     throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
   }
   return body as UploadResult
+}
+
+/**
+ * List the entries of a workspace pipeline directory (``GET /api/files/list/{module}``).
+ * ``module`` is the directory name (e.g. ``02_split_text``). Used by the parse page to
+ * enumerate the split files the user can select — the backend does the reading.
+ */
+export function listDir(module: string): Promise<DirListResult> {
+  return http.get<DirListResult>(`/api/files/list/${encodeURIComponent(module)}`)
 }

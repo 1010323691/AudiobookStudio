@@ -18,6 +18,7 @@ import CardContent from '@/components/ui/CardContent.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
+import ScriptPicker from '@/components/ScriptPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
@@ -50,22 +51,31 @@ const taskId = ref<string | null>(null)
 const result = ref<BatchResult | null>(null)
 
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
+// Which parsed JSON to synthesize (shared with 角色配音 via the project store; '' → most recent).
+const script = computed(() => project.activeScript)
 const missingVoices = computed(() => Math.max(0, speakerCount.value - readyVoices.value))
 
 async function loadSummary() {
+  let resolvedName = ''
   try {
-    const r = await listVoices()
+    const r = await listVoices(script.value || undefined)
     speakerCount.value = r.speakers.length
     readyVoices.value = r.speakers.filter((s) => s.status === 'ready').length
+    if (r.has_script && r.script_path) {
+      // The backend resolves the chosen (or most-recent) JSON — fetch that exact file.
+      resolvedName = r.script_path.split(/[\\/]/).pop() || ''
+    }
   } catch {
     /* backend down — leave counts blank */
   }
   try {
-    const res = await fetch(downloadUrl('03_parsed_json', 'annotated_script.json'))
-    if (res.ok) {
-      const script: any = await res.json()
-      if (Array.isArray(script)) {
-        segmentCount.value = script.filter((e: any) => (e.text || '').trim()).length
+    if (resolvedName) {
+      const res = await fetch(downloadUrl('03_parsed_json', resolvedName))
+      if (res.ok) {
+        const data: any = await res.json()
+        if (Array.isArray(data)) {
+          segmentCount.value = data.filter((e: any) => (e.text || '').trim()).length
+        }
       }
     }
   } catch {
@@ -73,6 +83,11 @@ async function loadSummary() {
   }
   summaryLoaded.value = true
 }
+
+// Re-summarize when the user picks a different parsed JSON.
+watch(script, () => {
+  loadSummary()
+})
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
@@ -91,7 +106,7 @@ async function doRun() {
   error.value = ''
   result.value = null
   try {
-    const { task_id } = await runBatch()
+    const { task_id } = await runBatch({ script: script.value || undefined })
     taskId.value = task_id
     await taskStore.refresh()
     // Completion is handled by the watcher on task.status.
@@ -161,9 +176,10 @@ watch(
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Layers class="h-5 w-5" />待合成</CardTitle>
-          <CardDescription>来自 <code class="text-xs">annotated_script.json</code> 与角色配音配置。</CardDescription>
+          <CardDescription>来自所选解析 JSON（03_parsed_json/）与角色配音配置。</CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
+          <ScriptPicker v-model="project.activeScript" label="解析 JSON（03_parsed_json/）" />
           <div class="flex flex-wrap items-center gap-x-10 gap-y-2">
             <div>
               <div class="text-2xl font-bold">{{ segmentCount ?? '—' }}</div>

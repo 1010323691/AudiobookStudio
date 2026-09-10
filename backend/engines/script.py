@@ -16,11 +16,17 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 
+from pathlib import Path
+
 from ..core.config import GenerationConfig, LLMConfig, PromptsConfig
+from ..core.concurrency import gate
 from ..core.paths import get_layout
+from ..core.tasks import TaskCancelled
+from .book import decode_buffer
 from .script_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 
 IMPLEMENTED = True
@@ -316,6 +322,159 @@ def _llm_chat_completion(base_url, api_key, model, messages,
     return content, finish_reason, usage
 
 
+def _llm_chat_completion_stream(base_url, api_key, model, messages,
+                                temperature, top_p, presence_penalty, max_tokens,
+                                top_k=0, min_p=0, banned_tokens=None, handle=None):
+    """Streaming twin of ``_llm_chat_completion``.
+
+    Issues the same OpenAI-compatible ``chat/completions`` POST with ``stream: true``
+    and reads the SSE delta frames as the model generates. Each coalesced slice of the
+    raw stream is forwarded to the UI via ``handle.llm_chunk(...)`` so the 文本解析
+    「流式反馈」 panel fills in real time — display only, never read back by the parse
+    pipeline. For reasoning models the stream carries ``delta.reasoning_content``
+    (the model's live "thinking") before any ``delta.content``; the panel shows both,
+    but the returned content is the ``delta.content`` answer only — byte-identical to
+    the non-streaming response (same body / sampling params; deltas concatenated and
+    stripped) — so the caller's downstream JSON clean / repair / salvage is unaffected.
+
+    Returns the same ``(content, finish_reason, usage)`` triple as the non-streaming
+    call. Raises on HTTP / network / parse failure — the caller's retry loop handles it.
+    ``handle`` may be ``None`` (no UI forwarding / no mid-stream cancel) for tests.
+    """
+    url = base_url.rstrip("/") + "/chat/completions"
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": top_p,
+        "presence_penalty": presence_penalty,
+        "max_tokens": max_tokens,
+        "stream": True,
+        # Ask OpenAI-compatible servers to include usage in the final frame; harmless
+        # for servers that ignore it (usage then stays None -> tokens logged as "?").
+        "stream_options": {"include_usage": True},
+    }
+    # openai ``extra_body`` keys go at the top level, only when set (non-zero).
+    if top_k:
+        body["top_k"] = top_k
+    if min_p:
+        body["min_p"] = min_p
+    if banned_tokens:
+        body["banned_tokens"] = banned_tokens
+
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+    # Coalescing: buffer raw deltas and flush on a throttle so the per-task SSE queue
+    # (queue.Queue(maxsize=500), which silently drops when full) never chokes on
+    # token-rate events. A ~120 ms / ~256-char cadence reads as live to the panel.
+    #
+    # Two buffers, one cadence — a reasoning model (e.g. Qwen3 "thinking") streams its
+    # working in ``delta.reasoning_content`` long before any ``delta.content``:
+    #   * ``pending``     = the raw display stream (reasoning + content, in arrival
+    #                       order) -> the llm_chunk panel shows the model "thinking".
+    #   * ``content_buf`` = the answer only (delta.content) -> returned to the caller so
+    #                       the downstream JSON parser sees exactly the non-streaming text.
+    FLUSH_INTERVAL = 0.12  # seconds between UI flushes
+    FLUSH_SIZE = 256  # chars — flush early if a burst arrives
+    pending: list[str] = []
+    content_buf: list[str] = []
+    emitted: list[str] = []  # accumulated answer (content-only) = the return value
+    finish_reason = None
+    usage = None
+    last_flush = time.monotonic()
+    # Real-time generation rate (chars/s) for the 文本解析 吞吐量 / per-window gauge —
+    # measured from the actual streamed text (content + reasoning) as it arrives, never
+    # estimated. ``usage`` is still read per frame only for the per-chunk token log line
+    # and the return value; the rate itself uses the real chars, so it stays live on any
+    # endpoint (token counts are only reported by some servers, usually just in the final
+    # frame — and not at all by others).
+    cps = 0.0
+
+    def flush(force: bool = False) -> None:
+        nonlocal last_flush, cps
+        if not pending:
+            return
+        chars = sum(len(p) for p in pending)
+        if not (force
+                or time.monotonic() - last_flush >= FLUSH_INTERVAL
+                or chars >= FLUSH_SIZE):
+            return
+        now = time.monotonic()
+        dt = now - last_flush
+        if dt > 1e-3:  # chars/s over the window since the previous flush (skip ~0 window)
+            cps = chars / dt
+        last_flush = now
+        content_slice = "".join(content_buf)
+        if content_slice:
+            emitted.append(content_slice)
+        if handle is not None:
+            handle.llm_chunk("".join(pending))
+            handle.llm_rate(cps)
+        content_buf.clear()
+        pending.clear()
+
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if payload_text == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                frame_usage = payload.get("usage")
+                if isinstance(frame_usage, dict):
+                    usage = frame_usage
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue  # e.g. the trailing usage-only frame
+                first = choices[0]
+                if not isinstance(first, dict):
+                    continue
+                delta = first.get("delta") or {}
+                # Reasoning models emit their thinking in ``reasoning_content`` before the
+                # answer in ``content``: show both live, but return only ``content`` so the
+                # parse pipeline stays byte-identical to the non-streaming path.
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    pending.append(reasoning)
+                piece = delta.get("content")
+                if piece:
+                    pending.append(piece)
+                    content_buf.append(piece)
+                fr = first.get("finish_reason")
+                if fr:
+                    finish_reason = fr
+                flush()
+                # Honour cancel within one frame of a request. Pause stays at the
+                # between-chunk handle.check() in the caller (can't pause a live HTTP
+                # read meaningfully).
+                if handle is not None and handle.cancelled:
+                    raise TaskCancelled()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"LLM HTTP {e.code}: {detail}") from e
+
+    flush(force=True)  # push any trailing buffer so the panel shows the full output
+    if handle is not None and cps:
+        handle.llm_rate(cps)  # final rate (resting value is already 0; skip a no-op)
+
+    return "".join(emitted).strip(), finish_reason, usage
+
+
 # ---------------------------------------------------------------------------
 # Per-chunk orchestration + the Task worker.
 # ---------------------------------------------------------------------------
@@ -368,18 +527,34 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
 
     for attempt in range(max_retries + 1):
         try:
-            text, finish_reason, usage = _llm_chat_completion(
-                llm.base_url, llm.api_key, model_name, messages,
-                temperature=temperature, top_p=top_p,
-                presence_penalty=presence_penalty, max_tokens=max_tokens,
-                top_k=top_k, min_p=min_p, banned_tokens=banned_tokens,
-            )
+            if llm.stream:
+                # Stream the completion so the 「流式反馈」 panel shows the model's raw
+                # output live; the accumulated content is identical to the non-streaming
+                # response, so the JSON handling below is unchanged.
+                text, finish_reason, usage = _llm_chat_completion_stream(
+                    llm.base_url, llm.api_key, model_name, messages,
+                    temperature=temperature, top_p=top_p,
+                    presence_penalty=presence_penalty, max_tokens=max_tokens,
+                    top_k=top_k, min_p=min_p, banned_tokens=banned_tokens,
+                    handle=handle,
+                )
+            else:
+                # Safety valve: some servers reject stream:true — fall back to the
+                # non-streaming call (the stream panel then stays empty).
+                text, finish_reason, usage = _llm_chat_completion(
+                    llm.base_url, llm.api_key, model_name, messages,
+                    temperature=temperature, top_p=top_p,
+                    presence_penalty=presence_penalty, max_tokens=max_tokens,
+                    top_k=top_k, min_p=min_p, banned_tokens=banned_tokens,
+                )
             pt = usage.get("prompt_tokens", "?") if usage else "?"
             ct = usage.get("completion_tokens", "?") if usage else "?"
             handle.log(f"chunk {chunk_num}/{total_chunks} attempt {attempt + 1}: "
                        f"finish_reason={finish_reason} | tokens prompt={pt} completion={ct}")
             if finish_reason == "length":
                 handle.log(f"WARNING: 响应被截断（达到 max_tokens={max_tokens}），可增大 max_tokens。", "WARNING")
+        except TaskCancelled:
+            raise  # a cancel raised mid-stream must propagate, not be retried
         except Exception as e:  # noqa: BLE001 — a failed call retries, then gives up
             handle.log(f"调用 LLM API 出错（attempt {attempt + 1}）：{e}", "ERROR")
             if attempt < max_retries:
@@ -419,69 +594,106 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
     return []
 
 
-def generate(handle, text, llm: LLMConfig, prompts: PromptsConfig, generation: GenerationConfig) -> dict:
-    """Task worker: turn novel ``text`` into ``{speaker, text, instruct}`` entries.
+def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generation: GenerationConfig) -> dict:
+    """Task worker: turn one ``02_split_text`` file into its ``{speaker, text, instruct}``
+    JSON entries.
 
-    Contract: first arg is the :class:`TaskHandle``. Streams per-chunk progress and
-    logs over SSE, honours cooperative cancel between chunks, and writes the result to
-    ``03_parsed_json/annotated_script.json`` (served by the shared
-    ``GET /api/files/download/03_parsed_json/{name}`` route). ``llm`` / ``prompts`` / ``generation``
-    are the config section objects; empty ``prompts`` fall back to the bundled defaults.
+    Contract: first arg is the :class:`TaskHandle``; the second is the absolute path of
+    the source ``.txt``. This is the per-file, concurrent form of the old text-paste
+    worker: each file is its own independent task with its own LLM requests, status,
+    and output. Concurrency is bounded by the shared gate (``core.concurrency``) so a
+    large batch can't open more simultaneous LLM calls than
+    ``generation.max_concurrency``. The result is written to
+    ``03_parsed_json/<source-stem>.json`` (one file per source, no scratch dir).
+    ``llm`` / ``prompts`` / ``generation`` are the config section objects; empty
+    ``prompts`` fall back to the bundled defaults.
     """
-    body = (text or "").strip()
-    if not body:
-        raise RuntimeError("输入文本为空。")
+    # Fail fast on a misconfigured model *before* taking a concurrency slot.
     if not (llm.model_name or "").strip():
         raise RuntimeError("请先在「文本解析」页配置 LLM 模型名称（模型不能为空）。")
 
-    body = fix_mojibake(body)
-    handle.log(f"读入 {len(body)} 字")
+    src = Path(path)
+    # Wait for a concurrency slot, then do the (LLM-heavy) work while holding it.
+    handle.progress(0.0, "排队中（等待并发槽位）")
+    gate().acquire()
+    try:
+        if not src.is_file():
+            raise RuntimeError(f"文件不存在：{src.name}")
+        raw = src.read_bytes()
+        if not raw:
+            raise RuntimeError(f"{src.name} 内容为空。")
+        try:
+            text, _enc = decode_buffer(raw)
+        except ValueError as e:
+            raise RuntimeError(f"{src.name} 无法解码：{e}")
+        body = (text or "").strip()
+        if not body:
+            raise RuntimeError(f"{src.name} 无有效文本。")
 
-    chunks = split_into_chunks(body, max_size=generation.chunk_size)
-    total = len(chunks)
-    if total == 0:
-        raise RuntimeError("未从输入文本切分出任何片段。")
-    handle.log(f"按段落/句子边界切分为 {total} 段（每段约 {generation.chunk_size} 字）")
-    handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
+        body = fix_mojibake(body)
+        handle.log(f"读入 {src.name}（{len(body)} 字）")
 
-    sys_prompt = prompts.system_prompt or DEFAULT_SYSTEM_PROMPT
-    usr_template = prompts.user_prompt or DEFAULT_USER_PROMPT
+        chunks = split_into_chunks(body, max_size=generation.chunk_size)
+        total = len(chunks)
+        if total == 0:
+            raise RuntimeError("未从文件切分出任何片段。")
+        handle.log(f"按段落/句子边界切分为 {total} 段（每段约 {generation.chunk_size} 字）")
+        handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
 
-    all_entries = []
-    for i, chunk in enumerate(chunks, 1):
-        handle.check()  # cooperative cancel / pause between chunks
-        handle.log(f"处理第 {i}/{total} 段（{len(chunk)} 字）…")
-        handle.progress((i - 1) / total, f"处理第 {i}/{total} 段")
-        previous = all_entries if all_entries else None
-        entries = process_chunk(
-            handle, llm, llm.model_name, chunk, i, total,
-            previous_entries=previous,
-            system_prompt=sys_prompt,
-            user_prompt_template=usr_template,
-            max_tokens=generation.max_tokens,
-            temperature=generation.temperature,
-            top_p=generation.top_p,
-            top_k=generation.top_k,
-            min_p=generation.min_p,
-            presence_penalty=generation.presence_penalty,
-            banned_tokens=generation.banned_tokens,
-        )
-        all_entries.extend(entries)
-        handle.log(f"  得到 {len(entries)} 条")
+        sys_prompt = prompts.system_prompt or DEFAULT_SYSTEM_PROMPT
+        usr_template = prompts.user_prompt or DEFAULT_USER_PROMPT
 
-    if not all_entries:
-        raise RuntimeError("未生成任何脚本条目。")
+        all_entries = []
+        processed_chars = 0  # 累计已处理原始字符数（处理速度 的分子），每完成一段累加
+        proc_start = time.monotonic()  # 本文件开始逐段处理的时刻（处理速度分母冻结于每段完成）
+        for i, chunk in enumerate(chunks, 1):
+            handle.check()  # cooperative cancel / pause between chunks
+            handle.log(f"处理第 {i}/{total} 段（{len(chunk)} 字）…")
+            handle.progress((i - 1) / total, f"处理第 {i}/{total} 段")
+            handle.llm_rate(0.0)  # reset the 字/s gauge per chunk (0 until the stream reports)
+            previous = all_entries if all_entries else None
+            entries = process_chunk(
+                handle, llm, llm.model_name, chunk, i, total,
+                previous_entries=previous,
+                system_prompt=sys_prompt,
+                user_prompt_template=usr_template,
+                max_tokens=generation.max_tokens,
+                temperature=generation.temperature,
+                top_p=generation.top_p,
+                top_k=generation.top_k,
+                min_p=generation.min_p,
+                presence_penalty=generation.presence_penalty,
+                banned_tokens=generation.banned_tokens,
+            )
+            all_entries.extend(entries)
+            handle.log(f"  得到 {len(entries)} 条")
+            # 每段完成后上报"累计原始字符数 + 到本段为止的处理耗时"，让处理速度（Σ字÷Σ耗时）
+            # 按段刷新、段间保持不变（耗时冻结于本段完成时刻，而非实时时钟，故不会持续衰减）。
+            # len(chunk) 是该段的真实源文字符数（字符，而非 token）。
+            processed_chars += len(chunk)
+            handle.llm_chars(processed_chars, time.monotonic() - proc_start)
 
-    out_path = get_layout().parsed_json / "annotated_script.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(all_entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        if not all_entries:
+            raise RuntimeError("未生成任何脚本条目。")
 
-    speakers = sorted({(e.get("speaker") or "UNKNOWN") for e in all_entries})
-    handle.progress(1.0, "完成")
-    handle.log(f"共生成 {len(all_entries)} 条；讲者：{', '.join(speakers)}")
-    return {
-        "entries": all_entries,
-        "output_path": str(out_path),
-        "count": len(all_entries),
-        "speakers": speakers,
-    }
+        out_name = f"{src.stem}.json"
+        out_path = get_layout().parsed_json / out_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(all_entries, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        speakers = sorted({(e.get("speaker") or "UNKNOWN") for e in all_entries})
+        handle.progress(1.0, "完成")
+        handle.log(f"共生成 {len(all_entries)} 条；讲者：{', '.join(speakers)}")
+        return {
+            "entries": all_entries,
+            "output_path": str(out_path),
+            "output_name": out_name,
+            "count": len(all_entries),
+            "speakers": speakers,
+            # Original (decoded, stripped, mojibake-fixed) input length in chars — kept in
+            # the result for reference. The live 处理速度 gauge uses the per-chunk llm_chars
+            # instead (chars, never tokens).
+            "input_chars": len(body),
+        }
+    finally:
+        gate().release()

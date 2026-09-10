@@ -19,23 +19,23 @@ import json
 import uuid
 
 from ..core.config import get_config
-from ..core.paths import get_layout
+from ..core.paths import get_layout, resolve_parsed_json
 from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, resolve_engine, run_worker
 
 IMPLEMENTED = True
 
 
-def _load_script():
-    p = get_layout().parsed_json / "annotated_script.json"
+def _load_script(script=None):
+    p = resolve_parsed_json(script)
     if not p.exists():
-        raise RuntimeError("未找到 03_parsed_json/annotated_script.json——请先在「文本解析」生成脚本。")
+        raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
     try:
-        script = json.loads(p.read_text("utf-8"))
+        data = json.loads(p.read_text("utf-8"))
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"annotated_script.json 无法解析：{e}")
-    if not isinstance(script, list) or not script:
-        raise RuntimeError("annotated_script.json 为空——请先生成脚本。")
-    return script
+        raise RuntimeError(f"{p.name} 无法解析：{e}")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"{p.name} 为空——请先生成脚本。")
+    return data
 
 
 def _handle_segment(line: str, by_index: dict, total: int, seg_results: dict, handle) -> None:
@@ -86,9 +86,9 @@ def _build_segments(script, indices=None):
     return segments
 
 
-def synthesize(handle, indices=None) -> dict:
+def synthesize(handle, indices=None, script=None) -> dict:
     """Task worker: synthesize all (or the selected) script lines, in JSON order."""
-    script = _load_script()
+    script = _load_script(script)
 
     # voice_config is optional here — a character missing from it becomes a clear
     # per-segment error (the run continues), not a crash.

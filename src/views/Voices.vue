@@ -19,6 +19,7 @@ import Input from '@/components/ui/Input.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
+import ScriptPicker from '@/components/ScriptPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
@@ -52,6 +53,8 @@ const taskId = ref<string | null>(null)
 const result = ref<PrepareVoicesResult | null>(null)
 
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
+// Which parsed JSON to read (shared with 音频合成 via the project store; '' → most recent).
+const script = computed(() => project.activeScript)
 const activePreview = ref<{ name: string; url: string } | null>(null)
 const readyCount = computed(() => speakers.value.filter((s) => s.status === 'ready').length)
 
@@ -62,7 +65,7 @@ function typeLabel(v: VoiceItem) {
 
 async function loadVoices() {
   try {
-    const r = await listVoices()
+    const r = await listVoices(script.value || undefined)
     hasScript.value = r.has_script
     speakers.value = r.speakers
   } catch {
@@ -70,6 +73,11 @@ async function loadVoices() {
     speakers.value = []
   }
 }
+
+// Re-list the characters when the user picks a different parsed JSON.
+watch(script, () => {
+  loadVoices()
+})
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
@@ -93,7 +101,7 @@ async function doPrepare(opts: {
   result.value = null
   activePreview.value = null
   try {
-    const { task_id } = await prepareVoices(opts)
+    const { task_id } = await prepareVoices({ ...opts, script: script.value || undefined })
     taskId.value = task_id
     await taskStore.refresh()
     // Completion is handled by the watcher on task.status.
@@ -167,8 +175,7 @@ watch(
     <template v-else>
       <Alert v-if="!hasScript" variant="default">
         <Users class="h-4 w-4 shrink-0" />
-        尚未检测到角色——请先在「文本解析」生成
-        <code class="text-xs">annotated_script.json</code>。
+        尚未检测到角色——请先在「文本解析」生成解析 JSON（03_parsed_json/）。
       </Alert>
 
       <!-- 角色列表 -->
@@ -179,7 +186,8 @@ watch(
           </CardTitle>
           <CardDescription v-if="speakers.length">已就绪 {{ readyCount }} / {{ speakers.length }}</CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent class="space-y-4">
+          <ScriptPicker v-model="project.activeScript" label="解析 JSON（03_parsed_json/）" />
           <div v-if="speakers.length" class="overflow-x-auto">
             <table class="w-full text-sm">
               <thead>

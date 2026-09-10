@@ -9,7 +9,9 @@ export function isNearBottom(el: HTMLElement, threshold = NEAR_BOTTOM_PX): boole
 }
 
 /**
- * Follow a growing log list to its bottom while the user is reading the tail.
+ * Follow a growing log list (or string buffer) to its bottom while the user reads
+ * the tail. Works for anything exposing a numeric `.length` (the log array, the raw
+ * LLM stream, …).
  *
  * Returns a function to bind as the `ref` of the scrollable element — a native
  * element, or a component such as `ScrollArea` (its root element is used). On new
@@ -20,7 +22,7 @@ export function isNearBottom(el: HTMLElement, threshold = NEAR_BOTTOM_PX): boole
  * *before* the new line grows the box); the actual scroll is deferred to the next
  * animation frame, after Vue has painted the new line.
  */
-export function useLogAutoFollow(getLogs: () => readonly unknown[]) {
+export function useLogAutoFollow(getSignal: () => { length: number }) {
   const el = ref<HTMLElement | null>(null)
 
   function bind(target: unknown) {
@@ -31,7 +33,7 @@ export function useLogAutoFollow(getLogs: () => readonly unknown[]) {
   }
 
   watch(
-    () => getLogs().length,
+    () => getSignal().length,
     () => {
       const node = el.value
       if (node && isNearBottom(node)) {

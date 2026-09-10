@@ -53,10 +53,16 @@ def stream_task(task_id: str):
         raise HTTPException(404, "任务不存在")
 
     def gen():
+        # Snapshot BEFORE subscribing so the replayed state and the live events that
+        # follow never overlap: a chunk logged after the snapshot is forwarded once as
+        # an event, rather than appearing both in the snapshot and again as an event.
+        # (The lost-event window between the snapshot and the subscribe is a few
+        # instructions wide — negligible, and self-heals on the next snapshot/final.)
+        initial = task.snapshot()
         q = task.subscribe()
         try:
             # Replay state so a late subscriber starts with the full picture.
-            yield _sse({"type": "snapshot", "task": task.snapshot()})
+            yield _sse({"type": "snapshot", "task": initial})
             if task.status in TERMINAL:
                 return
             while True:

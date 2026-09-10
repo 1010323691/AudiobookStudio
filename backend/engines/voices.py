@@ -1,6 +1,6 @@
 """Character voice-prep engine (port of source ``app/generate_personas.py``).
 
-Turns the parsed script (``03_parsed_json/annotated_script.json``) into a
+Turns the parsed script (``03_parsed_json/<name>.json``) into a
 ``voice_config.json`` that the batch TTS stage consumes:
 
   1. detect every speaker in the script (in order of first appearance);
@@ -30,7 +30,7 @@ import time
 import uuid
 
 from ..core.config import get_config
-from ..core.paths import PROJECT_ROOT, get_layout
+from ..core.paths import PROJECT_ROOT, get_layout, resolve_parsed_json
 from .persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT
 from .tts import _child_env, resolve_engine
 
@@ -308,27 +308,28 @@ def _design_preview(handle, description: str, ref_text: str, out_wav) -> str:
 # The Task worker
 # ---------------------------------------------------------------------------
 
-def prepare(handle, speakers=None, new_only=False, overrides=None) -> dict:
+def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=None) -> dict:
     """Task worker: prepare voices for every (selected) character in the script.
 
     Contract: first arg is the :class:`TaskHandle``. ``speakers`` is an optional
     allowlist (for regenerating a subset); ``new_only`` skips characters already in
     ``voice_config.json``; ``overrides`` maps a speaker → a user-supplied description
-    (skips the LLM for that character). Returns a summary for the UI.
+    (skips the LLM for that character); ``script_name`` selects which parsed JSON in
+    ``03_parsed_json/`` to read (None → the most recent one). Returns a summary for the UI.
     """
     overrides = overrides or {}
 
-    # 1. Load the parsed script.
-    script_path = get_layout().parsed_json / "annotated_script.json"
+    # 1. Load the parsed script (the chosen file, or the most recent one).
+    script_path = resolve_parsed_json(script_name)
     if not script_path.exists():
-        raise RuntimeError("未找到 03_parsed_json/annotated_script.json——请先在「文本解析」生成脚本。")
+        raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")
     try:
         script = json.loads(script_path.read_text("utf-8"))
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"annotated_script.json 无法解析：{e}")
+        raise RuntimeError(f"{script_path.name} 无法解析：{e}")
     if not isinstance(script, list) or not script:
-        raise RuntimeError("annotated_script.json 为空——请先生成脚本。")
-    handle.log(f"读入脚本：{len(script)} 条")
+        raise RuntimeError(f"{script_path.name} 为空——请先生成脚本。")
+    handle.log(f"读入脚本 {script_path.name}：{len(script)} 条")
 
     # 2. Collect sample lines per speaker, in order of first appearance.
     samples: dict = {}

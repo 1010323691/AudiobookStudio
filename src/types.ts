@@ -7,6 +7,16 @@ export interface UploadResult {
   name: string
   size: number
 }
+export interface FileItem {
+  name: string
+  is_dir: boolean
+  size: number | null
+}
+/** Response of ``GET /api/files/list/{module}``. */
+export interface DirListResult {
+  path: string
+  items: FileItem[]
+}
 
 // ------------------------------ text ------------------------------
 export interface TextStats {
@@ -163,6 +173,14 @@ export interface PrepareVoicesOptions {
   speakers?: string[]
   new_only?: boolean
   overrides?: Record<string, string>
+  /** Which parsed JSON (in 03_parsed_json/) to read; undefined → most recent. */
+  script?: string
+}
+/** Options for ``POST /api/tts/batch`` (音频合成). */
+export interface BatchRunOptions {
+  indices?: number[]
+  /** Which parsed JSON (in 03_parsed_json/) to synthesize; undefined → most recent. */
+  script?: string
 }
 export interface PrepareVoicesResult {
   count: number
@@ -195,8 +213,14 @@ export interface ScriptEntry {
 export interface ScriptGenerateResult {
   entries: ScriptEntry[]
   output_path: string
+  output_name?: string
   count: number
   speakers: string[]
+}
+/** Response of ``POST /api/script/generate-files``: one independent task per file. */
+export interface GenerateFilesResult {
+  task_ids: string[]
+  files: { file: string; task_id: string }[]
 }
 
 // ------------------------------ tasks ------------------------------
@@ -221,6 +245,14 @@ export interface TaskSnapshot {
   progress: number
   current: string
   logs: TaskLog[]
+  /** Raw LLM stream (「流式反馈」 panel); populated by `llm_chunk` events / snapshots. */
+  llm_stream?: string
+  /** Live LLM generation rate (chars/s) for the 文本解析 gauge; 0 when idle / queued. */
+  llm_cps?: number
+  /** Cumulative original-text chars processed (per completed chunk) — 处理速度 numerator. */
+  llm_chars?: number
+  /** Cumulative processing seconds up to the last completed chunk — 处理速度 denominator. */
+  llm_secs?: number
   result: Record<string, any>
   error: string
   created: number
@@ -271,6 +303,12 @@ export interface AppConfig {
     user_prompt: string
     advanced_prompt: string
   }
+  /** Speaker 检查 — 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
+  speaker_check: {
+    context_window: number
+    system_prompt: string
+    user_prompt: string
+  }
   generation: {
     chunk_size: number
     max_tokens: number
@@ -280,6 +318,8 @@ export interface AppConfig {
     min_p: number
     presence_penalty: number
     banned_tokens: number[]
+    /** Max files parsed in parallel (LLM jobs); the rest queue behind a shared gate. */
+    max_concurrency: number
   }
   ffmpeg: { ffmpeg_path: string; ffprobe_path: string }
   log: { level: string }

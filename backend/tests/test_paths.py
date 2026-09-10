@@ -7,6 +7,9 @@ project's files are never touched.
 from __future__ import annotations
 
 import json
+import os
+import time
+from pathlib import Path
 
 import pytest
 
@@ -141,3 +144,115 @@ def test_is_workspace_set_false_when_empty(sandbox, set_pointer):
 def test_is_workspace_set_true_when_set(sandbox, set_pointer):
     set_pointer(str(sandbox / "ws"))
     assert core_paths.is_workspace_set()
+
+
+# -- resolve_parsed_json (which parsed JSON the downstream stages read) ---------
+
+def test_resolve_parsed_json_unset_returns_placeholder(sandbox, set_pointer):
+    set_pointer("")
+    # No workspace -> an inert relative placeholder (read-only callers see "no script").
+    assert core_paths.resolve_parsed_json() == Path("annotated_script.json")
+    assert core_paths.resolve_parsed_json("ignored.json") == Path("annotated_script.json")
+
+
+def test_resolve_parsed_json_named_file(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    assert core_paths.resolve_parsed_json("第一册.json") == ws / "03_parsed_json" / "第一册.json"
+
+
+def test_resolve_parsed_json_most_recent_when_unnamed(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    older = d / "older.json"
+    newer = d / "newer.json"
+    older.write_text("[]", encoding="utf-8")
+    newer.write_text("[]", encoding="utf-8")
+    old_t = time.time() - 1000
+    new_t = time.time()
+    os.utime(older, (old_t, old_t))
+    os.utime(newer, (new_t, new_t))
+    # With no explicit name, the most recently written JSON wins.
+    assert core_paths.resolve_parsed_json() == newer
+
+
+def test_resolve_parsed_json_legacy_fallback_when_empty(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    # No JSON files yet (the dir may exist, empty) -> the legacy single-file name.
+    assert core_paths.resolve_parsed_json() == ws / "03_parsed_json" / "annotated_script.json"
+
+
+# -- resolve_parsed_json: Speaker-check ``_checked.json`` preference -------------
+
+def test_resolve_parsed_json_named_prefers_checked(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "第一册.json").write_text("[]", encoding="utf-8")
+    (d / "第一册_checked.json").write_text("[]", encoding="utf-8")
+    assert core_paths.resolve_parsed_json("第一册.json") == d / "第一册_checked.json"
+
+
+def test_resolve_parsed_json_named_falls_back_when_no_checked(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "第一册.json").write_text("[]", encoding="utf-8")
+    assert core_paths.resolve_parsed_json("第一册.json") == d / "第一册.json"
+
+
+def test_resolve_parsed_json_named_checked_not_double_suffixed(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "第一册_checked.json").write_text("[]", encoding="utf-8")
+    # Asking for the _checked file directly returns it as-is (no ``_checked_checked``).
+    assert core_paths.resolve_parsed_json("第一册_checked.json") == d / "第一册_checked.json"
+
+
+def test_resolve_parsed_json_autopick_most_recent_base_without_checked(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    a = d / "a.json"; a.write_text("[]", encoding="utf-8")
+    (d / "a_checked.json").write_text("[]", encoding="utf-8")
+    b = d / "b.json"; b.write_text("[]", encoding="utf-8")
+    # b is the most recent *base* file and has no checked copy -> resolves to b.
+    os.utime(a, (0, 0))
+    os.utime(b, (10, 10))
+    assert core_paths.resolve_parsed_json() == b
+
+
+def test_resolve_parsed_json_autopick_uses_checked_when_present(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    a = d / "a.json"; a.write_text("[]", encoding="utf-8")
+    ac = d / "a_checked.json"; ac.write_text("[]", encoding="utf-8")
+    b = d / "b.json"; b.write_text("[]", encoding="utf-8")
+    # ``a`` is the most recent base (``a_checked`` is excluded from the base pool even
+    # though it is newer) and has a checked copy -> resolves to ``a_checked``.
+    os.utime(a, (10, 10))
+    os.utime(ac, (20, 20))
+    os.utime(b, (5, 5))
+    assert core_paths.resolve_parsed_json() == ac
+
+
+def test_resolve_parsed_json_autopick_only_checked(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    set_pointer(str(ws))
+    d = ws / "03_parsed_json"
+    d.mkdir(parents=True, exist_ok=True)
+    c1 = d / "x_checked.json"; c1.write_text("[]", encoding="utf-8")
+    c2 = d / "y_checked.json"; c2.write_text("[]", encoding="utf-8")
+    os.utime(c1, (5, 5)); os.utime(c2, (10, 10))
+    # No base files at all -> degrade to the most recent _checked file.
+    assert core_paths.resolve_parsed_json() == c2

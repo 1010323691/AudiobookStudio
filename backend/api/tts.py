@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..core.paths import get_layout
+from ..core.paths import get_layout, resolve_parsed_json
 from ..core.tasks import get_task_manager
 from ..engines import merge as Merge
 from ..engines import tts as T
@@ -48,6 +48,8 @@ class PrepareVoicesRequest(BaseModel):
     new_only: bool = False
     # speaker -> user-supplied voice description (skips the LLM for that character).
     overrides: dict[str, str] | None = None
+    # Which parsed JSON (in 03_parsed_json/) to read; None -> most recent (resolve_parsed_json).
+    script: str | None = None
 
 
 @router.post("/prepare-voices")
@@ -62,7 +64,7 @@ def prepare_voices(req: PrepareVoicesRequest) -> dict:
     task = get_task_manager().create(
         "voices", label,
         V.prepare,
-        req.speakers, req.new_only, req.overrides or {},
+        req.speakers, req.new_only, req.overrides or {}, req.script,
     )
     return {"task_id": task.id}
 
@@ -80,16 +82,20 @@ def _voice_usable(entry: dict) -> bool:
 
 
 @router.get("/voices")
-def list_voices() -> dict:
+def list_voices(script: str | None = None) -> dict:
     """Detected characters + their voice-config state (ready/pending) + preview paths.
 
-    ``preview`` is a path relative to ``04_voice_profiles/`` so the UI can play it
-    through the shared ``download/04_voice_profiles/{name}`` route; empty when there
-    is nothing to preview.
+    ``script`` names the parsed JSON (in ``03_parsed_json/``) to read; when omitted the
+    most recently written one is used (see ``resolve_parsed_json``). With no workspace
+    set it degrades to an empty result. ``preview`` is a path relative to
+    ``04_voice_profiles/`` so the UI can play it through the shared
+    ``download/04_voice_profiles/{name}`` route; empty when there is nothing to preview.
     """
     layout = get_layout()
+    if layout.parsed_json is None:  # no workspace: nothing to read (read-only, degrades)
+        return {"has_script": False, "script_path": "", "voice_config_path": "", "speakers": []}
     out_voices = layout.voice_profiles
-    script_path = layout.parsed_json / "annotated_script.json"
+    script_path = resolve_parsed_json(script)
     vc_path = out_voices / "voice_config.json"
 
     has_script = False
@@ -164,13 +170,15 @@ def list_voices() -> dict:
 class BatchRequest(BaseModel):
     # None -> every script line; a list of line indices -> only those.
     indices: list[int] | None = None
+    # Which parsed JSON (in 03_parsed_json/) to synthesize; None -> most recent.
+    script: str | None = None
 
 
 @router.post("/batch")
 def run_batch(req: BatchRequest) -> dict:
     _common.require_workspace()
     label = "音频合成（全部）" if not req.indices else f"音频合成（{len(req.indices)} 段）"
-    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices)
+    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script)
     return {"task_id": task.id}
 
 

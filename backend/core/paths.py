@@ -118,3 +118,50 @@ def get_layout() -> Layout:
     layout = Layout(workspace)
     layout.ensure()
     return layout
+
+
+def _checked_variant(base: Path) -> Path:
+    """``<stem>_checked.json`` next to ``base`` if it exists, else ``base`` itself.
+
+    A Speaker check writes ``<stem>_checked.json`` alongside the original ``<stem>.json``
+    (leaving the original untouched); downstream stages read the checked copy when one
+    exists.
+    """
+    checked = base.with_name(base.stem + "_checked.json")
+    return checked if checked.exists() else base
+
+
+def resolve_parsed_json(script: str | None = None) -> Path:
+    """The parsed script JSON a downstream stage (角色配音 / 音频合成) should read.
+
+    ``script`` names a file inside ``03_parsed_json/``. When given, that file is used —
+    except that a base ``<stem>.json`` is transparently upgraded to ``<stem>_checked.json``
+    if the Speaker check has produced one (a name that is already a ``_checked`` file is
+    returned as-is, so it is never double-suffixed). When omitted, fall back to the most
+    recently modified *base* ``*.json`` (then to its ``_checked`` copy if present), and
+    finally to the legacy single-file name ``annotated_script.json`` (so an older project
+    that still has it keeps working). With no workspace set, returns a non-existent
+    relative placeholder so read-only callers degrade cleanly. Callers validate existence
+    and raise a clear error when nothing resolves.
+    """
+    layout = get_layout()
+    d = layout.parsed_json
+    if d is None:  # no workspace: inert (read-only callers see "no script")
+        return Path("annotated_script.json")
+    if script:
+        p = d / script
+        if script.endswith(".json") and not script.endswith("_checked.json"):
+            return _checked_variant(p)
+        return p
+    if d.exists():
+        # Pick the most recent base file (never a _checked file, so it can't be
+        # re-suffixed), then transparently upgrade to its _checked copy if present.
+        base = [p for p in d.glob("*.json")
+                if p.is_file() and not p.name.endswith("_checked.json")]
+        if base:
+            return _checked_variant(max(base, key=lambda p: p.stat().st_mtime))
+        # Only _checked files present (no base) — degrade to the most recent one.
+        checked = [p for p in d.glob("*_checked.json") if p.is_file()]
+        if checked:
+            return max(checked, key=lambda p: p.stat().st_mtime)
+    return d / "annotated_script.json"

@@ -6,7 +6,6 @@ import type {
   BookSplitResult,
   MergeResult,
   PrepareVoicesResult,
-  ScriptGenerateResult,
   TextFormatResult,
 } from '@/types'
 
@@ -29,7 +28,10 @@ export const useProjectStore = defineStore('project', () => {
   const bookOutputs = ref<string[]>([]) // volume .txt paths
   const bookResult = ref<BookSplitResult | null>(null)
 
-  const scriptResult = ref<ScriptGenerateResult | null>(null)
+  // Which parsed JSON (a file name in 03_parsed_json/) the downstream 角色配音 / 音频合成
+  // stages should read. Shared by both pages so they operate on the same file.
+  // Empty string → the backend falls back to the most recently written JSON.
+  const activeScript = ref('')
   const voiceResult = ref<PrepareVoicesResult | null>(null)
   const batchResult = ref<BatchResult | null>(null)
   const mergeResult = ref<MergeResult | null>(null)
@@ -51,8 +53,8 @@ export const useProjectStore = defineStore('project', () => {
     bookResult.value = r
     bookOutputs.value = r.files.map((f) => f.path)
   }
-  function recordScript(r: ScriptGenerateResult) {
-    scriptResult.value = r
+  function setActiveScript(name: string) {
+    activeScript.value = name
   }
   function recordVoices(r: PrepareVoicesResult) {
     voiceResult.value = r
@@ -73,7 +75,7 @@ export const useProjectStore = defineStore('project', () => {
     textResult,
     bookOutputs,
     bookResult,
-    scriptResult,
+    activeScript,
     voiceResult,
     batchResult,
     mergeResult,
@@ -84,7 +86,7 @@ export const useProjectStore = defineStore('project', () => {
     audioInput,
     recordText,
     recordBook,
-    recordScript,
+    setActiveScript,
     recordVoices,
     recordBatch,
     recordMerge,
