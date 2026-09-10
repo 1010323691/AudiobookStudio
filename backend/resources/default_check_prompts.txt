@@ -6,17 +6,37 @@ other entries are context only.
 Using the surrounding context, re-judge the correct "speaker" of EVERY target entry.
 
 RULES:
-- "speaker" is the character who SAYS the line (UPPERCASE name), or "NARRATOR" for
+
+* "speaker" is the character who SAYS the line (UPPERCASE name), or "NARRATOR" for
   non-dialogue (description, action, thought, scene-setting, narration).
-- Dialogue = words spoken aloud; everything else = NARRATOR. Inside quotation marks is
+* Dialogue = words spoken aloud; everything else = NARRATOR. Inside quotation marks is
   usually dialogue; outside is usually narration.
-- Decide ONLY from the provided window; never invent a speaker that is absent from it.
-- Judge ONLY the target entries (those marked "target": true). Do not change or comment
+* Decide ONLY from the provided window; never invent a speaker that is absent from it.
+* Judge ONLY the target entries (those marked "target": true). Do not change or comment
   on any context entry.
-- Return EXACTLY one JSON object of the form
-    {"results": [{"index": <the entry's "index">, "speaker": "..."}, ...]}
-  with one item per target entry, using each target entry's own "index". No markdown, no
-  extra keys, no explanation.
+* The "speaker" value MUST be copied exactly from an existing "speaker" value in the
+  provided entries, except for "NARRATOR".
+* NEVER translate, romanize, transliterate, localize, paraphrase, normalize, or otherwise
+  modify a character's name.
+* Character names written in Chinese MUST remain in their original Chinese characters.
+  For example, "任昊" MUST remain exactly "任昊", never "Ren Hao", "REN HAO", "Renhao",
+  or "任昊（Ren Hao）".
+* Chinese speaker labels such as "老师", "老板", or "李明" MUST remain exactly as they
+  appear in the input. NEVER translate them to "Teacher", "Boss", "Li Ming", etc.
+* Do NOT convert a speaker name into English even if the surrounding dialogue is in
+  English.
+* Do NOT infer an English equivalent of a Chinese name. The original speaker label in
+  the provided JSON is always authoritative.
+* Preserve the exact spelling, characters, capitalization, and wording of the selected
+  "speaker" value.
+* If the correct speaker is "NARRATOR", output exactly "NARRATOR".
+* Return EXACTLY one JSON object of the form
+  {"results": [{"index": <the entry's "index">, "speaker": "..."}, ...]}
+  with one item per target entry, using each target entry's own "index".
+* The output "speaker" MUST be the exact speaker label from the input. Never output a
+  translated or reformatted speaker name.
+* No markdown, no extra keys, no explanation.
+
 ---SEPARATOR---
 {context}
 
