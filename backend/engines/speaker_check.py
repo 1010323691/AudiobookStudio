@@ -1,7 +1,8 @@
 """Speaker check engine — re-judge each batch of entries' speakers with a context window.
 
 Reads the ORIGINAL parsed JSON (``<stem>.json`` in ``03_parsed_json/``) and processes it
-in batches of ``BATCH_SIZE`` entries. Each batch is ONE LLM call: the window holds the
+in batches (``speaker_check.batch_size`` target entries per batch, default
+:data:`BATCH_SIZE` = 20). Each batch is ONE LLM call: the window holds the
 batch's target entries (each flagged ``"target": true``) flanked by ``±N`` context
 entries (``N = speaker_check.context_window``), and the prompt states both the target
 count and the context scope so the model knows what it may reason from. The LLM re-judges
@@ -26,7 +27,7 @@ checked copy preferentially (``resolve_parsed_json``).
 ``check_file`` is a Task worker (first arg is the :class:`TaskHandle`), mirroring
 ``script.generate_file``'s concurrency: it holds ONE shared-gate slot for the whole file
 (serial LLM calls within, parallel across files) and uses per-item failure isolation
-(like ``voices.prepare``) — an entry whose calls can't be resolved keeps its original
+(like ``voices.prepare_foundations``) — an entry whose calls can't be resolved keeps its original
 speaker, so a single bad response can never abort (or corrupt) the whole file.
 """
 from __future__ import annotations
@@ -43,9 +44,10 @@ from . import check_prompts
 from .script import _llm_chat_completion, _llm_chat_completion_stream
 
 
-# How many entries are re-judged per LLM call. A batch whose re-judged speakers disagree
-# with the originals is resolved by dynamic majority voting (1–3 retries, stopping at the
-# first 2:1) — see ``check_file``.
+# Default number of target entries re-judged per LLM call — the value ``check_file`` uses
+# when the config's ``speaker_check.batch_size`` is unset (the config default mirrors this).
+# A batch whose re-judged speakers disagree with the originals is resolved by dynamic
+# majority voting (1–3 retries, stopping at the first 2:1) — see ``check_file``.
 BATCH_SIZE = 20
 
 
@@ -332,8 +334,9 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
     """Task worker: re-judge every entry's speaker in batches → ``<stem>_checked.json``.
 
     Contract: first arg is the :class:`TaskHandle`; the second is the absolute path of the
-    ORIGINAL ``<stem>.json`` in ``03_parsed_json/``. Entries are re-judged ``BATCH_SIZE``
-    at a time (one LLM call each); a batch whose re-judged speakers disagree with the
+    ORIGINAL ``<stem>.json`` in ``03_parsed_json/``. Entries are re-judged in batches of
+    ``check.batch_size`` (default 20) at a time (one LLM call each); a batch whose re-judged
+    speakers disagree with the
     originals is resolved by dynamic majority voting (original + first check + 1–3 retries,
     stopping at the first 2:1). Concurrency
     is bounded by the shared gate (``generation.max_concurrency``) like parsing — one slot
@@ -360,6 +363,9 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             raise RuntimeError(f"{src.name} 含非对象条目，无法检查。")
 
         n = max(0, int(check.context_window or 0))
+        # Target entries per LLM call, from the user's 「每次送检段落数」 (clamped to ≥1 so a
+        # 0 / negative value can never produce an empty-step range() or an infinite loop).
+        batch = max(1, int(check.batch_size or 0))
         total = len(original)
         # Shallow copies: only `speaker` may change, so `original` stays pristine and every
         # window (first pass + all re-runs) is built from the ORIGINAL speakers.
@@ -368,7 +374,7 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
         sys_prompt = check.system_prompt or check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
         usr_template = check.user_prompt or check_prompts.DEFAULT_CHECK_USER_PROMPT
 
-        handle.log(f"读入 {src.name}（{total} 条）· 每批 {BATCH_SIZE} 条 · 上下文窗口 ±{n}")
+        handle.log(f"读入 {src.name}（{total} 条）· 每批 {batch} 条 · 上下文窗口 ±{n}")
         handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
 
         changed = 0
@@ -376,8 +382,8 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
         proc_start = time.monotonic()
         window_chars = 0
 
-        for start in range(0, total, BATCH_SIZE):
-            size = min(BATCH_SIZE, total - start)
+        for start in range(0, total, batch):
+            size = min(batch, total - start)
             targets = target_indices(start, size, total)
             # The window is built from the ORIGINAL entries and reused for every call in
             # this batch (first pass + re-runs) so each sample sees identical context.

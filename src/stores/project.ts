@@ -5,7 +5,7 @@ import type {
   BatchResult,
   BookSplitResult,
   MergeResult,
-  PrepareVoicesResult,
+  PrepareFoundationsResult,
   TextFormatResult,
 } from '@/types'
 
@@ -32,7 +32,7 @@ export const useProjectStore = defineStore('project', () => {
   // stages should read. Shared by both pages so they operate on the same file.
   // Empty string → the backend falls back to the most recently written JSON.
   const activeScript = ref('')
-  const voiceResult = ref<PrepareVoicesResult | null>(null)
+  const voiceResult = ref<PrepareFoundationsResult | null>(null)
   const batchResult = ref<BatchResult | null>(null)
   const mergeResult = ref<MergeResult | null>(null)
 
@@ -56,7 +56,7 @@ export const useProjectStore = defineStore('project', () => {
   function setActiveScript(name: string) {
     activeScript.value = name
   }
-  function recordVoices(r: PrepareVoicesResult) {
+  function recordVoices(r: PrepareFoundationsResult) {
     voiceResult.value = r
   }
   function recordBatch(r: BatchResult) {

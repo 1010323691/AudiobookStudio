@@ -157,8 +157,10 @@ export interface TTSStatus {
 export interface VoiceItem {
   name: string
   line_count: number
-  status: 'ready' | 'pending'
-  type: string // clone | design | custom | ''
+  status: 'ready' | 'pending' // overall ready = alias OR a usable voice (clone/design/custom); a bare foundation is NOT ready
+  foundation_status: 'none' | 'done' | 'failed' // Phase 1 (语音推理基础) state
+  clone_status: 'none' | 'done' | 'failed' // Phase 2 (克隆音频) state
+  type: string // clone | design | custom | foundation | ''
   alias_of: string // non-empty -> this label points at another character's voice
   description: string
   preview: string // path relative to 04_voice_profiles/ (playable via downloadUrl('04_voice_profiles', preview)); '' if none
@@ -169,11 +171,20 @@ export interface VoicesListResult {
   voice_config_path: string
   speakers: VoiceItem[]
 }
-export interface PrepareVoicesOptions {
+export interface PrepareFoundationsOptions {
   speakers?: string[]
   new_only?: boolean
   overrides?: Record<string, string>
   /** Which parsed JSON (in 03_parsed_json/) to read; undefined → most recent. */
+  script?: string
+}
+/** Phase 2 (TTS only): options for ``POST /api/tts/make-clones`` (批量制作克隆音频). */
+export interface MakeClonesOptions {
+  speakers?: string[]
+  new_only?: boolean
+  /** Number of parallel TTS subprocesses; undefined → backend default (1). */
+  concurrency?: number
+  /** Which parsed JSON to read for the character set; undefined → most recent. */
   script?: string
 }
 /** Options for ``POST /api/tts/batch`` (音频合成). */
@@ -181,14 +192,28 @@ export interface BatchRunOptions {
   indices?: number[]
   /** Which parsed JSON (in 03_parsed_json/) to synthesize; undefined → most recent. */
   script?: string
+  /** Concurrent segments (1..32); undefined → the persisted default (config.tts.batch_concurrency). */
+  concurrency?: number
+  /** True → re-synthesize EVERY segment (clears the resume skip); undefined/false → resume
+   *  (only the not-yet-done segments, skipping existing audio). */
+  force_all?: boolean
 }
-export interface PrepareVoicesResult {
+export interface PrepareFoundationsResult {
   count: number
   aliases: number
   speakers: string[]
   voice_config_path: string
+  results: { speaker: string; ok: boolean; type: string; description: string }[]
+}
+/** Phase 2 (TTS) batch result (``POST /api/tts/make-clones``). */
+export interface MakeClonesResult {
+  count: number
+  ok: number
+  failed: number
+  speakers: string[]
+  voice_config_path: string
   output_dir: string
-  results: { speaker: string; ok: boolean; type: string; preview: string; description: string }[]
+  results: { speaker: string; ok: boolean; type: string; preview: string; reason?: string }[]
 }
 export interface BatchResult {
   total: number
@@ -196,6 +221,16 @@ export interface BatchResult {
   failed: { index: number; speaker: string; reason: string }[]
   output_dir: string
   manifest_path: string
+  /** Cumulative (after this run) number of segments already synthesized — 「累计已合成 X」. */
+  done_count?: number
+  /** Total synthesizable segments in the script — 「全部 Y」 (denominator of the cumulative count). */
+  all_count?: number
+}
+/** Synthesis progress for the 待合成 card's 【已合成 / 总段落】 (``GET /api/tts/batch-status``). */
+export interface BatchStatus {
+  total: number
+  completed: number
+  remaining: number
 }
 export interface MergeResult {
   file: string
@@ -286,7 +321,10 @@ export interface AppConfig {
     device: string
     pause_between_speakers_ms: number
     pause_same_speaker_ms: number
+    /** 角色配音·阶段 2（克隆）的并行 TTS 子进程数。 */
     parallel_workers: number
+    /** 音频合成（一键合成）的并发段数（单子进程内线程池；1 = 串行；范围 1..32）。 */
+    batch_concurrency: number
     api_base: string
     api_key: string
     voice: string
@@ -306,8 +344,11 @@ export interface AppConfig {
     user_prompt: string
     advanced_prompt: string
   }
-  /** Speaker 检查 — 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
+  /** Speaker 检查 — 每次送检段落数 + 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
   speaker_check: {
+    /** 每次送检段落数：每批送入 LLM 重判的目标条数（每批再在前后各加 `context_window` 条上下文）。 */
+    batch_size: number
+    /** 上下文窗口大小：每批送检块前后各取 N 条上下文（仅供理解、不改判）。 */
     context_window: number
     system_prompt: string
     user_prompt: string
@@ -327,6 +368,17 @@ export interface AppConfig {
   ffmpeg: { ffmpeg_path: string; ffprobe_path: string }
   log: { level: string }
   ui: { theme: string }
+}
+
+/** A recursively-partial ``AppConfig`` — mirrors the backend's deep-merge ``update_config``
+ *  (``PUT /api/config``), which patches only the fields actually sent, at any nesting depth.
+ *  Nested object sections may be partial; arrays are provided whole. */
+export type DeepPartial<T> = {
+  [K in keyof T]?: T[K] extends readonly any[]
+    ? T[K]
+    : T[K] extends object
+      ? DeepPartial<T[K]>
+      : T[K]
 }
 
 /** Workspace state from ``GET /api/workspace``. */

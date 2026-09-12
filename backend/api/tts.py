@@ -1,7 +1,8 @@
 """TTS + character-voice + batch + merge endpoints (modules: TTS / 角色配音 / 音频合成 / 音频合并).
 
-``GET /status`` reports readiness. The stage endpoints (``POST /prepare-voices``,
-``GET /voices``, ``POST /batch``, ``POST /merge``) each start a long-running
+``GET /status`` reports readiness. The stage endpoints (``POST /prepare-foundations``,
+``POST /make-clones``, ``GET /voices``, ``POST /batch``, ``POST /merge``) each start a
+long-running
 :class:`Task` that drives the isolated Qwen3-TTS engine (see
 ``backend/engines/tts.py`` / ``voices.py`` / ``tts_batch.py`` / ``merge.py``) and
 return ``{"task_id"}``; the UI streams the task's progress/logs over SSE and plays
@@ -41,10 +42,10 @@ def status() -> dict:
 # 角色配音（voice preparation）
 # ---------------------------------------------------------------------------
 
-class PrepareVoicesRequest(BaseModel):
-    # None -> every character in the script; a list -> only those (single-char regen).
+class PrepareFoundationsRequest(BaseModel):
+    # Phase 1 (LLM only): None -> every character; a list -> only those (single-char regen).
     speakers: list[str] | None = None
-    # True -> skip characters already present in voice_config.json.
+    # True -> regenerate only characters without a foundation yet.
     new_only: bool = False
     # speaker -> user-supplied voice description (skips the LLM for that character).
     overrides: dict[str, str] | None = None
@@ -52,20 +53,56 @@ class PrepareVoicesRequest(BaseModel):
     script: str | None = None
 
 
-@router.post("/prepare-voices")
-def prepare_voices(req: PrepareVoicesRequest) -> dict:
+class MakeClonesRequest(BaseModel):
+    # Phase 2 (TTS only): None -> every foundation-bearing character; a list -> only those.
+    speakers: list[str] | None = None
+    # True -> limit to characters not yet holding a usable clone (also retries failed ones).
+    new_only: bool = False
+    # Number of parallel TTS subprocesses (each loads the model once; VRAM scales with it).
+    concurrency: int | None = None
+    # Which parsed JSON to read for the character set; None -> most recent.
+    script: str | None = None
+
+
+def _scope_suffix(script: str | None) -> str:
+    """A short task-label suffix naming the parsed-JSON scope ("" for the default, most-recent)."""
+    return "（全部解析文件）" if script == ALL_PARSED_JSON else ""
+
+
+@router.post("/prepare-foundations")
+def prepare_foundations(req: PrepareFoundationsRequest) -> dict:
+    """Start Phase 1: batch-generate every character's voice foundation (LLM only, no TTS)."""
     _common.require_workspace()
-    all_scope = "（全部解析文件）" if req.script == ALL_PARSED_JSON else ""
+    suffix = _scope_suffix(req.script)
     if req.speakers:
-        label = f"重新生成 {len(req.speakers)} 个角色声音{all_scope}"
+        label = f"重新生成 {len(req.speakers)} 个角色语音推理基础{suffix}"
     elif req.new_only:
-        label = f"准备新增角色声音{all_scope}"
+        label = f"生成新增角色语音推理基础{suffix}"
     else:
-        label = f"准备所有角色声音{all_scope}"
+        label = f"生成所有角色语音推理基础{suffix}"
     task = get_task_manager().create(
-        "voices", label,
-        V.prepare,
+        "voices-foundation", label,
+        V.prepare_foundations,
         req.speakers, req.new_only, req.overrides or {}, req.script,
+    )
+    return {"task_id": task.id}
+
+
+@router.post("/make-clones")
+def make_clones(req: MakeClonesRequest) -> dict:
+    """Start Phase 2: batch-render every character's clone seed WAV (TTS only, no LLM)."""
+    _common.require_workspace()
+    suffix = _scope_suffix(req.script)
+    if req.speakers:
+        label = f"重新制作 {len(req.speakers)} 个角色克隆音频{suffix}"
+    elif req.new_only:
+        label = f"制作新增角色克隆音频{suffix}"
+    else:
+        label = f"制作所有角色克隆音频{suffix}"
+    task = get_task_manager().create(
+        "voices-clone", label,
+        V.make_clones,
+        req.speakers, req.new_only, req.concurrency, req.script,
     )
     return {"task_id": task.id}
 
@@ -80,6 +117,36 @@ def _voice_usable(entry: dict) -> bool:
     if vtype == "custom":
         return True  # uses a named preset / default voice
     return False
+
+
+def _foundation_status(entry: dict) -> str:
+    """The character's voice-foundation state: ``none`` | ``done`` | ``failed``.
+
+    Prefers the explicit ``foundation_status`` written by Phase 1; otherwise infers it so
+    entries created before the two-phase split (a stored description ⇒ a foundation exists)
+    still report sensibly.
+    """
+    entry = entry or {}
+    st = entry.get("foundation_status")
+    if st in ("done", "failed"):
+        return st
+    if (entry.get("description") or "").strip():
+        return "done"
+    return "none"
+
+
+def _clone_status(entry: dict) -> str:
+    """The character's clone-audio state: ``none`` | ``done`` | ``failed``.
+
+    Prefers the explicit ``clone_status`` written by Phase 2; otherwise a stored
+    ``type: clone`` + ``ref_audio`` (a usable clone seed) infers ``done``.
+    """
+    st = entry.get("clone_status")
+    if st in ("done", "failed"):
+        return st
+    if entry.get("type") == "clone" and entry.get("ref_audio"):
+        return "done"
+    return "none"
 
 
 def _fold_script(order: list[str], counts: dict[str, int], data) -> bool:
@@ -173,6 +240,8 @@ def list_voices(script: str | None = None) -> dict:
             "name": sp,
             "line_count": counts.get(sp, 0),
             "status": "ready" if ready else "pending",
+            "foundation_status": _foundation_status(entry),
+            "clone_status": _clone_status(entry),
             "type": vtype,
             "alias_of": alias_of,
             "description": entry.get("description", ""),
@@ -196,6 +265,11 @@ class BatchRequest(BaseModel):
     indices: list[int] | None = None
     # Which parsed JSON (in 03_parsed_json/) to synthesize; None -> most recent.
     script: str | None = None
+    # Concurrent segments (1..32); None -> the persisted default (config.tts.batch_concurrency).
+    concurrency: int | None = None
+    # True -> re-synthesize EVERY line (clears the resume skip); False (default) -> resume
+    # (synthesize only the not-yet-done segments, skipping existing audio).
+    force_all: bool = False
 
 
 @router.post("/batch")
@@ -203,9 +277,41 @@ def run_batch(req: BatchRequest) -> dict:
     _common.require_workspace()
     if req.script == ALL_PARSED_JSON:
         raise HTTPException(status_code=400, detail="音频合成仅支持单个解析 JSON（“全部”只用于「角色配音」）。")
-    label = "音频合成（全部）" if not req.indices else f"音频合成（{len(req.indices)} 段）"
-    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script)
+    if req.force_all:
+        label = "音频合成（重新全部）"
+    elif req.indices:
+        label = f"音频合成（{len(req.indices)} 段）"
+    else:
+        label = "音频合成（续合）"
+    if req.concurrency:
+        label += f" · 并发 {req.concurrency}"
+    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script, req.concurrency, req.force_all)
     return {"task_id": task.id}
+
+
+@router.get("/batch-status")
+def batch_status(script: str | None = None) -> dict:
+    """The chosen script's synthesis progress: ``{total, completed, remaining}``.
+
+    ``completed`` counts segments already synthesized (a manifest entry ``ok`` whose file is
+    still on disk) — the number behind the 待合成 card's 【已合成 / 总段落】, refreshed live while
+    a run streams (the manifest is written incrementally). ``script`` names the parsed JSON to
+    read; omitted -> most recent. Degrades to zeros with no workspace / no script, like ``/voices``.
+    """
+    layout = get_layout()
+    if layout.parsed_json is None:  # no workspace: nothing to read (read-only, degrades)
+        return {"total": 0, "completed": 0, "remaining": 0}
+    src = resolve_parsed_json(script)
+    if not src.exists():
+        return {"total": 0, "completed": 0, "remaining": 0}
+    try:
+        data = json.loads(src.read_text("utf-8"))
+    except Exception:  # noqa: BLE001 — a corrupt / empty script just reports nothing
+        return {"total": 0, "completed": 0, "remaining": 0}
+    if not isinstance(data, list) or not data:
+        return {"total": 0, "completed": 0, "remaining": 0}
+    out_dir = layout.audio_chunk / Batch.package_for(src)
+    return Batch.count_completion(Batch._build_segments(data), Batch.load_manifest(out_dir))
 
 
 class MergeRequest(BaseModel):

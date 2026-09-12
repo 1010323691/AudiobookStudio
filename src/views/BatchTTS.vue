@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
-import { listVoices, runBatch, ttsStatus } from '@/api/tts'
+import { listVoices, runBatch, ttsStatus, batchStatus } from '@/api/tts'
 import { downloadUrl } from '@/utils/fileops'
-import type { BatchResult, TTSStatus } from '@/types'
+import type { BatchResult, BatchStatus, TTSStatus } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -17,6 +17,7 @@ import CardDescription from '@/components/ui/CardDescription.vue'
 import CardContent from '@/components/ui/CardContent.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
+import Input from '@/components/ui/Input.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
 import DirPicker from '@/components/DirPicker.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
@@ -27,6 +28,7 @@ import {
   XCircle,
   CheckCircle2,
   RefreshCw,
+  RotateCcw,
   ArrowRight,
 } from 'lucide-vue-next'
 
@@ -54,6 +56,33 @@ const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?
 // Which parsed JSON to synthesize (shared with 角色配音 via the project store; '' → most recent).
 const script = computed(() => project.activeScript)
 const missingVoices = computed(() => Math.max(0, speakerCount.value - readyVoices.value))
+
+// 待合成 card's 【已合成 / 总段落】: read from the (incrementally-written) package manifest so it
+// reflects real progress. Before the first batch-status arrives it shows 0 over the total (which
+// the summary already knows), then climbs to the live completed count as synthesis proceeds.
+const batchProgress = ref<BatchStatus | null>(null)
+const completedLabel = computed(() => {
+  const total = batchProgress.value?.total ?? segmentCount.value
+  if (total == null) return '—'
+  return `${batchProgress.value?.completed ?? 0} / ${total}`
+})
+
+// 一键合成 并发段数 (1..32)：单个 TTS 子进程内并行合成多少段（模型只加载一次）。
+// Seeded from the persisted config; written back to it on each run (see doRun).
+const MIN_CONCURRENCY = 1
+const MAX_CONCURRENCY = 32
+const concurrency = ref(4)
+
+function clampConcurrency(n: number): number {
+  const v = Math.trunc(n)
+  if (!Number.isFinite(v)) return MIN_CONCURRENCY
+  return Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, v))
+}
+
+// Coerce the 并发段数 input (the Input component emits a string) to an integer in [1, 32].
+function onConcurrency(v: string | number) {
+  concurrency.value = clampConcurrency(Number(v))
+}
 
 async function loadSummary() {
   let resolvedName = ''
@@ -84,32 +113,94 @@ async function loadSummary() {
   summaryLoaded.value = true
 }
 
+// 【已合成 / 总段落】: fetch the package manifest's completion count. Called on mount / on script
+// change, and polled while a run streams (the manifest is written incrementally, so this is a
+// real, live count — never animated or estimated).
+async function loadBatchProgress() {
+  try {
+    batchProgress.value = await batchStatus(script.value || undefined)
+  } catch {
+    /* backend down — keep the last known value */
+  }
+}
+
+// While a synthesis run is in flight, refresh the 【已合成 / 总段落】 count every few seconds so
+// the 待合成 card climbs in real time; a final refresh happens once the task settles.
+let statusTimer: ReturnType<typeof setInterval> | null = null
+
+function startStatusPolling() {
+  if (statusTimer) return
+  void loadBatchProgress()
+  statusTimer = setInterval(() => void loadBatchProgress(), 3000)
+}
+
+function stopStatusPolling(final = true) {
+  if (statusTimer) {
+    clearInterval(statusTimer)
+    statusTimer = null
+  }
+  if (final) void loadBatchProgress()
+}
+
 // Re-summarize when the user picks a different parsed JSON.
 watch(script, () => {
   loadSummary()
+  loadBatchProgress()
 })
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
+  // Seed 并发段数 from the persisted config (falls back to the default of 4 if unavailable).
+  concurrency.value = clampConcurrency(Number(settings.config?.tts?.batch_concurrency ?? 4))
   try {
     status.value = await ttsStatus()
   } catch {
     status.value = { implemented: false, message: '后端未连接' }
   }
   await loadSummary()
+  loadBatchProgress()
   taskStore.refresh()
 })
+onUnmounted(() => stopStatusPolling(false))
 
 async function doRun() {
   if (busy.value) return
   busy.value = true
   error.value = ''
   result.value = null
+  const concurrencyNow = concurrency.value
   try {
-    const { task_id } = await runBatch({ script: script.value || undefined })
+    // Default (resume): synthesize only the not-yet-done segments, skipping existing audio.
+    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow })
     taskId.value = task_id
     await taskStore.refresh()
+    // Remember the chosen 并发段数 in the persisted config (fire-and-forget: the run above
+    // already carries it; a save failure here must not fail the run that just started).
+    void settings.save({ tts: { batch_concurrency: concurrencyNow } })
+    startStatusPolling()
     // Completion is handled by the watcher on task.status.
+  } catch (e: any) {
+    error.value = e?.message || '启动失败'
+    busy.value = false
+  }
+}
+
+// 「重新全部合成」: the user explicitly clears the completion state and re-does EVERY segment
+// (loads the model again, re-synthesizes all). Gated behind a confirm since it is expensive and
+// discards the resume shortcut.
+async function doRunAll() {
+  if (busy.value) return
+  if (!window.confirm('重新全部合成会清除已完成状态并重做全部段落（需重新加载模型、耗时较长）。确定继续吗？')) return
+  busy.value = true
+  error.value = ''
+  result.value = null
+  const concurrencyNow = concurrency.value
+  try {
+    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow, force_all: true })
+    taskId.value = task_id
+    await taskStore.refresh()
+    void settings.save({ tts: { batch_concurrency: concurrencyNow } })
+    startStatusPolling()
   } catch (e: any) {
     error.value = e?.message || '启动失败'
     busy.value = false
@@ -129,6 +220,7 @@ watch(
       result.value = t.result as BatchResult
       taskId.value = null
       busy.value = false
+      stopStatusPolling()
       project.recordBatch(result.value)
       toast({
         title: '音频合成完成',
@@ -139,10 +231,12 @@ watch(
       error.value = t.error || '音频合成失败'
       taskId.value = null
       busy.value = false
+      stopStatusPolling()
       toast({ title: '音频合成失败', variant: 'destructive', description: error.value })
     } else if (st === 'cancelled') {
       taskId.value = null
       busy.value = false
+      stopStatusPolling()
     }
   },
 )
@@ -188,8 +282,8 @@ watch(
           />
           <div class="flex flex-wrap items-center gap-x-10 gap-y-2">
             <div>
-              <div class="text-2xl font-bold">{{ segmentCount ?? '—' }}</div>
-              <div class="text-xs text-muted-foreground">段落</div>
+              <div class="text-2xl font-bold">{{ completedLabel }}</div>
+              <div class="text-xs text-muted-foreground">已合成 / 总段落</div>
             </div>
             <div>
               <div class="text-2xl font-bold">{{ speakerCount || '—' }}</div>
@@ -217,7 +311,8 @@ watch(
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Layers class="h-5 w-5" />一键音频合成</CardTitle>
           <CardDescription>
-            合成整本书；模型只加载一次，逐段推进，实时显示「第 i / N 段 · 当前角色 · 正在生成」与成功 / 失败。
+            合成整本书；模型只加载一次，按下方「并发段数」并行合成（1 = 逐段串行），
+            实时显示「正在生成（角色 X）」与「完成 i / N 段」及成功 / 失败。
           </CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
@@ -227,9 +322,30 @@ watch(
               <Layers v-else class="h-4 w-4" />
               {{ busy ? '合成中…' : '开始音频合成' }}
             </Button>
+            <Button
+              variant="outline"
+              :disabled="busy || !workspaceSet"
+              title="清除已完成状态，重新合成全部段落"
+              @click="doRunAll"
+            >
+              <RotateCcw class="h-4 w-4" />重新全部合成
+            </Button>
             <Button variant="outline" size="sm" @click="loadSummary">
               <RefreshCw class="h-4 w-4" />刷新
             </Button>
+            <label class="flex items-center gap-2 text-sm text-muted-foreground">
+              并发段数
+              <Input
+                :modelValue="concurrency"
+                type="number"
+                min="1"
+                max="32"
+                step="1"
+                class="h-8 w-20"
+                :disabled="busy"
+                @update:modelValue="onConcurrency"
+              />
+            </label>
           </div>
 
           <LiveLogPanel :task="task" :max-height-class="'h-96'">
@@ -247,12 +363,15 @@ watch(
                 <CheckCircle2 class="h-4 w-4 shrink-0 text-emerald-500" />
               </template>
               <span class="flex-1">
-                完成：成功 {{ result.completed }} / 共 {{ result.total }} 段
+                本次成功 {{ result.completed }} / 共 {{ result.total }} 段
                 <span v-if="result.failed.length" class="text-amber-600 dark:text-amber-400">
                   ，失败 {{ result.failed.length }}
                 </span>
+                <span v-if="result.done_count != null" class="text-xs text-muted-foreground">
+                  · 累计已合成 {{ result.done_count }} / 全部 {{ result.all_count }} 段
+                </span>
               </span>
-              <Button v-if="result.completed > 0" size="sm" @click="router.push('/merge')">
+              <Button v-if="(result.done_count ?? result.completed) > 0" size="sm" @click="router.push('/merge')">
                 前往音频合并<ArrowRight class="h-4 w-4" />
               </Button>
             </Alert>

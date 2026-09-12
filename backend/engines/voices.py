@@ -1,33 +1,42 @@
 """Character voice-prep engine (port of source ``app/generate_personas.py``).
 
-Turns the parsed script (``03_parsed_json/<name>.json``) into a
-``voice_config.json`` that the batch TTS stage consumes:
+Splits voice preparation into two independent phases so the LLM and the TTS engine
+never share the GPU at once (each can then run at its own max concurrency):
 
-  1. detect every speaker in the script (in order of first appearance);
-  2. (heuristic) fold obvious aliases of an already-configured character into it;
-  3. for each remaining character, ask the LLM for a short voice ``description``
-     + a ``ref_text`` sample (port of the persona prompts);
-  4. render a per-character preview WAV via the worker's ``design`` mode and store it
-     as a **clone** reference (``type: clone, ref_audio, ref_text``);
-  5. on a preview failure, fall back to a **design** voice (``type: design``) so the
-     character still gets a distinct, working voice.
+**Phase 1 — ``prepare_foundations`` (LLM only, no TTS).** Detects every speaker in
+the parsed script (in order of first appearance), folds obvious aliases into an
+existing character, then — in parallel, bounded by ``generation.max_concurrency`` —
+asks the LLM for each character's voice *foundation*: a ``description`` + a
+multi-sentence ``ref_text`` seed, reasoned from the character's own lines sampled
+across the book (front / middle / back), each carrying its ±window local context
+(surrounding narration and other characters). The foundation is persisted to
+``voice_config.json`` as ``type: "foundation"``. No TTS runs in this phase.
 
-The result: one click → ``JSON → 所有角色声音准备完成``. A single character's voice can
-be regenerated in isolation via ``speakers`` (+ an optional ``description`` override)
-without re-running the rest — requirement #2.
+**Phase 2 — ``make_clones`` (TTS only, no LLM).** Reads back the persisted
+foundations and — in parallel, up to the caller's ``concurrency`` — renders each
+character's clone seed WAV via the worker's ``design`` mode, storing it as a **clone**
+reference (``type: clone, ref_audio, ref_text``). On a render failure it falls back to
+a **design** voice (``type: design``) so the character still gets a working voice.
+On cancel every in-flight TTS child process is killed so GPU memory is freed at once.
 
-``prepare`` is a Task worker (first arg is a :class:`TaskHandle`); it streams rich,
-meaningful progress/logs over SSE and honours cooperative cancel between characters.
-A per-character failure is recorded (and that character falls back to ``design``) —
-it never aborts the whole run; only a *fatal* error (no script, no engine) raises.
+The book's per-line synthesis remains the separate 音频合成 (``tts_batch``) stage, which
+consumes the finished ``voice_config.json``. A single character's foundation / clone can
+be (re)generated in isolation via ``speakers`` (+ an optional ``description`` override).
+
+Both workers are Task workers (first arg is a :class:`TaskHandle`); each streams rich
+progress/logs over SSE and honours cooperative cancel between characters. A per-character
+failure is recorded (and, in phase 2, that character falls back to ``design``) — it never
+aborts the whole run; only a *fatal* error (no script, no engine) raises.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core.config import get_config
 from ..core.paths import ALL_PARSED_JSON, PROJECT_ROOT, get_layout, resolve_parsed_json, resolve_parsed_json_all
@@ -36,7 +45,10 @@ from .tts import _child_env, resolve_engine
 
 IMPLEMENTED = True
 
-_NARRATOR_LABELS = frozenset({"NARRATOR", "NARRATION", "NARRATIVE"})
+# How much local context (entries, on each side) is attached to each sampled target
+# line, and how many target lines are drawn from each of the front / middle / back bands.
+CONTEXT_WINDOW = 4
+SAMPLES_PER_BAND = 8
 
 
 # ---------------------------------------------------------------------------
@@ -130,24 +142,51 @@ def _entry_text(entry):
     return (entry.get("text") or "").strip()
 
 
-def _collect_narrator_context(script, speaker, window=4):
-    """Gather unique narrator lines near any appearance of ``speaker`` (port)."""
-    context_lines, seen_lines = [], set()
-    window = max(1, int(window or 4))
-    speaker_indices = [i for i, e in enumerate(script) if _entry_speaker(e) == speaker]
-    for idx in speaker_indices:
-        for j in range(max(0, idx - window), min(len(script), idx + window + 1)):
-            if j == idx:
-                continue
-            entry = script[j]
-            if _entry_speaker(entry).upper() in _NARRATOR_LABELS:
-                line = _entry_text(entry)
-                if line and line not in seen_lines:
-                    seen_lines.add(line)
-                    context_lines.append(line)
-                    if len(context_lines) >= window:
-                        return context_lines
-    return context_lines
+def _select_target_bands(pairs, per=SAMPLES_PER_BAND):
+    """Split a character's own lines into (front, middle, back) bands of script indices.
+
+    ``pairs`` is a list of ``(script_index, text)`` for the character's lines, in script
+    order. ``front`` = the first ``per``; ``back`` = the last ``per``; ``middle`` =
+    ``per`` lines spread evenly through the middle region. When the character has too few
+    lines to fill three bands, all of them are returned as ``front`` (none dropped), so a
+    small cast still gets every line with its context. Returns three lists of indices.
+    """
+    n = len(pairs)
+    if n == 0:
+        return [], [], []
+    idxs = [i for i, _t in pairs]
+    if n <= 3 * per:
+        return idxs, [], []
+    front = idxs[:per]
+    back = idxs[-per:]
+    region = idxs[per:n - per]
+    if len(region) <= per:
+        middle = list(region)
+    else:
+        step = (len(region) - 1) / (per - 1)
+        middle = [region[round(k * step)] for k in range(per)]
+    return front, middle, back
+
+
+def _window_block(script, idx, window=CONTEXT_WINDOW):
+    """One target line with its ±``window`` surrounding entries (any speaker) as a block.
+
+    The surrounding entries keep script order; the target line is marked ``★`` and the
+    rest are indented. Entries with empty text are dropped, and the window clamps at the
+    start / end of the script (fewer than ``window`` neighbours are taken when present).
+    """
+    total = len(script)
+    lo = max(0, idx - window)
+    hi = min(total, idx + window + 1)
+    lines = []
+    for j in range(lo, hi):
+        txt = _entry_text(script[j])
+        if not txt:
+            continue
+        spk = _entry_speaker(script[j]) or "(?)"
+        marker = "★ " if j == idx else "   "
+        lines.append(f"{marker}{spk}: {txt}")
+    return "\n".join(lines)
 
 
 def pick_ref_text(lines):
@@ -172,19 +211,44 @@ def _sanitize(name):
 # LLM + worker bridges
 # ---------------------------------------------------------------------------
 
-def _llm_persona(handle, llm, system, user_template, speaker, lines, narrator_ctx):
-    """Ask the LLM for a character's voice ``description`` + ``ref_text``.
+def _llm_persona(handle, llm, system, user_template, speaker, script, bands):
+    """Ask the LLM for a character's voice ``description`` + a ``ref_text`` seed.
 
-    Reuses the stdlib-urllib LLM channel from ``engines/script.py``. One retry, then
-    the caller falls back to :func:`_fallback_persona`. Returns ``(description, ref_text)``.
+    Reuses the stdlib-urllib LLM channel from ``engines/script.py``. The prompt feeds the
+    character's own lines sampled across the book (front / middle / back) with each line's
+    ±window local context (see :func:`_select_target_bands` / :func:`_window_block`), so
+    the model judges the voice from the character's full range of delivery, not just the
+    intro. One retry, then the caller falls back to :func:`_fallback_persona`. Returns
+    ``(description, ref_text)``.
     """
     from .script import _llm_chat_completion
 
     if not (llm.model_name or "").strip():
         raise RuntimeError("未配置 LLM 模型名称（在「文本解析」页填写模型）。")
-    sample_text = "\n".join(lines[:8])
-    intro = "\n".join(narrator_ctx) if narrator_ctx else "(No nearby narrator intro lines found.)"
-    user_prompt = user_template.format(speaker=speaker, narrator_context=intro, sample_lines=sample_text)
+
+    front, middle, back = bands
+
+    def band_lines(indices, title):
+        if not indices:
+            return []
+        out = [f"【{title}】"]
+        for k, idx in enumerate(indices, 1):
+            out.append(f"── 台词 {k} ──")
+            out.append(_window_block(script, idx, CONTEXT_WINDOW))
+        out.append("")
+        return out
+
+    parts = []
+    parts += band_lines(front, f"开场 · {speaker} 的前 {len(front)} 句台词")
+    parts += band_lines(middle, f"中段 · {speaker} 的中 {len(middle)} 句台词")
+    parts += band_lines(back, f"结尾 · {speaker} 的后 {len(back)} 句台词")
+    line_windows = "\n".join(parts).strip() or "（该角色没有可用的台词样本。）"
+
+    # str.replace (not str.format) so a user-edited template holding other braces can't
+    # raise; {line_windows} is filled before {speaker} (the windows already carry the name).
+    user_prompt = (user_template
+                   .replace("{line_windows}", line_windows)
+                   .replace("{speaker}", speaker))
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_prompt},
@@ -192,10 +256,12 @@ def _llm_persona(handle, llm, system, user_template, speaker, lines, narrator_ct
     gen = get_config().generation
     for attempt in range(2):
         try:
+            # 1024 (not 400): the answer now carries a multi-sentence ref_text, and a
+            # thinking model spends part of the budget on reasoning before the JSON.
             text, _finish, _usage = _llm_chat_completion(
                 llm.base_url, llm.api_key, llm.model_name, messages,
                 temperature=0.3, top_p=gen.top_p, presence_penalty=gen.presence_penalty,
-                max_tokens=400, top_k=gen.top_k, min_p=gen.min_p,
+                max_tokens=1024, top_k=gen.top_k, min_p=gen.min_p,
                 banned_tokens=gen.banned_tokens,
             )
         except Exception as e:  # noqa: BLE001 — a failed call retries, then falls back
@@ -211,11 +277,13 @@ def _llm_persona(handle, llm, system, user_template, speaker, lines, narrator_ct
     return "", ""
 
 
-def _design_preview(handle, description: str, ref_text: str, out_wav) -> str:
-    """Render a per-character preview WAV via the worker's ``design`` mode.
+def _design_preview(handle, description: str, ref_text: str, out_wav, reg=None) -> str:
+    """Render a per-character clone-seed WAV via the worker's ``design`` mode.
 
     Spawns the isolated TTS env (``resolve_engine`` raises a clear error if it is not
-    installed) and pumps its stdout into the task. Returns the produced file path;
+    installed) and pumps its stdout into the task. ``reg`` (an optional :class:`_ChildReg`)
+    registers the live child process so a cancel can kill it; when omitted the child runs
+    to completion (the original, non-parallel behaviour). Returns the produced file path;
     raises on failure so the caller can fall back to a ``design`` voice.
     """
     import subprocess
@@ -260,6 +328,9 @@ def _design_preview(handle, description: str, ref_text: str, out_wav) -> str:
                 pass
         raise RuntimeError(f"无法启动 TTS 引擎：{python}")
 
+    if reg is not None:
+        reg.add(proc)  # register the live child so a cancel can kill it (frees GPU memory)
+
     # Read the child to completion, forwarding its lines as logs. The input files must
     # outlive the child (it reads them only after a slow torch import), so they are
     # removed *after* communicate() returns — never right after Popen (that raced ahead
@@ -271,6 +342,8 @@ def _design_preview(handle, description: str, ref_text: str, out_wav) -> str:
         proc.kill()
         raise RuntimeError(f"TTS 引擎异常：{e}")
     finally:
+        if reg is not None:
+            reg.remove(proc)
         for p in (desc_file, text_file):
             try:
                 p.unlink(missing_ok=True)
@@ -305,21 +378,11 @@ def _design_preview(handle, description: str, ref_text: str, out_wav) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The Task worker
+# Shared preparation helpers (used by both phase workers)
 # ---------------------------------------------------------------------------
 
-def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=None) -> dict:
-    """Task worker: prepare voices for every (selected) character in the script.
-
-    Contract: first arg is the :class:`TaskHandle``. ``speakers`` is an optional
-    allowlist (for regenerating a subset); ``new_only`` skips characters already in
-    ``voice_config.json``; ``overrides`` maps a speaker → a user-supplied description
-    (skips the LLM for that character); ``script_name`` selects which parsed JSON in
-    ``03_parsed_json/`` to read (None → the most recent one). Returns a summary for the UI.
-    """
-    overrides = overrides or {}
-
-    # 1. Load the parsed script(s): the chosen file, the most recent one, or ALL of them.
+def _load_script(handle, script_name):
+    """Load the parsed script: the chosen file, the most recent one, or ALL of them."""
     if script_name == ALL_PARSED_JSON:
         # Whole-book aggregate: concatenate every 分册 (each upgraded to its _checked
         # copy) in reading order. An unreadable/empty file is skipped — the run continues.
@@ -352,33 +415,30 @@ def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=N
         if not isinstance(script, list) or not script:
             raise RuntimeError(f"{script_path.name} 为空——请先生成脚本。")
         handle.log(f"读入脚本 {script_path.name}：{len(script)} 条")
+    return script
 
-    # 2. Collect sample lines per speaker, in order of first appearance.
+
+def _collect_samples(script):
+    """Each character's OWN lines as (script_index, text), in order of first appearance.
+
+    The index lets the persona prompt attach each sampled line's ±window local context
+    (surrounding narration and other characters). Returns ``(samples, order)``.
+    """
     samples: dict = {}
     order: list = []
-    for entry in script:
+    for i, entry in enumerate(script):
         sp = _entry_speaker(entry)
         if not sp:
             continue
         if sp not in samples:
             samples[sp] = []
             order.append(sp)
-        samples[sp].append(_entry_text(entry))
-    handle.log(f"检测到 {len(order)} 个角色：{'、'.join(order)}")
+        samples[sp].append((i, _entry_text(entry)))
+    return samples, order
 
-    # 3. Narrator-intro context per character (feeds the persona prompt).
-    narrator_ctx = {sp: _collect_narrator_context(script, sp, window=4) for sp in order}
 
-    # 4/5. LLM + persona prompts.
-    cfg = get_config()
-    llm = cfg.llm
-    pp = cfg.persona_prompts
-    persona_system = pp.system_prompt or PERSONA_SYSTEM_PROMPT
-    persona_user = pp.user_prompt or PERSONA_USER_PROMPT
-    if not (llm.model_name or "").strip() and not overrides:
-        handle.log("警告：未配置 LLM 模型——未提供提示词的角色将使用兜底描述。", "WARNING")
-
-    # 6. Load the existing voice config (preserve any hand-edited entries).
+def _load_voice_config(handle):
+    """Load the existing voice_config.json (preserving any hand-edited entries)."""
     vc_path = get_layout().voice_profiles / "voice_config.json"
     voice_config = {}
     if vc_path.exists():
@@ -388,23 +448,15 @@ def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=N
                 voice_config = loaded
         except Exception as e:  # noqa: BLE001
             handle.log(f"现有 voice_config.json 无法解析（{e}），将重建。", "WARNING")
+    return vc_path, voice_config
 
-    # 7. Select which characters to process this run.
-    selected = list(order)
-    if new_only:
-        selected = [s for s in selected if s not in voice_config]
-    if speakers:
-        allow = {s for s in speakers if s}
-        selected = [s for s in selected if s in allow]
-    if not selected:
-        handle.log("没有需要处理的角色。")
-        return {"count": 0, "aliases": 0, "speakers": order,
-                "voice_config_path": str(vc_path), "results": []}
 
-    handle.log(f"本次处理 {len(selected)} 个角色。")
+def _fold_aliases(handle, selected, voice_config):
+    """Fold a label that clearly matches an existing character into an ``alias_of``
+    pointer instead of giving it a new voice (heuristic; runs before the LLM / TTS).
 
-    # 8. Heuristic alias fold: a label that clearly matches an existing character
-    #    becomes a pointer (``alias_of``) to it instead of getting a new voice.
+    Returns ``(unique_speakers, resolved_aliases)``.
+    """
     resolved_aliases: dict = {}
     unique_speakers: list = []
     for sp in selected:
@@ -425,72 +477,340 @@ def prepare(handle, speakers=None, new_only=False, overrides=None, script_name=N
             resolved_aliases[sp] = alias
         else:
             unique_speakers.append(sp)
+    return unique_speakers, resolved_aliases
 
-    # 9. Generate a persona + design preview for each unique character.
+
+def _has_foundation(entry) -> bool:
+    """Whether a stored entry already carries a voice foundation (a non-empty description)."""
+    return bool(entry) and bool((entry.get("description") or "").strip())
+
+
+def _clone_done(entry) -> bool:
+    """Whether a stored entry already holds a usable clone (``type: clone`` + ``ref_audio``)."""
+    return bool(entry) and entry.get("type") == "clone" and bool(entry.get("ref_audio"))
+
+
+class _ChildReg:
+    """Thread-safe registry of live TTS child processes, so a cancel can kill them all.
+
+    Phase 2 runs N design-renders in parallel (each its own model-loading subprocess);
+    on cancel the coordinator calls :meth:`kill_all` so in-flight children (each holding a
+    loaded model in GPU memory) are torn down immediately instead of running to completion.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: set = set()
+
+    def add(self, proc) -> None:
+        with self._lock:
+            self._procs.add(proc)
+
+    def remove(self, proc) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self) -> None:
+        with self._lock:
+            procs = list(self._procs)
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------------------
+# The two-phase Task workers
+# ---------------------------------------------------------------------------
+
+def prepare_foundations(handle, speakers=None, new_only=False, overrides=None, script_name=None) -> dict:
+    """Phase 1 (LLM only): generate each character's voice *foundation* and persist it.
+
+    First arg is the :class:`TaskHandle`. ``speakers`` is an optional allowlist (single-
+    character regeneration); ``new_only`` regenerates only characters without a foundation
+    yet; ``overrides`` maps a speaker → a user description (skips the LLM for that
+    character); ``script_name`` selects which parsed JSON to read (None → most recent).
+
+    The persona LLM calls run in parallel (bounded by ``generation.max_concurrency``) so
+    the LLM runs at full concurrency on its own. **No TTS is started** — the VoiceDesign
+    seed render is Phase 2 (``make_clones``). A per-character failure is recorded; only a
+    *fatal* error (no script) raises.
+    """
+    overrides = overrides or {}
+
+    script = _load_script(handle, script_name)
+    samples, order = _collect_samples(script)
+    handle.log(f"检测到 {len(order)} 个角色：{'、'.join(order)}")
+
+    cfg = get_config()
+    llm = cfg.llm
+    pp = cfg.persona_prompts
+    persona_system = pp.system_prompt or PERSONA_SYSTEM_PROMPT
+    persona_user = pp.user_prompt or PERSONA_USER_PROMPT
+    if not (llm.model_name or "").strip() and not overrides:
+        handle.log("警告：未配置 LLM 模型——未提供提示词的角色将使用兜底描述。", "WARNING")
+
+    vc_path, voice_config = _load_voice_config(handle)
+
+    # Characters to (re)generate a foundation for: everyone, or (new_only) only those
+    # without a foundation yet; an explicit ``speakers`` allowlist narrows it further.
+    selected = [s for s in order if not (new_only and _has_foundation(voice_config.get(s)))]
+    if speakers:
+        allow = {s for s in speakers if s}
+        selected = [s for s in selected if s in allow]
+    if not selected:
+        handle.log("没有需要生成基础的角色。")
+        return {"count": 0, "aliases": 0, "speakers": order,
+                "voice_config_path": str(vc_path), "results": []}
+
+    handle.log(f"本次为 {len(selected)} 个角色生成语音推理基础（仅 LLM，不启动 TTS）。")
+
+    unique_speakers, resolved_aliases = _fold_aliases(handle, selected, voice_config)
+
     n = len(unique_speakers)
+    max_workers = max(1, int(cfg.generation.max_concurrency or 1))
+    handle.log(f"LLM 并发 {max_workers}。")
     results = []
-    for i, sp in enumerate(unique_speakers, 1):
-        handle.check()  # cooperative cancel / pause between characters
-        lines = samples.get(sp, [])
-        handle.progress(i / (n or 1), f"[{i}/{n}] 正在生成角色：{sp}")
-        handle.log(f"[{i}/{n}] 角色 {sp}（{len(lines)} 句样本）")
+    done = 0
 
+    def gen_one(sp):
+        # Pure: compute the foundation and return it. The single-threaded coordinator below
+        # applies it to the shared ``voice_config`` and persists, so workers never mutate it
+        # (no lock needed, and no "dict changed size" hazard with the list-polling reader).
+        handle.log(f"[{sp}] 开始生成语音推理基础（LLM 推理）…")
+        pairs = samples.get(sp, [])
+        lines = [t for _i, t in pairs]  # texts only, for ref-text selection / fallback
+        bands = _select_target_bands(pairs)
         # Description + ref text: an override wins, else the LLM, else a fallback.
         description = (overrides.get(sp) or "").strip()
         ref_text = ""
         if description:
-            handle.log(f"  使用自定义提示词：{description[:60]}")
+            handle.log(f"  [{sp}] 使用自定义提示词：{description[:60]}")
             ref_text = pick_ref_text(lines)
         else:
             try:
                 description, ref_text = _llm_persona(
-                    handle, llm, persona_system, persona_user, sp, lines, narrator_ctx.get(sp, []),
+                    handle, llm, persona_system, persona_user, sp, script, bands,
                 )
             except Exception as e:  # noqa: BLE001
-                handle.log(f"  LLM 生成描述失败：{e}（改用兜底）", "WARNING")
+                handle.log(f"  [{sp}] LLM 生成描述失败：{e}（改用兜底）", "WARNING")
                 description, ref_text = "", ""
         if not description:
             description, ref_text = _fallback_persona(sp, lines)
-            handle.log("  使用兜底描述。", "WARNING")
+            handle.log(f"  [{sp}] 使用兜底描述。", "WARNING")
         if not ref_text:
             ref_text = pick_ref_text(lines) or f"{sp} speaks in a clear, natural voice."
+        return {
+            "speaker": sp,
+            "ok": bool(description),
+            "type": "foundation",
+            "description": description,
+            "ref_text": ref_text,
+            "foundation_status": "done" if description else "failed",
+        }
 
-        # Render the preview WAV; on success store a clone reference, else a design voice.
-        out_wav = str(get_layout().voice_profiles / "designed_voices" /
-                      f"{_sanitize(sp)}_{time.time_ns()}.wav")
-        try:
-            produced = _design_preview(handle, description, ref_text, out_wav)
+    def persist():
+        # Single-threaded incremental persist: every finished character is written back the
+        # moment it completes, so the 角色配音 list (status / preview) refreshes in real time.
+        vc_path.parent.mkdir(parents=True, exist_ok=True)
+        vc_path.write_bytes(json.dumps(voice_config, indent=2, ensure_ascii=False).encode("utf-8"))
+
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    futs = {ex.submit(gen_one, sp): sp for sp in unique_speakers}
+    cancelled = False
+    try:
+        handle.progress(0.02, "启动 LLM（并行）")
+        for fut in as_completed(futs):
+            sp = futs[fut]
+            try:
+                r = fut.result()
+            except Exception as e:  # noqa: BLE001 — a per-char error never aborts the run
+                handle.log(f"  {sp} 生成基础失败：{e}", "ERROR")
+                r = {"speaker": sp, "ok": False, "type": "foundation", "description": "",
+                     "ref_text": "", "foundation_status": "failed"}
+            # Apply the pure worker's result on the single coordinator thread, then persist.
             entry = voice_config.get(sp, {})
             entry.update({
-                "type": "clone",
-                "ref_audio": produced,  # absolute path (the worker reads it directly)
-                "ref_text": ref_text,
-                "description": description,
-                "character_style": description,
+                "type": r["type"],
+                "description": r["description"],
+                "ref_text": r.get("ref_text", ""),
+                "foundation_status": r.get("foundation_status") or ("failed" if not r["ok"] else "done"),
                 "seed": entry.get("seed", -1),
             })
             voice_config[sp] = entry
-            handle.log(f"  [{i}/{n}] {sp} 声音就绪（克隆）。")
-            results.append({"speaker": sp, "ok": True, "type": "clone",
-                            "preview": produced, "description": description})
-        except Exception as e:  # noqa: BLE001 — this character falls back; the run continues
-            handle.log(f"  [{i}/{n}] {sp} 预览生成失败：{e}（改用 design 兜底）", "ERROR")
-            entry = voice_config.get(sp, {})
-            entry.update({"type": "design", "description": description, "ref_text": ref_text})
-            voice_config[sp] = entry
-            results.append({"speaker": sp, "ok": False, "type": "design",
-                            "preview": "", "description": description})
+            persist()
+            results.append({"speaker": r["speaker"], "ok": r["ok"], "type": r["type"],
+                            "description": r["description"]})
+            done += 1
+            if r["ok"]:
+                handle.log(f"  ✓ [{done}/{n}] {sp} 语音推理基础完成。")
+            else:
+                handle.log(f"  ✗ [{done}/{n}] {sp} 语音推理基础失败（无可用描述）。", "ERROR")
+            handle.progress(0.02 + 0.98 * (done / (n or 1)), f"[{done}/{n}] 语音推理基础：{sp}")
+            handle.check()  # cooperative cancel between completions
+    except BaseException:
+        cancelled = True
+        raise
+    finally:
+        # On cancel, don't wait for in-flight (uninterruptible) LLM calls — drop them.
+        if cancelled:
+            ex.shutdown(wait=False, cancel_futures=True)
+        else:
+            ex.shutdown(wait=True)
 
-    # 10. Persist the voice config.
-    vc_path.parent.mkdir(parents=True, exist_ok=True)
-    vc_path.write_text(json.dumps(voice_config, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Final persist also covers the early-cancel / no-completion case.
+    persist()
     handle.log(f"voice_config 已保存：{vc_path}")
 
     handle.progress(1.0, "完成")
-    handle.log(f"所有角色声音准备完成：{len(unique_speakers)} 个新角色 + {len(resolved_aliases)} 个别名。")
+    handle.log(f"语音推理基础生成完成：{len(unique_speakers)} 个角色 + {len(resolved_aliases)} 个别名。")
     return {
         "count": len(unique_speakers),
         "aliases": len(resolved_aliases),
+        "speakers": order,
+        "voice_config_path": str(vc_path),
+        "results": results,
+    }
+
+
+def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_name=None) -> dict:
+    """Phase 2 (TTS only): render each foundation-bearing character's clone seed WAV.
+
+    First arg is the :class:`TaskHandle`. Reads back the foundations persisted by Phase 1
+    and, for every in-scope non-alias character that has a foundation, renders its clone
+    seed WAV via the worker's ``design`` mode and stores it as the clone reference
+    (``type: clone, ref_audio``). On a render failure it falls back to a ``design`` voice.
+
+    ``concurrency`` is the number of TTS subprocesses to run in parallel (each loads the
+    model once — GPU memory scales with it); ``new_only`` limits the run to characters
+    not yet holding a usable clone; ``speakers`` restricts to an allowlist (single-character
+    remake). On cancel every in-flight TTS child is killed so GPU memory frees at once.
+    **No LLM is used.**
+    """
+    script = _load_script(handle, script_name)
+    samples, order = _collect_samples(script)
+    handle.log(f"检测到 {len(order)} 个角色：{'、'.join(order)}")
+
+    vc_path, voice_config = _load_voice_config(handle)
+
+    # Characters eligible for a clone: in-scope, non-alias, already carrying a foundation.
+    def _is_alias(sp):
+        return bool((voice_config.get(sp) or {}).get("alias_of"))
+
+    selected = [s for s in order if _has_foundation(voice_config.get(s)) and not _is_alias(s)]
+    no_foundation = [s for s in order if not _has_foundation(voice_config.get(s)) and not _is_alias(s)]
+    if no_foundation:
+        handle.log(f"提示：{len(no_foundation)} 个角色尚无语音推理基础，本次跳过——请先运行阶段 1。", "WARNING")
+    if new_only:
+        selected = [s for s in selected if not _clone_done(voice_config.get(s))]
+    if speakers:
+        allow = {s for s in speakers if s}
+        selected = [s for s in selected if s in allow]
+    if not selected:
+        handle.log("没有可制作克隆音频的角色（请先运行阶段 1 生成语音推理基础）。", "WARNING")
+        return {"count": 0, "ok": 0, "failed": 0, "speakers": order,
+                "voice_config_path": str(vc_path),
+                "output_dir": str(get_layout().voice_profiles / "designed_voices"),
+                "results": []}
+
+    n = len(selected)
+    workers = max(1, int(concurrency or 1))
+    handle.log(f"本次为 {n} 个角色制作克隆音频（TTS 并发 {workers}，请确保已关闭 LLM 以释放显存）。")
+
+    results = []
+    ok = failed = done = 0
+    reg = _ChildReg()
+
+    def render_one(sp):
+        # Pure: render the clone seed and return the result. The coordinator applies it to
+        # the shared ``voice_config`` and persists; workers only *read* it (description/ref_text).
+        handle.log(f"[{sp}] 开始制作克隆音频（VoiceDesign / TTS 渲染）…")
+        entry = voice_config.get(sp, {})
+        description = (entry.get("description") or "").strip()
+        ref_text = (entry.get("ref_text") or "").strip()
+        if not ref_text:
+            ref_text = pick_ref_text([t for _i, t in samples.get(sp, [])]) \
+                or f"{sp} speaks in a clear, natural voice."
+        out_wav = str(get_layout().voice_profiles / "designed_voices" /
+                      f"{_sanitize(sp)}_{time.time_ns()}.wav")
+        try:
+            produced = _design_preview(handle, description, ref_text, out_wav, reg=reg)
+            return {"speaker": sp, "ok": True, "type": "clone", "preview": produced,
+                    "description": description, "ref_text": ref_text, "clone_status": "done"}
+        except Exception as e:  # noqa: BLE001 — this character falls back; the run continues
+            return {"speaker": sp, "ok": False, "type": "design", "preview": "", "reason": str(e),
+                    "description": description, "ref_text": ref_text, "clone_status": "failed"}
+
+    def persist():
+        # Single-threaded incremental persist: each finished character is written back the
+        # moment it completes, so the 角色配音 list (status / preview) refreshes in real time.
+        vc_path.parent.mkdir(parents=True, exist_ok=True)
+        vc_path.write_bytes(json.dumps(voice_config, indent=2, ensure_ascii=False).encode("utf-8"))
+
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = {ex.submit(render_one, sp): sp for sp in selected}
+    cancelled = False
+    try:
+        handle.progress(0.02, "启动 TTS（并行）")
+        for fut in as_completed(futs):
+            sp = futs[fut]
+            try:
+                r = fut.result()
+            except Exception as e:  # noqa: BLE001
+                handle.log(f"  {sp} 制作克隆失败：{e}", "ERROR")
+                r = {"speaker": sp, "ok": False, "type": "design", "preview": "", "reason": str(e),
+                     "description": "", "ref_text": "", "clone_status": "failed"}
+            # Apply the pure worker's result on the single coordinator thread, then persist.
+            entry = voice_config.get(sp, {})
+            if r["ok"]:
+                entry.update({
+                    "type": "clone",
+                    "ref_audio": r["preview"],  # absolute path (the worker reads it directly)
+                    "ref_text": r["ref_text"],
+                    "description": r["description"],
+                    "character_style": r["description"],
+                    "clone_status": "done",
+                    "seed": entry.get("seed", -1),
+                })
+            else:
+                entry.update({"type": "design", "description": r["description"],
+                              "ref_text": r["ref_text"], "clone_status": "failed"})
+            voice_config[sp] = entry
+            persist()
+            item = {"speaker": r["speaker"], "ok": r["ok"], "type": r["type"], "preview": r["preview"]}
+            if r.get("reason"):
+                item["reason"] = r["reason"]
+            results.append(item)
+            done += 1
+            if r["ok"]:
+                ok += 1
+                handle.log(f"  ✓ [{done}/{n}] {sp} 克隆音频就绪。")
+            else:
+                failed += 1
+                handle.log(f"  ✗ [{done}/{n}] {sp} 克隆生成失败（{r.get('reason', '')}），改用 design 兜底。", "ERROR")
+            handle.progress(0.02 + 0.98 * (done / (n or 1)), f"[{done}/{n}] 克隆音频：{sp}")
+            handle.check()  # cooperative cancel between completions -> kill_all in finally
+    except BaseException:
+        cancelled = True
+        raise
+    finally:
+        if cancelled:
+            reg.kill_all()  # tear down in-flight TTS children (frees GPU memory at once)
+            ex.shutdown(wait=False, cancel_futures=True)
+        else:
+            ex.shutdown(wait=True)
+
+    # Final persist also covers the early-cancel / no-completion case.
+    persist()
+    handle.log(f"voice_config 已保存：{vc_path}")
+
+    handle.progress(1.0, "完成")
+    handle.log(f"克隆音频制作完成：成功 {ok} / 失败 {failed} / 共 {n} 个角色。")
+    return {
+        "count": n,
+        "ok": ok,
+        "failed": failed,
         "speakers": order,
         "voice_config_path": str(vc_path),
         "output_dir": str(get_layout().voice_profiles / "designed_voices"),

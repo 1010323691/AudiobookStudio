@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { getConfig, patchConfig } from '@/api/config'
-import type { AppConfig } from '@/types'
+import type { AppConfig, DeepPartial } from '@/types'
 
 let mediaHandler: (() => void) | null = null
 let media: MediaQueryList | null = null
@@ -41,12 +41,12 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  /** Merge a partial patch into the persisted config; returns true on success. */
-  async function save(patch: Partial<AppConfig>): Promise<boolean> {
+  /** Merge a partial patch (at any nesting depth) into the persisted config; returns true on success. */
+  async function save(patch: DeepPartial<AppConfig>): Promise<boolean> {
     saving.value = true
     try {
       config.value = await patchConfig(patch)
-      if (patch.ui) applyTheme(patch.ui.theme)
+      if (patch.ui?.theme) applyTheme(patch.ui.theme)
       return true
     } catch {
       return false

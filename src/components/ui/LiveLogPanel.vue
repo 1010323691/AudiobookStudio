@@ -25,6 +25,11 @@ const props = defineProps<{
 
 const logs = computed(() => props.task?.logs ?? [])
 
+// While the task is in a live state the step row spins; once it lands in a terminal state
+// (succeeded / failed / cancelled) the spinner stops so a finished run doesn't look busy.
+const ACTIVE = ['pending', 'running', 'paused']
+const isActive = computed(() => (props.task ? ACTIVE.includes(props.task.status) : false))
+
 // Follow the log to its bottom while the user is reading the tail (newest line is last).
 const { bind: bindLog } = useLogAutoFollow(() => logs.value)
 
@@ -45,7 +50,7 @@ function logColor(level: string) {
     <div v-if="showProgress !== false" class="space-y-1.5">
       <div class="flex items-center justify-between gap-3">
         <span class="flex min-w-0 items-center gap-2 text-sm">
-          <Loader2 class="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+          <Loader2 v-if="isActive" class="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
           <span class="truncate">{{ task.current || '处理中…' }}</span>
         </span>
         <span class="shrink-0 text-xs text-muted-foreground">{{ Math.round(task.progress * 100) }}%</span>

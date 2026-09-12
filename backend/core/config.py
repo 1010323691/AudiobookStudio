@@ -75,8 +75,12 @@ class TTSConfig(BaseModel):
     # inserted between segments, per-speaker vs. speaker-change (ms).
     pause_between_speakers_ms: int = 500
     pause_same_speaker_ms: int = 250
-    # Placeholder for later concurrency work (native list batching / thread pool).
+    # 角色配音·阶段 2（克隆）的并行 TTS 子进程数（每个子进程各自加载一次模型，显存随之增加）。
     parallel_workers: int = 1
+    # 音频合成（一键合成 / batch）的并发段数：单个 TTS 子进程内用线程池并行合成，
+    # 同时最多 ``batch_concurrency`` 段在合成，模型只加载一次。1 = 逐段串行（原行为）。
+    # 使用处钳制到 [1, 32]。与 parallel_workers（并行子进程）是两种不同的并行方式。
+    batch_concurrency: int = 4
     # Legacy API-provider fields, unused by the local engine, kept so an existing
     # config/app.json still loads (and round-trips) cleanly.
     api_base: str = ""
@@ -128,8 +132,14 @@ class PromptsConfig(BaseModel):
 
 class SpeakerCheckConfig(BaseModel):
     # Speaker 检查 (post-parse) settings — fully independent of the 解析 prompts above.
-    # context_window: how many surrounding entries (on EACH side) are sent as context when
-    # checking one entry (N=4 → 9 entries total: 前 4 条 / 当前条 / 后 4 条).
+    # batch_size: how many TARGET entries are re-judged per LLM call (one batch); each batch
+    # is flanked by ``±context_window`` context entries, so a full batch sends at most
+    # ``batch_size + 2*context_window`` entries (clamped down at the file's start / end).
+    # A batch of 50 with a window of 4 → 50 targets + 4 before + 4 after = ≤ 58 entries.
+    batch_size: int = 20
+    # context_window: how many surrounding entries (on EACH side of the target block) are
+    # sent as context when checking a batch (they are marked non-target: used to reason,
+    # never re-judged).
     context_window: int = 4
     # Dedicated 检查 prompts. Empty values fall back to the bundled defaults
     # (``backend/engines/check_prompts.py`` / ``resources/default_check_prompts.txt``).

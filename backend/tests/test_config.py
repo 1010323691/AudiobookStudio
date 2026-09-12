@@ -38,6 +38,12 @@ def test_tts_config_concurrency_placeholder():
     assert TTSConfig().parallel_workers == 1
 
 
+def test_tts_config_batch_concurrency_default():
+    # 一键合成 (batch) 并发段数 defaults to 4 — distinct from parallel_workers (make-clones).
+    assert TTSConfig().batch_concurrency == 4
+    assert TTSConfig().parallel_workers == 1
+
+
 def test_tts_config_keeps_legacy_fields():
     # An existing config/app.json still round-trips: legacy API fields survive.
     t = TTSConfig()

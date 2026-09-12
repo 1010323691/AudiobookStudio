@@ -288,18 +288,27 @@ async function save() {
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><ShieldCheck class="h-5 w-5" />Speaker 检查</CardTitle>
           <CardDescription>
-            解析完成后，对每条用「前后各 N 条」的上下文让 LLM 重新判断 <code class="text-xs">speaker</code>，
+            解析完成后，对每批（默认 20 条待检查段落）用「前后各 N 条」的上下文让 LLM 重新判断 <code class="text-xs">speaker</code>，
             不同则只改 <code class="text-xs">speaker</code>，结果写入 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>
             （原始 <code class="text-xs">.json</code> 不变）。检查提示词与上方解析提示词完全独立。
           </CardDescription>
         </CardHeader>
         <CardContent class="space-y-3">
           <div class="space-y-1.5">
-            <Label>上下文窗口大小（当前条前后各取 N 条，共 2N+1 条）</Label>
+            <Label>每次送检段落数（每批送检的目标条数）</Label>
+            <div class="flex flex-wrap items-center gap-3">
+              <Input v-model.number="draft.speaker_check.batch_size" type="number" min="1" step="1" class="max-w-[8rem]" />
+              <span class="text-xs text-muted-foreground">
+                例如 50 → 每批把 50 条待检查段落一次性送入 LLM 重判。
+              </span>
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <Label>上下文窗口大小（每批送检块前后各取 N 条）</Label>
             <div class="flex flex-wrap items-center gap-3">
               <Input v-model.number="draft.speaker_check.context_window" type="number" min="0" step="1" class="max-w-[8rem]" />
               <span class="text-xs text-muted-foreground">
-                例如 4 → 前 4 条 + 当前条 + 后 4 条，共 9 条送入 LLM。
+                例如 4 → 每批在送检块前后各加 4 条上下文（仅供理解、不改判），一批最多 50 + 4 + 4 = 58 条。
               </span>
             </div>
           </div>
@@ -413,6 +422,17 @@ async function save() {
                 <option value="cuda">CUDA（GPU）</option>
                 <option value="cpu">CPU</option>
               </Select>
+            </div>
+            <div class="space-y-1.5">
+              <Label>并发段数（音频合成）</Label>
+              <Input
+                v-model.number="draft.tts.batch_concurrency"
+                type="number"
+                min="1"
+                max="32"
+                step="1"
+                class="max-w-[8rem]"
+              />
             </div>
           </div>
         </CardContent>

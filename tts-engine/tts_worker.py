@@ -20,7 +20,8 @@ Modes (``--mode``)
   custom   (default)  one segment, CustomVoice model — the original one-shot behaviour
   design             one VoiceDesign preview wav (used to seed a character voice)
   clone              one segment via a cloned (Base + reference) voice
-  batch              all segments in a file, one subprocess, needed models loaded once
+  batch              all segments in a file, one subprocess, needed models loaded once,
+                     synthesized by a thread pool of --concurrency (default 4; 1 = sequential)
   merge              combine per-segment files (in order) into the final audiobook
 
 Contract with the backend (all on STDOUT unless noted)
@@ -40,9 +41,20 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# transformers reconfigures its root logger on first import: it resets the level to
+# WARNING, attaches its own stderr handler and disables propagation — which stomps any
+# ``logging.getLogger("transformers").setLevel(...)`` set earlier in this process (the
+# ML stack is imported lazily, always after ``main()``). The TRANSFORMERS_VERBOSITY env
+# var is read at exactly that reconfiguration moment, so it is the reliable way to keep
+# the benign "Setting `pad_token_id` to `eos_token_id` ... for open-end generation"
+# WARNING (emitted on every ``generate()``) out of the live log. ``setdefault`` lets an
+# explicit value (e.g. "info" while debugging) still win.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 # Model ids. The three Qwen3-TTS 1.7B variants share the same loader; only the
 # suffix (CustomVoice / Base / VoiceDesign) selects the behaviour.
@@ -276,6 +288,48 @@ def _load_models_for(needed: set, device: str, args):
         log("Loading VoiceDesign model…")
         models["design"] = load_model(args.design_model, device)
     return models
+
+
+def run_bounded(items, concurrency, fn, on_result=None):
+    """Run ``fn(item)`` for every ``item``, with at most ``concurrency`` in flight.
+
+    ``concurrency <= 1`` (or a single item) runs sequentially in the calling thread —
+    exactly the original single-threaded behaviour (no pool, no threads). Otherwise a
+    ``ThreadPoolExecutor`` of ``concurrency`` workers overlaps the (model) work, hard-
+    capped at ``concurrency``: the pool can never run more than ``concurrency`` ``fn``
+    calls at once, so the limit is enforced by construction (verified in
+    ``backend/tests/test_tts_worker.py``).
+
+    Results are returned in input order. ``on_result(item, result)`` is invoked from the
+    *calling* thread (never the workers) as each completes, so the progress / log lines it
+    emits are single-threaded and the progress fractions stay monotonic. A per-item
+    exception raised by ``fn`` propagates out of ``fut.result()``; callers that want
+    per-item tolerance (the batch) make ``fn`` never raise and instead return an error.
+    """
+    try:
+        limit = int(concurrency)
+    except (TypeError, ValueError):
+        limit = 1
+    limit = max(1, limit)
+
+    if limit <= 1 or len(items) <= 1:
+        out = []
+        for item in items:
+            r = fn(item)
+            out.append(r)
+            if on_result is not None:
+                on_result(item, r)
+        return out
+
+    out = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=limit) as ex:
+        futs = {ex.submit(fn, item): i for i, item in enumerate(items)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            out[i] = fut.result()  # re-raises a per-item exception, if any
+            if on_result is not None:
+                on_result(items[i], out[i])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -599,40 +653,47 @@ def _run_batch(args) -> int:
     progress(0.05, "模型就绪")
     log("模型就绪。")
 
+    # Concurrency: how many segments synthesize at once (a thread pool inside this one
+    # subprocess, so the model loads only once). Clamped to [1, 32] — the backend already
+    # clamps, this is defence in depth against a hand-edited / stale value.
+    concurrency = max(1, min(32, int(args.concurrency)))
+    if concurrency > 1:
+        log(f"并发 {concurrency} 段（模型只加载一次，线程池并行）")
+    else:
+        log("逐段串行（并发 1，模型只加载一次）")
+
     clone_prompts: dict = {}
+    clone_lock = threading.Lock()
     total = len(segments)
     width = max(4, len(str(total)))
+    counts = {"completed": 0, "failed": 0}
 
-    completed = 0
-    failed = 0
-    for i, seg in enumerate(segments):
-        index = int(seg.get("index", i))
+    def synth(seg):
+        """Synthesize one segment on a pool worker thread; return ``(ok, detail)``.
+
+        Never raises: any fault (missing config, unsupported type, model error) folds into
+        an ``ok=False`` result so a single bad segment can't abort the run. The coordinator
+        (``report``) is the only place that emits ``[segment]`` / ``[progress]`` lines, so
+        those stay ordered on the live log; this thread only logs the in-flight "正在生成".
+        """
+        index = int(seg.get("index", 0))
         speaker = (seg.get("speaker") or "").strip()
         text = (seg.get("text") or "").strip()
         instruct = (seg.get("instruct") or "").strip()
-        i1 = i + 1
-
-        progress(0.05 + 0.95 * (i1 / total), f"第 {i1}/{total} 段 · 角色：{speaker or '(未知)'}")
         preview = text if len(text) <= 60 else text[:60] + "…"
-        log(f"  正在生成：{preview}")
+        log(f"  正在生成（角色 {speaker or '(未知)'}）：{preview}")
 
         if not text:
-            _segment_error(index, "空文本")
-            failed += 1
-            continue
+            return False, "空文本"
 
         canonical = _resolve_alias(speaker, voice_config)
         vd = voice_config.get(canonical) or {}
         if not vd:
-            _segment_error(index, f"缺少角色声音配置（{speaker or canonical}）——请先在「角色声音」页生成")
-            failed += 1
-            continue
+            return False, f"缺少角色声音配置（{speaker or canonical}）——请先在「角色声音」页生成"
 
         vtype = vd.get("type", "custom")
         if vtype not in SUPPORTED_TYPES:
-            _segment_error(index, f"不支持的声音类型：{vtype}")
-            failed += 1
-            continue
+            return False, f"不支持的声音类型：{vtype}"
 
         fname = str(index + 1).zfill(width)
         out_mp3 = os.path.join(out_dir, fname + ".mp3")
@@ -643,12 +704,16 @@ def _run_batch(args) -> int:
                 model = models.get("clone")
                 if model is None:
                     raise RuntimeError("Base 模型未加载")
-                if canonical not in clone_prompts:
-                    log(f"  构建 {canonical} 的克隆提示…")
-                    clone_prompts[canonical] = _build_clone_prompt(model, vd, os.getcwd(), canonical)
+                # The clone prompt is shared per character — build it once, under a lock, so
+                # two threads synthesizing the same character don't both call create_voice_clone_prompt.
+                with clone_lock:
+                    if canonical not in clone_prompts:
+                        log(f"  构建 {canonical} 的克隆提示…")
+                        clone_prompts[canonical] = _build_clone_prompt(model, vd, os.getcwd(), canonical)
+                    prompt = clone_prompts[canonical]
                 wavs, sr = model.generate_voice_clone(
                     text=text,
-                    voice_clone_prompt=clone_prompts[canonical],
+                    voice_clone_prompt=prompt,
                     non_streaming_mode=True,
                     max_new_tokens=2048,
                 )
@@ -698,8 +763,7 @@ def _run_batch(args) -> int:
                     os.remove(wav_tmp)
             else:
                 produced = wav_tmp  # MP3 unavailable -> keep the WAV
-            _segment_ok(index, produced)
-            completed += 1
+            return True, produced
         except Exception as e:  # noqa: BLE001 — one bad segment must not kill the batch
             for p in (wav_tmp, out_mp3):
                 try:
@@ -707,8 +771,31 @@ def _run_batch(args) -> int:
                         os.remove(p)
                 except OSError:
                     pass
-            _segment_error(index, str(e))
-            failed += 1
+            return False, str(e)
+
+    def report(seg, result):
+        """Coordinator-thread completion handler: emit the ``[segment]`` line + progress.
+
+        Runs single-threaded in completion order, so the ``[progress]`` fractions it emits
+        are monotonic and the ``[segment]`` log lines stay well-ordered on the live log.
+        """
+        ok, detail = result
+        index = int(seg.get("index", 0))
+        if ok:
+            _segment_ok(index, detail)
+            counts["completed"] += 1
+        else:
+            _segment_error(index, detail)
+            counts["failed"] += 1
+        done = counts["completed"] + counts["failed"]
+        progress(
+            0.05 + 0.95 * (done / total),
+            f"完成 {done}/{total} 段（成功 {counts['completed']} / 失败 {counts['failed']}）",
+        )
+
+    run_bounded(segments, concurrency, synth, on_result=report)
+
+    completed, failed = counts["completed"], counts["failed"]
 
     progress(1.0, f"完成（成功 {completed} / 失败 {failed} / 共 {total}）")
     log(f"批量合成结束：成功 {completed}，失败 {failed}，共 {total} 段。输出目录：{out_dir}")
@@ -831,16 +918,12 @@ def main() -> int:
     ap.add_argument("--segments-file", default="", help="JSON list of segments (batch/merge)")
     ap.add_argument("--voice-config", default="", help="voice_config.json path (batch)")
     ap.add_argument("--out-dir", default="", help="per-segment output dir (batch)")
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="max segments synthesized in parallel (batch; 1 = sequential)")
     # merge
     ap.add_argument("--pause-ms", type=int, default=500, help="pause between different speakers")
     ap.add_argument("--same-same-ms", type=int, default=250, help="pause for same speaker")
     args = ap.parse_args()
-
-    # transformers logs a benign "Setting `pad_token_id` to `eos_token_id` ... for
-    # open-end generation" WARNING on every generate(); it's non-actionable, so raise
-    # the transformers loggers to ERROR. (Real failures still surface as exceptions on
-    # stderr; merge mode never loads a model, so this is a harmless no-op for it.)
-    logging.getLogger("transformers").setLevel(logging.ERROR)
 
     if args.mode == "custom":
         return _run_custom(args)
