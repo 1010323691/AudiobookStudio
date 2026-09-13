@@ -476,6 +476,108 @@ def test_run_with_watchdog_reraises_fault():
 
 
 # --------------------------------------------------------------------------- #
+# Two-stage merge planning (pure)
+# --------------------------------------------------------------------------- #
+
+def test_plan_merge_batches_single():
+    tw = _load_worker()
+    assert tw.plan_merge_batches(0, 100) == []
+    assert tw.plan_merge_batches(1, 100) == [(0, 1)]
+    assert tw.plan_merge_batches(80, 100) == [(0, 80)]
+    assert tw.plan_merge_batches(100, 100) == [(0, 100)]
+
+
+def test_plan_merge_batches_coverage():
+    tw = _load_worker()
+    plan = tw.plan_merge_batches(250, 100)
+    assert plan == [(0, 100), (100, 200), (200, 250)]
+    flat = [i for start, end in plan for i in range(start, end)]
+    assert flat == list(range(250))  # full coverage, no overlap, in order
+
+
+def test_plan_merge_batches_clamps_size():
+    tw = _load_worker()
+    # a bogus size degrades to one-segment parts, never to an empty range
+    assert tw.plan_merge_batches(3, 0) == [(0, 1), (1, 2), (2, 3)]
+    assert tw.plan_merge_batches(2, -5) == [(0, 1), (1, 2)]
+
+
+def test_normalize_pause_ms():
+    tw = _load_worker()
+    assert tw.normalize_pause_ms(None) is None
+    assert tw.normalize_pause_ms(900) == 900
+    assert tw.normalize_pause_ms("900") == 900
+    assert tw.normalize_pause_ms(900.6) == 900
+    assert tw.normalize_pause_ms("abc") is None
+    assert tw.normalize_pause_ms({}) is None
+    assert tw.normalize_pause_ms(-5) == 0
+
+
+def test_boundary_gap_override_wins():
+    tw = _load_worker()
+    assert tw.boundary_gap_ms(900, "A", "B", 500, 250) == 900
+    assert tw.boundary_gap_ms(0, "A", "A", 500, 250) == 0  # an explicit 0 is still an override
+
+
+def test_boundary_gap_speaker_rule():
+    tw = _load_worker()
+    assert tw.boundary_gap_ms(None, "A", "A", 500, 250) == 250
+    assert tw.boundary_gap_ms(None, "A", "B", 500, 250) == 500
+    assert tw.boundary_gap_ms("bad", "A", "A", 500, 250) == 250  # dirty -> speaker rule
+
+
+def test_boundary_gap_matches_single_pass():
+    """The two-stage merge must insert exactly the gaps a single-pass merge would.
+    The single-pass rule for the gap after segment i is: its pause_after (if any),
+    else the same/different-speaker default against segment i+1. With batch size 2
+    the part boundary falls exactly on the override-bearing gap below."""
+    tw = _load_worker()
+    segs = [("A", None), ("A", 900), ("B", None), ("A", None)]
+    # single-pass gaps for the three inter-segment boundaries (pause_ms=500, same_ms=250):
+    single_pass = [250, 900, 500]  # 0->1 same speaker; 1->2 override; 2->3 speaker change
+
+    def single_pass_gap(i):
+        # the reference rule, inlined (what one combine pass over the whole sequence does)
+        override = segs[i][1]
+        if override is not None:
+            return int(override)
+        return 250 if segs[i + 1][0] == segs[i][0] else 500
+
+    assert [single_pass_gap(i) for i in range(3)] == single_pass
+
+    # two-stage: the part boundary (after segment 1, the last of part [0,1]) is
+    # boundary_gap_ms(last_pause_after, last_speaker, first_speaker, ...) of the two parts
+    assert tw.boundary_gap_ms(segs[1][1], segs[1][0], segs[2][0], 500, 250) == single_pass[1]
+    # ...and the intra-part boundaries are the same rule the single pass applies there
+    assert tw.boundary_gap_ms(segs[0][1], segs[0][0], segs[1][0], 500, 250) == single_pass[0]
+    assert tw.boundary_gap_ms(segs[2][1], segs[2][0], segs[3][0], 500, 250) == single_pass[2]
+
+
+def test_boundary_gap_across_skipped_segments():
+    """When segments are skipped (missing files), the single-pass gap falls between
+    the last valid segment before and the first valid segment after the skip — the
+    part boundary must use exactly those two (plus any override on the earlier one)."""
+    tw = _load_worker()
+    assert tw.boundary_gap_ms(None, "A", "C", 500, 250) == 500  # A -> C across the skip
+    assert tw.boundary_gap_ms(700, "A", "C", 500, 250) == 700    # override still wins
+
+
+def test_merge_frac_bands_contiguous():
+    tw = _load_worker()
+    assert tw.merge_stage1_frac(0, 3000) == pytest.approx(0.05)
+    assert tw.merge_stage1_frac(3000, 3000) == pytest.approx(0.80)
+    assert tw.merge_stage2_frac(0, 30) == pytest.approx(0.80)
+    assert tw.merge_stage2_frac(30, 30) == pytest.approx(0.95)
+    assert tw.merge_encode_frac(0.0) == pytest.approx(0.95)
+    assert tw.merge_encode_frac(1.0) == pytest.approx(1.0)
+    assert tw.merge_encode_frac(5.0) == pytest.approx(1.0)  # clamped at the top
+    seq = ([tw.merge_stage1_frac(i, 100) for i in range(101)]
+           + [tw.merge_stage2_frac(i, 3) for i in range(1, 4)]
+           + [tw.merge_encode_frac(f) for f in (0.0, 0.5, 1.0)])
+    assert all(a <= b for a, b in zip(seq, seq[1:]))  # one monotone run, 0.05 -> 1.0
+
+
+# --------------------------------------------------------------------------- #
 # The worker module loads in the lean backend (stdlib-only top level)
 # --------------------------------------------------------------------------- #
 
@@ -487,7 +589,9 @@ def test_worker_module_loads_without_torch():
                  "run_with_watchdog", "_clear_gpu_cache", "_talker_vram_params",
                  "_free_vram_budget", "_free_vram", "_total_vram", "_warmup",
                  "_synth_sub_batch", "plan_next_sub_batch", "plan_row_tokens",
-                 "_clone_input_overhead", "band_cap_for_chars", "VramGovernor"):
+                 "_clone_input_overhead", "band_cap_for_chars", "VramGovernor",
+                 "plan_merge_batches", "normalize_pause_ms", "boundary_gap_ms",
+                 "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac"):
         assert callable(getattr(tw, name)), f"missing {name}"
     for const in ("ROW_STRUCTURAL_OVERHEAD", "CLONE_FALLBACK_OVERHEAD",
                   "CHAR_TOKENS_PER_CHAR", "PEAK_PRESSURE_FRAC", "PEAK_GROW_FRAC",

@@ -51,6 +51,26 @@ def resolve_engine() -> tuple[Path, Path]:
     return python, worker
 
 
+def _kill_worker_tree(proc: subprocess.Popen) -> None:
+    """Terminate the worker **and** everything it spawned.
+
+    A plain ``proc.kill()`` (TerminateProcess on Windows) reaches only the worker
+    itself; on a cancel mid-encode the worker's ffmpeg child would be orphaned
+    and keep running (and holding its temp files) until the encode finished on
+    its own. On Windows this therefore does a process-tree kill
+    (``taskkill /F /T``) and falls back to the plain kill if that fails. POSIX
+    behaviour is unchanged (plain kill of the child).
+    """
+    if os.name != "nt":
+        proc.kill()
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:  # noqa: BLE001
+        proc.kill()
+
+
 def _child_env() -> dict:
     """Environment for the isolated TTS child (see :func:`resolve_engine`).
 
@@ -184,7 +204,7 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
             time.sleep(0.15)
     finally:
         if proc.poll() is None:
-            proc.kill()
+            _kill_worker_tree(proc)
         proc.wait()
         if run_log:
             run_log.write(

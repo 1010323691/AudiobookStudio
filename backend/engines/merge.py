@@ -1,11 +1,16 @@
 """Merge engine — combine per-segment audio into the final audiobook.
 
 Reads the manifest written by the batch stage, hands the ordered per-segment files
-(speakers + per-segment pause overrides) to the worker's ``merge`` mode — which runs
-the ported ``compute_timeline`` / ``combine_audio_with_pauses`` in the isolated env
-(it has pydub / numpy / soundfile; the lean 3.14 backend does not) — and reports the
-final ``cloned_audiobook.mp3``. Order is preserved, missing files are skipped with a
-clear warning, and a merge failure (no audio / engine error) marks the task FAILED.
+(speakers + per-segment pause overrides) to the worker's ``merge`` mode — which
+merges in two stages in the isolated env (it has pydub / numpy / soundfile; the
+lean 3.14 backend does not): per-batch part WAVs (``MERGE_BATCH_SIZE`` segments
+each, staged in a ``00_temp`` dir) are combined first, then the parts into the
+whole book. That keeps a merge of thousands of segments reporting live per-batch /
+per-part / per-encode progress instead of going silent. Order is preserved, the
+inter-batch pauses keep the single-pass semantics (segment ``pause_after`` >
+same speaker > speaker change), missing files are skipped with a clear warning,
+and a merge failure (no audio / engine error) marks the task FAILED. The staging
+dir is this module's to clean (try/finally) on every exit path.
 
 ``run`` is a Task worker (first arg is a :class:`TaskHandle`); it streams progress /
 log over SSE and honours cooperative cancel (killing the child).
@@ -14,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -23,8 +29,17 @@ from .tts import resolve_engine, run_worker
 
 IMPLEMENTED = True
 
+# Segments per part WAV in the two-stage merge (passed as the worker's --merge-batch-size).
+MERGE_BATCH_SIZE = 100
+
 # Windows-illegal filename characters (a package name becomes an output file name).
 _BAD_FILENAME_CHARS = set('\\/:*?"<>|')
+
+
+def _batch_count(n: int, size: int = MERGE_BATCH_SIZE) -> int:
+    """How many part batches the worker will build for ``n`` segments (>= 1) — the
+    same plan the worker's plan_merge_batches yields, for the up-front log line."""
+    return max(1, -(-n // max(1, size)))
 
 
 def _find_manifest(layout, package: str | None) -> Path:
@@ -103,8 +118,14 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
 
     handle.log(f"开始 Merge：{len(segs)} 段 · 停顿 换人 {pause_ms}ms / 同人 {same_ms}ms")
 
+    m = _batch_count(len(segs))
+    if m > 1:
+        handle.log(f"两阶段合并：{len(segs)} 段 → {m} 批（每批 {MERGE_BATCH_SIZE} 段）→ 整书")
+
     seg_file = layout.temp / f"merge_segments_{uuid.uuid4().hex[:12]}.json"
     seg_file.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
+    tmp_dir = layout.temp / f"merge_tmp_{uuid.uuid4().hex[:12]}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     out_path = layout.audio_merge / _output_name(manifest_path, layout)
 
     python, worker = resolve_engine()
@@ -115,6 +136,8 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
         "--out", str(out_path),
         "--pause-ms", str(pause_ms),
         "--same-same-ms", str(same_ms),
+        "--tmp-dir", str(tmp_dir),
+        "--merge-batch-size", str(MERGE_BATCH_SIZE),
     ]
     if cfg.ffmpeg.ffmpeg_path:
         cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
@@ -130,7 +153,20 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
         else:
             handle.log(line)
 
-    run_worker(cmd, handle, on_line, temp_files=(seg_file,), fail_prefix="Merge 引擎")
+    try:
+        run_worker(cmd, handle, on_line, temp_files=(seg_file,), fail_prefix="Merge 引擎")
+    finally:
+        # On an MP3-encode failure the worker keeps the whole-book WAV inside the
+        # staging dir and reports it via [result] — relocate it before the dir goes.
+        if result_path:
+            kept = Path(result_path)
+            if kept.is_file() and str(kept).startswith(str(tmp_dir) + os.sep):
+                target = layout.audio_merge / kept.name
+                kept.replace(target)
+                result_path = str(target)
+        # The backend owns the staging dir's cleanup on every exit path
+        # (success / failure / cancel-kill of the child).
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     produced = Path(result_path or out_path)
     if not produced.exists():

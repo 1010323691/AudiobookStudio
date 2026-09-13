@@ -24,7 +24,9 @@ Modes (``--mode``)
                      segments are padded into native tensor batches; --concurrency is only the
                      per-batch CEILING — the real size follows the segment-length bands and a
                      measured VRAM governor that shrinks / grows it as the run goes
-  merge              combine per-segment files (in order) into the final audiobook
+  merge              two-stage: per-segment files -> part WAVs (batches of
+                     --merge-batch-size, staged in --tmp-dir) -> the final audiobook;
+                     every stage reports live progress
 
 Contract with the backend (all on STDOUT unless noted)
 ------------------------------------------------------
@@ -48,6 +50,8 @@ import argparse
 import contextlib
 import gc
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -118,6 +122,14 @@ VRAM_SCALE_MIN, VRAM_SCALE_MAX = 0.5, 4.0  # trust range for the static L^2 esti
 # mid-batch) — so a long sub-batch doesn't go silent in the log and the timeout budget stays legible.
 HEARTBEAT_FIRST = 10.0     # seconds before the first heartbeat (shorter batches finish before it)
 HEARTBEAT_INTERVAL = 20.0  # seconds between subsequent heartbeats
+
+# Two-stage merge (merge mode): per-batch part WAVs are staged first, then folded into
+# the whole book, so merging thousands of segments reports live progress throughout
+# instead of going silent. RE_FFMPEG_TIME is the port of backend/engines/audio.py's
+# RE_TIME (permissive across ffmpeg 4.x/5.x/6.x).
+RE_FFMPEG_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+ENCODE_PROGRESS_MIN_STEP_PCT = 1.0    # refresh the encode-progress line at most every ...
+ENCODE_PROGRESS_MIN_INTERVAL_S = 2.0  # ... 1% of the encode or 2 seconds, whichever is later
 
 
 def log(msg: str) -> None:
@@ -783,6 +795,80 @@ def _warmup(model, vtype, language, device) -> None:
         log("warmup 完成（已吸收首次调用开销）")
     except Exception as e:  # noqa: BLE001 — warmup is best-effort, never fatal
         log(f"warmup 跳过（{e}）")
+
+
+# ---------------------------------------------------------------------------
+# Merge: two-stage plan + boundary pause (pure stdlib — unit-testable in the lean venv)
+# ---------------------------------------------------------------------------
+
+def plan_merge_batches(n_segments, batch_size):
+    """Half-open (start, end) ranges over the segment list for the two-stage merge.
+
+    ``n <= size`` yields a single batch (the fast path: one part, stage 2 is just a
+    rename). Sizes clamp to >= 1 so a bogus batch size degrades to one-segment parts,
+    never to an empty range or an infinite loop.
+    """
+    size = max(1, int(batch_size))
+    n = max(0, int(n_segments))
+    if n == 0:
+        return []
+    if n <= size:
+        return [(0, n)]
+    return [(k, min(k + size, n)) for k in range(0, n, size)]
+
+
+def normalize_pause_ms(raw):
+    """A ``pause_after`` value (ms) -> int, or None when absent / not numeric.
+
+    A non-numeric stray ("" / "fast" / {}) degrades to "no override" (the speaker
+    rule applies) instead of raising; negative values clamp to 0. Numeric values —
+    the normal case — pass through unchanged, so behaviour on clean data is
+    identical to the old raw-value handling.
+    """
+    if raw is None:
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def boundary_gap_ms(last_pause_after, last_speaker, first_speaker, pause_ms, same_ms):
+    """The pause between two adjacent parts, computed from the same inputs a
+    single-pass merge uses for that boundary: the earlier part's last segment's
+    ``pause_after`` (if any) wins, else the same-speaker / speaker-change default
+    applied to (last segment of part k, first segment of part k+1). Feeding these
+    gaps back in as explicit overrides makes a two-stage merge insert exactly the
+    gaps a one-pass merge would.
+    """
+    p = normalize_pause_ms(last_pause_after)
+    if p is not None:
+        return p
+    return same_ms if first_speaker == last_speaker else pause_ms
+
+
+def merge_stage1_frac(done, total):
+    """0.05 -> 0.80 across stage 1 (decode + per-batch part export), by global
+    segment index (clamped at the band end so the next band starts exactly where
+    this one ends — float rounding can otherwise overshoot by a ulp)."""
+    if total <= 0:
+        return 0.05
+    return min(0.80, 0.05 + 0.75 * (done / total))
+
+
+def merge_stage2_frac(done, total):
+    """0.80 -> 0.95 across stage 2 (part decode + whole-book combine), by part
+    index (clamped at the band end)."""
+    if total <= 0:
+        return 0.80
+    return min(0.95, 0.80 + 0.15 * (done / total))
+
+
+def merge_encode_frac(frac):
+    """0.95 -> 1.00 across the final MP3 encode, by ffmpeg's reported time fraction
+    (clamped)."""
+    f = max(0.0, min(1.0, float(frac)))
+    return min(1.0, 0.95 + 0.05 * f)
 
 
 # ---------------------------------------------------------------------------
@@ -1457,13 +1543,317 @@ def _run_batch(args) -> int:
     return 0
 
 
-def _run_merge(args) -> int:
-    """Combine per-segment files (in order) into the final audiobook mp3."""
-    import json as _json
+def _new_windows_kill_job():
+    """Best-effort Windows job object that kills its processes when this process's
+    handles are closed — i.e. when the backend hard-kills the worker on cancel,
+    which would otherwise leave the ffmpeg encoder orphaned (TerminateProcess does
+    not reach children). Returns ``(job, kernel32)`` or ``(None, None)`` anywhere
+    the setup fails or off-Windows; callers then rely on the explicit finally-kill
+    alone, exactly as before. Never raises.
+    """
+    if os.name != "nt":
+        return None, None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None, None
+
+        class _BASIC_LIMIT(ctypes.Structure):
+            # JOBOBJECT_BASIC_LIMIT_INFORMATION (64-bit layout, 40 bytes)
+            _fields_ = [("ProcessMemoryLimit", ctypes.c_int64),
+                        ("JobMemoryLimit", ctypes.c_int64),
+                        ("BasicLimitInfo", ctypes.c_uint32),
+                        ("_pad", ctypes.c_uint32),
+                        ("PeakProcessMemoryUsed", ctypes.c_uint64),
+                        ("PeakJobMemoryUsed", ctypes.c_uint64)]
+
+        class _IO_COUNTERS(ctypes.Structure):
+            # IO_COUNTERS (64-bit layout, 48 bytes)
+            _fields_ = [("ReadOperationCount", ctypes.c_uint64),
+                        ("WriteOperationCount", ctypes.c_uint64),
+                        ("OtherOperationCount", ctypes.c_uint64),
+                        ("ReadTransferBytes", ctypes.c_uint64),
+                        ("WriteTransferBytes", ctypes.c_uint64),
+                        ("OtherTransferBytes", ctypes.c_uint64)]
+
+        class _EXT_LIMIT(ctypes.Structure):
+            # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (64-bit layout, 120 bytes)
+            _fields_ = [("Basic", _BASIC_LIMIT),
+                        ("Io", _IO_COUNTERS),
+                        ("MemoryLimit", ctypes.c_uint64),
+                        ("ProcessMemoryLimit", ctypes.c_uint64),
+                        ("PeakProcessMemoryUsed", ctypes.c_uint64),
+                        ("PeakJobMemoryUsed", ctypes.c_uint64)]
+
+        if ctypes.sizeof(_EXT_LIMIT) != 120:
+            kernel32.CloseHandle(job)
+            return None, None  # unexpected layout — a wrong-size call would fail anyway
+        ext = _EXT_LIMIT()
+        ext.Basic.BasicLimitInfo = 0x2  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        # 9 = JobObjectExtendedLimitInformation
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(ext),
+                                                ctypes.sizeof(ext)):
+            kernel32.CloseHandle(job)
+            return None, None
+        return job, kernel32
+    except Exception:
+        return None, None
+
+
+def _merge_stage1(segs, tmp_dir, pause_ms, same_ms, batch_size, total):
+    """Stage 1: fold the per-segment files into per-batch part WAVs in ``tmp_dir``.
+
+    Reports live progress per batch ("正在合并第 k/M 批") and per ~10 segments.
+    Returns each part's boundary metadata (first/last speaker, the last segment's
+    RAW pause_after, duration, planned batch number) for stage 2, or None after a
+    fatal error. A part ends exactly at its last sample: combine_audio_with_pauses
+    ignores the final override, so the part's last segment's pause_after is carried
+    in the metadata as the input to the stage-2 boundary gap. A batch whose
+    segments are all unreadable produces no part — the boundary then simply falls
+    between the two surviving neighbours, as a single-pass merge would.
+    """
     from pydub import AudioSegment
 
-    if not args.segments_file or not args.out:
-        print("TTS_WORKER_ERROR: merge mode needs --segments-file and --out", file=sys.stderr, flush=True)
+    plan = plan_merge_batches(total, batch_size)
+    m = len(plan)
+    parts = []
+    skipped = 0
+    for k, (start, end) in enumerate(plan, start=1):
+        label = f"正在合并第 {k}/{m} 批"
+        progress(merge_stage1_frac(start, total), label)
+        log(f"{label}（段 {start + 1}–{end}，共 {end - start} 段）")
+        chunks, audio = [], []
+        for i in range(start, end):
+            s = segs[i]
+            p = s.get("path") or ""
+            full = p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
+            if not p or not os.path.exists(full):
+                skipped += 1
+                continue
+            try:
+                seg = AudioSegment.from_file(full)
+            except Exception as e:  # noqa: BLE001
+                log(f"跳过无法读取的段 {s.get('index')}（{os.path.basename(full)}）：{e}")
+                skipped += 1
+                continue
+            chunks.append(s)
+            audio.append(seg)
+            if (i + 1) % 10 == 0 or i == end - 1:
+                progress(merge_stage1_frac(i + 1, total), f"{label} · 段 {i + 1}/{total}")
+        if not audio:
+            log(f"第 {k}/{m} 批：整批跳过（无可读音频）")
+            continue
+        overrides = [normalize_pause_ms(c.get("pause_after")) for c in chunks]
+        speakers = [c.get("speaker", "") for c in chunks]
+        part = combine_audio_with_pauses(audio, speakers, pause_ms, same_ms, overrides)
+        if part is None:
+            print("TTS_WORKER_ERROR: 批内合并结果为空", file=sys.stderr, flush=True)
+            return None
+        part_path = os.path.join(tmp_dir, f"part_{k:03d}.wav")
+        part.export(part_path, format="wav")
+        parts.append({
+            "k": k,
+            "path": part_path,
+            "first_speaker": speakers[0],
+            "last_speaker": speakers[-1],
+            "last_pause_after": chunks[-1].get("pause_after"),
+            "duration_ms": len(part),
+            "n": len(audio),
+        })
+        progress(merge_stage1_frac(end, total), f"{label} · 段 {end}/{total}")
+        log(f"第 {k}/{m} 批完成 → part_{k:03d}.wav（{len(part) / 60000:.1f} 分钟，{len(audio)} 段）")
+        del part, audio, chunks
+        gc.collect()
+    if skipped:
+        log(f"警告：{skipped} 段被跳过（文件缺失或无法读取）")
+    if not parts:
+        print("TTS_WORKER_ERROR: 没有可合并的音频段", file=sys.stderr, flush=True)
+        return None
+    return parts
+
+
+def _merge_stage2(parts, tmp_dir, out_path, pause_ms, same_ms, m_plan):
+    """Stage 2: fold the part WAVs into the whole-book WAV (kept in ``tmp_dir``).
+
+    A single part fast-paths to an atomic rename (no re-decode / re-combine).
+    Every inter-part gap is computed explicitly (boundary_gap_ms) and passed as a
+    non-None override, so the speaker list below never influences the result — the
+    combined samples match a single-pass merge exactly.
+
+    Returns ``(wav_path, duration_seconds)``; ``(None, 0.0)`` after a fatal error.
+    """
+    from pydub import AudioSegment
+
+    out_stem = os.path.splitext(os.path.basename(out_path))[0]
+    final_wav = os.path.join(tmp_dir, out_stem + ".wav")
+    if len(parts) == 1:
+        os.replace(parts[0]["path"], final_wav)
+        log("单批完成：整书 WAV 已就绪")
+        return final_wav, parts[0]["duration_ms"] / 1000.0
+
+    log(f"开始最终合并：{len(parts)} 个分片 → 整书（批间停顿按边界段规则）")
+    audio, overrides, speakers = [], [], []
+    for pos, p in enumerate(parts, start=1):
+        audio.append(AudioSegment.from_file(p["path"], format="wav"))
+        speakers.append(p["first_speaker"])
+        if pos < len(parts):
+            overrides.append(boundary_gap_ms(p["last_pause_after"], p["last_speaker"],
+                                            parts[pos]["first_speaker"], pause_ms, same_ms))
+        else:
+            overrides.append(None)  # ignored by combine; keeps the lists aligned
+        progress(merge_stage2_frac(pos, len(parts)), f"最终合并第 {p['k']}/{m_plan} 片")
+        log(f"分片 {p['k']}/{m_plan} 就绪（{p['duration_ms'] / 60000:.1f} 分钟）")
+    final = combine_audio_with_pauses(audio, speakers, pause_ms, same_ms, overrides)
+    if final is None:
+        print("TTS_WORKER_ERROR: 合并结果为空", file=sys.stderr, flush=True)
+        return None, 0.0
+    final.export(final_wav, format="wav")
+    log(f"整书 WAV 已导出（{len(final) / 60000:.1f} 分钟）")
+    return final_wav, len(final) / 1000.0
+
+
+def _encode_mp3_streaming(wav_path, mp3_path, duration_s, ffmpeg=""):
+    """WAV -> MP3 via a direct ffmpeg child with live progress.
+
+    Progress comes from two measured sources, both throttled to ~1 update / 2 s:
+    ffmpeg's stderr ``time=`` lines (real-time on platforms whose stderr is not
+    block-buffered) and — because Windows pipes block-buffer ffmpeg's stderr, so
+    the time= lines can arrive in one burst only at the end — a ffprobe reading
+    of the growing output file's *real* duration every 2 s while the encoder
+    runs (measured, never estimated). If ffprobe is missing the label degrades
+    to an elapsed-time tick, so the progress text still changes at least every
+    2 s. Mirrors backend/engines/audio.py::detect_silences (reader thread over
+    stderr + the time= regex) minus the task-cancellation hook — the backend
+    kills the worker on cancel, and the finally below kills the encoder. The
+    encoder args match the old _wav_to_mp3 (pydub default export) exactly:
+    libmp3lame with NO explicit bitrate — pydub's export passes no -b:a, and an
+    explicit 192k would clamp differently per sample rate (160k at 22.05/24 kHz)
+    and change the size / quality of every merged file. Returns False (caller
+    falls back to keeping the WAV) when ffmpeg is missing / fails, or the output
+    is a broken header-only file (< 1 KiB).
+    """
+    if duration_s <= 0:
+        return False
+    ffmpeg = ffmpeg or "ffmpeg"
+    cmd = [ffmpeg, "-y", "-loglevel", "info", "-i", wav_path,
+           "-c:a", "libmp3lame", mp3_path]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return False
+
+    # Best-effort: on Windows, bind the encoder to a kill-on-close job object so a
+    # hard kill of this worker on cancel cannot orphan it (see _new_windows_kill_job).
+    job, kernel32 = _new_windows_kill_job()
+    if job is not None:
+        try:
+            # A failed assignment (returns 0, no exception) means nothing is in the
+            # job yet, so dropping the handle is safe and falls back to finally-kill.
+            if not kernel32.AssignProcessToJobObject(job, proc._handle):
+                kernel32.CloseHandle(job)
+                job = None
+        except Exception:
+            kernel32.CloseHandle(job)
+            job = None
+
+    state = {"pct": -1.0, "at": 0.0}
+
+    def report(pct) -> None:
+        pct = max(0.0, min(100.0, pct))
+        now = time.time()
+        if (pct - state["pct"] >= ENCODE_PROGRESS_MIN_STEP_PCT
+                or now - state["at"] >= ENCODE_PROGRESS_MIN_INTERVAL_S):
+            state["pct"] = pct
+            state["at"] = now
+            progress(merge_encode_frac(pct / 100.0), f"编码 MP3 {pct:.0f}%")
+
+    def reader() -> None:
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", "replace")
+                m = RE_FFMPEG_TIME.search(line)
+                if not m:
+                    continue
+                secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                report(min(100.0, secs / duration_s * 100.0))
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def measured_pct():
+        """The output file's real duration so far / the whole book (ffprobe)."""
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", mp3_path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+            if r.returncode != 0:
+                return None
+            d = float(r.stdout.strip().split(b"\n")[0])
+            return min(100.0, max(0.0, d / duration_s * 100.0))
+        except Exception:
+            return None
+
+    t_start = time.time()
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    try:
+        while proc.poll() is None:
+            # On Windows the time= lines above sit in ffmpeg's stderr buffer until
+            # the encoder exits — measure the real output duration instead, so the
+            # progress text/bar changes at least every ENCODE_PROGRESS_MIN_INTERVAL_S.
+            if time.time() - state["at"] >= ENCODE_PROGRESS_MIN_INTERVAL_S:
+                pct = measured_pct()
+                if pct is None:
+                    # no ffprobe (or nothing measurable yet): keep the label alive
+                    state["at"] = time.time()
+                    frac = (merge_encode_frac(max(0.0, state["pct"]) / 100.0)
+                            if state["pct"] >= 0 else 0.95)
+                    progress(frac, f"编码 MP3… 已 {time.time() - t_start:.0f} 秒")
+                else:
+                    report(pct)
+            time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        t.join(timeout=5)
+        if job is not None:
+            kernel32.CloseHandle(job)  # safe: the encoder has exited (or been killed)
+
+    if proc.returncode != 0:
+        return False
+    # A broken ffmpeg (no libmp3lame) yields a tiny header-only file without raising.
+    size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else 0
+    if size < 1024:
+        if os.path.exists(mp3_path):
+            os.remove(mp3_path)
+        return False
+    return True
+
+
+def _run_merge(args) -> int:
+    """Two-stage merge: per-segment files -> part WAVs (batches of
+    --merge-batch-size) in --tmp-dir -> the final audiobook, with live progress
+    through every stage.
+
+    ``[result]`` is emitted exactly once, for the final file only (part files are
+    plain log lines); on an MP3-encode failure it points at the kept whole-book WAV
+    inside --tmp-dir, which the backend relocates into 06_audio_merge. Exit codes:
+    0 success, 1 combine failed, 2 setup error / nothing to merge.
+    """
+    import json as _json
+
+    if not args.segments_file or not args.out or not args.tmp_dir:
+        print("TTS_WORKER_ERROR: merge mode needs --segments-file, --out and --tmp-dir",
+              file=sys.stderr, flush=True)
         return 2
 
     _add_ffmpeg_to_path(args.ffmpeg)
@@ -1481,64 +1871,32 @@ def _run_merge(args) -> int:
     pause_ms = int(args.pause_ms)
     same_ms = int(args.same_same_ms)
     total = len(segs)
+    tmp_dir = os.path.abspath(args.tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
 
-    chunks_with_audio = []
-    skipped = 0
-    for i, s in enumerate(segs):
-        p = s.get("path")
-        if not p:
-            skipped += 1
-            continue
-        full = p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
-        if not os.path.exists(full):
-            skipped += 1
-            continue
-        try:
-            seg = AudioSegment.from_file(full)
-        except Exception as e:  # noqa: BLE001
-            log(f"跳过无法读取的段 {s.get('index')}（{os.path.basename(full)}）：{e}")
-            skipped += 1
-            continue
-        chunk = {"speaker": s.get("speaker", ""), "pause_after": s.get("pause_after"),
-                 "text": s.get("text", "")}
-        chunks_with_audio.append((chunk, seg))
-        if (i + 1) % 50 == 0 or i == total - 1:
-            progress(0.10 + 0.70 * (i + 1) / total, f"读取音频 {i + 1}/{total}")
-
-    if not chunks_with_audio:
-        print("TTS_WORKER_ERROR: 没有可合并的音频段", file=sys.stderr, flush=True)
+    parts = _merge_stage1(segs, tmp_dir, pause_ms, same_ms, args.merge_batch_size, total)
+    if parts is None:
         return 2
-    if skipped:
-        log(f"警告：{skipped} 段被跳过（文件缺失或无法读取）")
-
-    progress(0.85, "计算时间轴并合并")
-    timeline = compute_timeline(chunks_with_audio, pause_ms, same_ms)
-    audio_segments = [seg for _, seg, _ in timeline]
-    speakers = [c["speaker"] for c, _, _ in timeline]
-    pause_overrides = [c.get("pause_after") for c, _, _ in timeline]
-    final = combine_audio_with_pauses(audio_segments, speakers, pause_ms, same_ms, pause_overrides)
-    if final is None:
-        print("TTS_WORKER_ERROR: 合并结果为空", file=sys.stderr, flush=True)
-        return 1
+    m_plan = len(plan_merge_batches(total, args.merge_batch_size))
 
     out_path = os.path.abspath(args.out)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    base, _ = os.path.splitext(out_path)
-    wav_tmp = base + ".wav"
 
-    final.export(wav_tmp, format="wav")
-    duration_s = len(final) / 1000.0
-    progress(0.95, "编码 MP3")
-    if _wav_to_mp3(wav_tmp, out_path):
+    final_wav, duration_s = _merge_stage2(parts, tmp_dir, out_path, pause_ms, same_ms, m_plan)
+    if final_wav is None:
+        return 1
+
+    progress(0.95, "开始编码 MP3")
+    log(f"开始编码 MP3（{duration_s / 60:.1f} 分钟，流式进度）")
+    if _encode_mp3_streaming(final_wav, out_path, duration_s, args.ffmpeg):
         produced = out_path
-        if os.path.exists(wav_tmp):
-            os.remove(wav_tmp)
     else:
         log("MP3 编码不可用（缺少 ffmpeg？）；保留 WAV。")
-        produced = wav_tmp
-    log(f"合并完成：{duration_s / 60:.1f} 分钟，{len(audio_segments)} 段 → {produced}")
+        produced = final_wav
+
+    log(f"合并完成：{duration_s / 60:.1f} 分钟，{sum(p['n'] for p in parts)} 段 → {produced}")
     print(f"[result] {produced}", flush=True)
     progress(1.0, "完成")
     return 0
@@ -1583,6 +1941,11 @@ def main() -> int:
     # merge
     ap.add_argument("--pause-ms", type=int, default=500, help="pause between different speakers")
     ap.add_argument("--same-same-ms", type=int, default=250, help="pause for same speaker")
+    ap.add_argument("--tmp-dir", default="",
+                    help="staging dir for the part WAVs (merge; required — created and "
+                         "cleaned by the backend)")
+    ap.add_argument("--merge-batch-size", type=int, default=100,
+                    help="segments per part WAV in the two-stage merge (merge)")
     args = ap.parse_args()
 
     if args.mode == "custom":
