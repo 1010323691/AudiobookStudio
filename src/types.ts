@@ -192,8 +192,13 @@ export interface BatchRunOptions {
   indices?: number[]
   /** Which parsed JSON (in 03_parsed_json/) to synthesize; undefined → most recent. */
   script?: string
-  /** Concurrent segments (1..32); undefined → the persisted default (config.tts.batch_concurrency). */
+  /** 批内段数（上限，1..64，不是固定并发数）：把多段垫成一个 GPU 张量批一次并行推理；
+   *  undefined → 持久默认 (config.tts.batch_concurrency)。实际每批条数按段长自动分档
+   *  （短段跑满、长段自动降低、超长单独），并按实测显存余量实时升降。 */
   concurrency?: number
+  /** Reproducible seed for the run: >=0 seeds each sub-batch (seed + sub-batch seq);
+   *  undefined → the persisted default (config.tts.batch_seed); -1 → random. */
+  seed?: number
   /** True → re-synthesize EVERY segment (clears the resume skip); undefined/false → resume
    *  (only the not-yet-done segments, skipping existing audio). */
   force_all?: boolean
@@ -323,8 +328,14 @@ export interface AppConfig {
     pause_same_speaker_ms: number
     /** 角色配音·阶段 2（克隆）的并行 TTS 子进程数。 */
     parallel_workers: number
-    /** 音频合成（一键合成）的并发段数（单子进程内线程池；1 = 串行；范围 1..32）。 */
+    /** 音频合成（一键合成）的「批内段数」上限（只是上限，不是固定并发数）：把多段垫成
+     *  一个 GPU 张量批一次并行推理（1 = 逐段串行；范围 1..64）。实际每批条数按段长自动
+     *  分档（短段跑满、长段自动降低、超长单独），并按实测显存余量实时升降。
+     *  与 parallel_workers（并行子进程，角色配音·克隆）是两种不同的并行方式。 */
     batch_concurrency: number
+    /** 音频合成 batch 的可复现 seed：>=0 时每子批用「seed + 子批序号」播种（可复现，便于定位
+     *  某段特定输入导致的异常）；-1 = 随机。 */
+    batch_seed: number
     api_base: string
     api_key: string
     voice: string

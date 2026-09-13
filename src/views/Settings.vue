@@ -424,15 +424,31 @@ async function save() {
               </Select>
             </div>
             <div class="space-y-1.5">
-              <Label>并发段数（音频合成）</Label>
+              <Label>批内段数（音频合成）</Label>
               <Input
                 v-model.number="draft.tts.batch_concurrency"
                 type="number"
                 min="1"
-                max="32"
+                max="64"
                 step="1"
                 class="max-w-[8rem]"
               />
+              <p class="text-xs text-muted-foreground">
+                只是上限，不是固定并发数；把多段垫成 GPU 张量批一次并行推理（1 = 逐段串行）。
+                实际每批条数按段长自动分档（短段跑满、长段自动降低、超长单独），
+                并按实测显存余量实时升降——显存吃紧 / 吞吐下降时主动降并发。
+              </p>
+            </div>
+            <div class="space-y-1.5">
+              <Label>seed（音频合成 · 可复现）</Label>
+              <Input
+                v-model.number="draft.tts.batch_seed"
+                type="number"
+                step="1"
+                placeholder="-1"
+                class="max-w-[8rem]"
+              />
+              <p class="text-xs text-muted-foreground">-1 = 随机；填 ≥0 的数字 = 可复现（便于定位某段特定输入导致的异常）。</p>
             </div>
           </div>
         </CardContent>

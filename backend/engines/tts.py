@@ -68,7 +68,17 @@ def _child_env() -> dict:
     return env
 
 
-def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = "TTS 引擎") -> deque:
+class WorkerWatchdogTimeout(RuntimeError):
+    """The one-shot worker died on its *watchdog* exit code (a sub-batch produced no output
+    within its budget and the process ``os._exit``'d). Distinct from a plain failure so a stage
+    (``tts_batch``) can shrink the batch and restart a fresh subprocess instead of failing the
+    whole task. ``run_worker`` raises this when ``watchdog_code`` is set and matches the exit.
+    """
+
+
+def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = "TTS 引擎",
+              watchdog_code: int | None = None,
+              log_file: Path | None = None) -> deque:
     """Run a one-shot ``.venv-tts`` worker and stream its output into a Task.
 
     Shared orchestration for the TTS-family stages (batch synthesis / merge):
@@ -80,7 +90,15 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
     * ``[progress] <frac> <label>`` stdout lines are reported via
       ``handle.progress`` here; every other non-empty stdout line is passed to
       ``on_line`` (decoded, stripped) for stage-specific parsing.
-    * A non-zero exit raises ``RuntimeError(f"{fail_prefix}失败（退出码 N）…")``.
+    * When ``log_file`` is given, the whole transcript is mirrored to that file
+      (append mode, line-buffered) — stdout lines as ``[out] …``, stderr lines as
+      ``[err] …``, bracketed by ``=== attempt started/ended ===`` markers — so a
+      run leaves a persistent, on-disk trail (the Task log itself is SSE-only and
+      vanishes with the session). ``None`` (the default) changes nothing.
+    * A non-zero exit raises ``RuntimeError(f"{fail_prefix}失败（退出码 N）…")`` — except that,
+      when ``watchdog_code`` is set and the child exits with exactly that code, a
+      :class:`WorkerWatchdogTimeout` is raised instead (so a batch stage can shrink the batch
+      and restart a fresh subprocess rather than failing the whole task).
 
     Returns the rolling stderr tail for post-run validation.
     """
@@ -93,6 +111,21 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
     out_q: "queue.Queue" = queue.Queue()
     err_q: "queue.Queue" = queue.Queue()
     stderr_tail: deque = deque(maxlen=40)
+
+    # Persistent run mirror: the Task log is SSE-only (it vanishes with the session), so a
+    # failed run leaves no trail on disk. When a stage names a log file, every stdout line
+    # ([out]), stderr line ([err]) and the attempt boundary markers are also appended there
+    # (line-buffered, append mode) — each restart attempt appends its own section, so the
+    # file is the forensic record of what the engine actually said before it died.
+    run_log = None
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            run_log = open(log_file, "a", encoding="utf-8", buffering=1)
+            run_log.write(f"\n=== attempt started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            run_log.write("cmd: " + " ".join(str(c) for c in cmd) + "\n")
+        except OSError:
+            run_log = None
 
     def _pump(stream, q: "queue.Queue") -> None:
         try:
@@ -128,6 +161,8 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
                         handle.progress(frac, parts[2] if len(parts) > 2 else "")
                     else:
                         on_line(line)
+                        if run_log:
+                            run_log.write(f"[out] {line}\n")
             except queue.Empty:
                 pass
             try:
@@ -140,6 +175,8 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
                     if line:
                         stderr_tail.append(line)
                         handle.log(line, "WARNING")
+                        if run_log:
+                            run_log.write(f"[err] {line}\n")
             except queue.Empty:
                 pass
             if proc.poll() is not None and out_done and err_done:
@@ -149,6 +186,11 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+        if run_log:
+            run_log.write(
+                f"=== attempt ended rc={proc.returncode} "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            run_log.close()
         for p in (proc.stdout, proc.stderr):
             try:
                 p.close()
@@ -162,8 +204,9 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
 
     if proc.returncode != 0:
         tail = " | ".join(stderr_tail)[-500:]
-        raise RuntimeError(
-            f"{fail_prefix}失败（退出码 {proc.returncode}）"
-            + (f"：{tail}" if tail else "（无错误输出）")
-        )
+        msg = (f"{fail_prefix}失败（退出码 {proc.returncode}）"
+               + (f"：{tail}" if tail else "（无错误输出）"))
+        if watchdog_code is not None and proc.returncode == watchdog_code:
+            raise WorkerWatchdogTimeout(msg)
+        raise RuntimeError(msg)
     return stderr_tail

@@ -40,12 +40,15 @@ export function listVoices(script?: string): Promise<VoicesListResult> {
 }
 
 /** 音频合成：start a batch TTS Task (all lines, or the given line indices; for a script).
- *  ``force_all`` re-synthesizes every segment; otherwise the run resumes (skips the done). */
+ *  ``force_all`` re-synthesizes every segment; otherwise the run resumes (skips the done).
+ *  ``concurrency`` is the *manual per-batch cap* (批内段数上限); ``seed`` (>=0) makes a run
+ *  reproducible (omitted → the persisted config default; -1 → random). */
 export function runBatch(opts: BatchRunOptions = {}): Promise<{ task_id: string }> {
   return http.post<{ task_id: string }>('/api/tts/batch', {
     indices: opts.indices ?? null,
     script: opts.script ?? null,
     concurrency: opts.concurrency ?? null,
+    seed: opts.seed ?? null,
     force_all: opts.force_all ?? false,
   })
 }

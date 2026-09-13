@@ -67,10 +67,12 @@ const completedLabel = computed(() => {
   return `${batchProgress.value?.completed ?? 0} / ${total}`
 })
 
-// 一键合成 并发段数 (1..32)：单个 TTS 子进程内并行合成多少段（模型只加载一次）。
+// 一键合成「批内段数」上限 (1..64)：把多段垫成一个 GPU 张量批，一批最多能垫多少段（只是上限，
+// 不是固定并发数；模型只加载一次。实际每批条数 = min(段长分档〔短段跑满、长段自动降低、超长
+// 单独〕, 实测显存动态调节, 显存估算, 单批字符上限)）。
 // Seeded from the persisted config; written back to it on each run (see doRun).
 const MIN_CONCURRENCY = 1
-const MAX_CONCURRENCY = 32
+const MAX_CONCURRENCY = 64
 const concurrency = ref(4)
 
 function clampConcurrency(n: number): number {
@@ -79,9 +81,19 @@ function clampConcurrency(n: number): number {
   return Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, v))
 }
 
-// Coerce the 并发段数 input (the Input component emits a string) to an integer in [1, 32].
+// Coerce the 批内段数 input (the Input component emits a string) to an integer in [1, 64].
 function onConcurrency(v: string | number) {
   concurrency.value = clampConcurrency(Number(v))
+}
+
+// Reproducible seed (a debug aid; NOT persisted to config): empty → use the configured
+// default (config.tts.batch_seed, default -1 = random); a number → this run is reproducible.
+const seedInput = ref('')
+function runSeed(): number | undefined {
+  const t = seedInput.value.trim()
+  if (t === '') return undefined
+  const v = Math.trunc(Number(t))
+  return Number.isFinite(v) ? v : undefined
 }
 
 async function loadSummary() {
@@ -150,7 +162,7 @@ watch(script, () => {
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
-  // Seed 并发段数 from the persisted config (falls back to the default of 4 if unavailable).
+  // Initialize 批内段数 from the persisted config (falls back to the default of 4 if unavailable).
   concurrency.value = clampConcurrency(Number(settings.config?.tts?.batch_concurrency ?? 4))
   try {
     status.value = await ttsStatus()
@@ -171,10 +183,10 @@ async function doRun() {
   const concurrencyNow = concurrency.value
   try {
     // Default (resume): synthesize only the not-yet-done segments, skipping existing audio.
-    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow })
+    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow, seed: runSeed() })
     taskId.value = task_id
     await taskStore.refresh()
-    // Remember the chosen 并发段数 in the persisted config (fire-and-forget: the run above
+    // Remember the chosen 批内段数 in the persisted config (fire-and-forget: the run above
     // already carries it; a save failure here must not fail the run that just started).
     void settings.save({ tts: { batch_concurrency: concurrencyNow } })
     startStatusPolling()
@@ -196,7 +208,7 @@ async function doRunAll() {
   result.value = null
   const concurrencyNow = concurrency.value
   try {
-    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow, force_all: true })
+    const { task_id } = await runBatch({ script: script.value || undefined, concurrency: concurrencyNow, seed: runSeed(), force_all: true })
     taskId.value = task_id
     await taskStore.refresh()
     void settings.save({ tts: { batch_concurrency: concurrencyNow } })
@@ -311,7 +323,9 @@ watch(
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Layers class="h-5 w-5" />一键音频合成</CardTitle>
           <CardDescription>
-            合成整本书；模型只加载一次，按下方「并发段数」并行合成（1 = 逐段串行），
+            合成整本书；模型只加载一次，把多段垫成 GPU 张量批一次并行推理
+            （下方「批内段数」只是上限，1 = 逐段串行；实际每批条数按段长自动分档
+            ——短段跑满、长段自动降低、超长单独——并按实测显存余量实时升降，不追求显存占满），
             实时显示「正在生成（角色 X）」与「完成 i / N 段」及成功 / 失败。
           </CardDescription>
         </CardHeader>
@@ -334,16 +348,31 @@ watch(
               <RefreshCw class="h-4 w-4" />刷新
             </Button>
             <label class="flex items-center gap-2 text-sm text-muted-foreground">
-              并发段数
+              批内段数
               <Input
                 :modelValue="concurrency"
                 type="number"
                 min="1"
-                max="32"
+                max="64"
                 step="1"
                 class="h-8 w-20"
                 :disabled="busy"
                 @update:modelValue="onConcurrency"
+              />
+            </label>
+            <label
+              class="flex items-center gap-2 text-sm text-muted-foreground"
+              title="留空 = 用「设置」里的默认（默认 -1 = 随机）；填数字 = 本次运行可复现。仅本次运行生效，不写入设置。"
+            >
+              seed
+              <Input
+                :modelValue="seedInput"
+                type="number"
+                step="1"
+                placeholder="默认随机"
+                class="h-8 w-24"
+                :disabled="busy"
+                @update:modelValue="seedInput = String($event)"
               />
             </label>
           </div>

@@ -77,10 +77,15 @@ class TTSConfig(BaseModel):
     pause_same_speaker_ms: int = 250
     # 角色配音·阶段 2（克隆）的并行 TTS 子进程数（每个子进程各自加载一次模型，显存随之增加）。
     parallel_workers: int = 1
-    # 音频合成（一键合成 / batch）的并发段数：单个 TTS 子进程内用线程池并行合成，
-    # 同时最多 ``batch_concurrency`` 段在合成，模型只加载一次。1 = 逐段串行（原行为）。
-    # 使用处钳制到 [1, 32]。与 parallel_workers（并行子进程）是两种不同的并行方式。
+    # 音频合成（一键合成 / batch）的「批内段数」上限：把多段垫成一个 GPU 张量批一次并行推理，
+    # ``batch_concurrency`` 是每批最多几条段的上限（不是固定并发数）；运行时实际批内条数 =
+    # min(段长分档〔短段跑满、长段自动降低、超长单独〕, 实测显存动态调节, 显存估算, 单批字符上限)。
+    # 1 = 逐段串行。使用处钳制到 [1, 64]。
+    # 与 parallel_workers（并行子进程，角色配音·克隆）是两种不同的并行方式。
     batch_concurrency: int = 4
+    # 音频合成 batch 的可复现 seed：>=0 时每子批用 ``seed + 子批序号`` 播种（同输入 + 同 seed +
+    # 同批布局 → 可复现，便于定位某段特定输入导致的异常）；-1 = 随机（默认）。
+    batch_seed: int = -1
     # Legacy API-provider fields, unused by the local engine, kept so an existing
     # config/app.json still loads (and round-trips) cleanly.
     api_base: str = ""

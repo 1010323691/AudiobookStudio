@@ -107,6 +107,7 @@ import pytest  # noqa: E402
 from backend.core import config as core_config  # noqa: E402
 from backend.core import paths as core_paths  # noqa: E402
 import backend.engines.tts_batch as tts_batch  # noqa: E402
+from backend.engines.tts import WorkerWatchdogTimeout  # noqa: E402
 
 
 class _Handle:
@@ -157,7 +158,7 @@ def workspace(monkeypatch, tmp_path):
 def _fake_run_worker(captured):
     """A run_worker stand-in: records the cmd and simulates a fully-successful child."""
 
-    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎"):
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
         captured["cmd"] = cmd
         with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
             segs = json.load(f)
@@ -206,7 +207,7 @@ def test_synthesize_clamps_concurrency_to_max(workspace, monkeypatch):
     captured = {}
     _stub_engine(monkeypatch, captured)
     tts_batch.synthesize(_Handle(), None, "s.json", 99)
-    assert _cmd_flag(captured["cmd"], "--concurrency") == "32"
+    assert _cmd_flag(captured["cmd"], "--concurrency") == "64"
 
 
 def test_synthesize_clamps_concurrency_to_min(workspace, monkeypatch):
@@ -222,7 +223,154 @@ def test_synthesize_reports_effective_concurrency_in_log(workspace, monkeypatch)
     _stub_engine(monkeypatch, captured)
     h = _Handle()
     tts_batch.synthesize(h, None, "s.json", 3)
-    assert any("并发 3 段" in msg for _lvl, msg in h.logs)
+    assert any("批内上限 3 段" in msg for _lvl, msg in h.logs)
+
+
+# --------------------------------------------------------------------------- #
+# the watchdog / restart loop — shrink, isolate, and the attempt cap
+# --------------------------------------------------------------------------- #
+
+def test_synthesize_watchdog_shrinks_and_restarts(workspace, monkeypatch):
+    """A hung child (exit 124) shrinks the batch and restarts; a clean 2nd run finishes the job."""
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) == 1:  # first run hangs: name the in-flight batch, then exit 124
+            on_line("[watchdog] timeout batch=custom#1 indices=[0, 1] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        # second run is clean: synthesize whatever is still remaining
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "s.json", 4)
+    assert len(calls) == 2  # one restart, not a fatal failure
+    assert _cmd_flag(calls[0], "--concurrency") == "4"
+    assert _cmd_flag(calls[1], "--concurrency") == "2"  # the cap halved on the restart
+    assert result["completed"] == 2 and result["failed"] == []  # the task still succeeds
+    assert any("缩到 2 段" in msg for _lvl, msg in h.logs)  # the shrink is logged
+
+
+def test_synthesize_watchdog_isolates_poison_segment_at_workers_one(workspace, monkeypatch):
+    """At workers==1 a segment that times out twice is isolated as a failure; the rest complete."""
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) in (1, 2):  # poison segment 0 times out twice (strike, then isolate)
+            on_line("[watchdog] timeout batch=custom#1 indices=[0] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        # third run: only the healthy remaining segment (index 1)
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "s.json", 1)
+    assert len(calls) == 3
+    assert all(_cmd_flag(c, "--concurrency") == "1" for c in calls)  # never grows back
+    assert result["completed"] == 1  # the healthy segment (index 1) completed
+    assert len(result["failed"]) == 1 and result["failed"][0]["index"] == 0
+    assert "隔离" in result["failed"][0]["reason"]  # the poison segment is a recorded failure
+    # and it lands in the manifest as not-ok, so a later default resume would retry it
+    by_index = {e["index"]: e for e in json.loads(
+        (workspace / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert by_index[0]["ok"] is False and by_index[1]["ok"] is True
+
+
+def test_synthesize_watchdog_attempt_cap_raises(workspace, monkeypatch):
+    """If the engine keeps timing out (and nothing is ever isolated), the run gives up -> FAILED."""
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        # Always time out, always naming an out-of-range index that can never be isolated,
+        # so `remaining` never shrinks and the attempt cap is the only thing that ends the loop.
+        calls.append(cmd)
+        on_line("[watchdog] timeout batch=custom#1 indices=[99] elapsed=181.2")
+        raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    with pytest.raises(RuntimeError):
+        tts_batch.synthesize(h, None, "s.json", 1)
+    assert len(calls) == 9  # MAX_ATTEMPTS (8) shrink-retries, then the 9th attempt trips the cap
+
+
+# --------------------------------------------------------------------------- #
+# the persistent per-run transcript (a forensic trail for a mid-batch death)
+# --------------------------------------------------------------------------- #
+
+def test_synthesize_persists_run_log(workspace, monkeypatch):
+    """synthesize mirrors the child transcript to a per-run log file under <workspace>/logs
+    (the task log is SSE-only and vanishes with the session; a run that dies mid-batch must
+    leave its trail on disk)."""
+    captured = {}
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        captured["cmd"] = cmd
+        captured["log_file"] = kw.get("log_file")
+        log_file = kw.get("log_file")
+        if log_file is not None:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("=== attempt started ===\n[out] 引擎就绪\n[err] simulated fault\n"
+                        "=== attempt ended rc=0 ===\n")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok "
+                    f"{os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine",
+                        lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    tts_batch.synthesize(h, None, "s.json", 4)
+
+    log_file = captured["log_file"]
+    assert log_file is not None
+    assert log_file.parent == workspace / "logs"
+    assert log_file.name.startswith("tts_batch_") and log_file.name.endswith(".log")
+    text = log_file.read_text(encoding="utf-8")
+    assert "[out] 引擎就绪" in text and "[err] simulated fault" in text
+    assert any("运行日志" in msg for _lvl, msg in h.logs)  # the user can find the file
+
+
+def test_run_worker_mirrors_transcript_to_log_file(tmp_path):
+    """run_worker appends every stdout/stderr line — plus attempt start/end markers with the
+    exit code — to ``log_file`` (a real one-shot child; OOM tracebacks on stderr included)."""
+    import sys
+
+    from backend.engines import tts as tts_eng
+
+    log_file = tmp_path / "logs" / "unit_run.log"
+    code = ("import sys; "
+            "print('[segment] 0 ok /x.mp3', flush=True); "
+            "print('boom-line', file=sys.stderr, flush=True)")
+    h = _Handle()
+    tail = tts_eng.run_worker([sys.executable, "-c", code], h, lambda line: None,
+                              log_file=log_file)
+    text = log_file.read_text(encoding="utf-8")
+    assert "=== attempt started" in text
+    assert "[out] [segment] 0 ok /x.mp3" in text
+    assert "[err] boom-line" in text
+    assert "=== attempt ended rc=0" in text
+    assert "boom-line" in " | ".join(tail)  # the stderr tail still feeds the error message
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +426,7 @@ def test_synthesize_resume_manifest_is_cumulative(workspace, monkeypatch):
 def test_synthesize_writes_manifest_incrementally(workspace, monkeypatch):
     captured = {}
 
-    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎"):
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
         captured["cmd"] = cmd
         out = cmd[cmd.index("--out-dir") + 1]
         on_line(f"[segment] 0 ok {os.path.join(out, '0001.mp3')}")

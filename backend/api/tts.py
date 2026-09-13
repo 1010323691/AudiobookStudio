@@ -267,6 +267,9 @@ class BatchRequest(BaseModel):
     script: str | None = None
     # Concurrent segments (1..32); None -> the persisted default (config.tts.batch_concurrency).
     concurrency: int | None = None
+    # Reproducible seed for the run: >=0 seeds each sub-batch (seed + sub-batch seq); None ->
+    # the persisted default (config.tts.batch_seed); -1 -> random.
+    seed: int | None = None
     # True -> re-synthesize EVERY line (clears the resume skip); False (default) -> resume
     # (synthesize only the not-yet-done segments, skipping existing audio).
     force_all: bool = False
@@ -284,8 +287,8 @@ def run_batch(req: BatchRequest) -> dict:
     else:
         label = "音频合成（续合）"
     if req.concurrency:
-        label += f" · 并发 {req.concurrency}"
-    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script, req.concurrency, req.force_all)
+        label += f" · 批内 {req.concurrency}"
+    task = get_task_manager().create("tts-batch", label, Batch.synthesize, req.indices, req.script, req.concurrency, req.force_all, req.seed)
     return {"task_id": task.id}
 
 

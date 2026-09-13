@@ -6,7 +6,10 @@ order, so a full book runs in one process (models loaded once) while the 3.14
 backend still never imports torch. The child's stdout is pumped line-by-line into
 the task's progress/log — the real-time "第 i/N 段 · 角色：X · 正在生成" stream — and
 each per-segment ``[segment]`` line is recorded, so a single failure never freezes
-the run. A manifest of what was produced is written for the Merge stage.
+the run. A manifest of what was produced is written for the Merge stage. The task
+log is SSE-only (it vanishes with the session), so the child's full transcript is
+also mirrored to ``<workspace>/logs/tts_batch_<timestamp>.log`` — the persistent
+forensic trail for a run that dies mid-batch.
 
 ``synthesize`` is a Task worker (first arg is a :class:`TaskHandle`), mirroring
 ``engines/tts.py``: it streams progress/log, honours cooperative cancel (killing
@@ -16,25 +19,27 @@ down, or every segment failed) — a per-segment failure is a recorded, non-fata
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from pathlib import Path
 
 from ..core.config import get_config
 from ..core.paths import get_layout, resolve_parsed_json
-from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, resolve_engine, run_worker
+from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, WorkerWatchdogTimeout, resolve_engine, run_worker
 
 IMPLEMENTED = True
 
-# 一键合成并发段数的上下界（前端输入与后端钳制共用）。
+# 一键合成「批内段数」上限的上下界（前端输入与后端钳制共用）。这只是上限：worker 运行时按
+# 段长分档 + 实测显存动态调节实际每批条数（32/64 永远不会是固定并发数）。
 MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 32
+MAX_CONCURRENCY = 64
 
 
 def clamp_concurrency(n) -> int:
     """Clamp a requested concurrency to ``[MIN_CONCURRENCY, MAX_CONCURRENCY]``.
 
     ``None`` / non-integer / out-of-range values collapse to a safe in-range int, so a
-    stray config value or request can never spawn a degenerate pool (0) or an unbounded
+    stray config value or request can never spawn a degenerate cap (0) or an unbounded
     one (e.g. 999).
     """
     try:
@@ -45,11 +50,12 @@ def clamp_concurrency(n) -> int:
 
 
 def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
-               model, base_model, design_model, ffmpeg_path, concurrency) -> list:
+               model, base_model, design_model, ffmpeg_path, concurrency, seed) -> list:
     """The one-shot ``.venv-tts`` batch command (pure; factored out for testing).
 
-    ``--concurrency`` is always present (a clamped int) so the worker's thread pool is
-    sized explicitly; empty model ids are omitted so the worker falls back to its own
+    ``--concurrency`` is always present (a clamped int) — the worker's *per-batch ceiling*
+    (the length bands + measured VRAM governor set the actual size); ``--seed`` (-1 = random)
+    makes a run reproducible. Empty model ids are omitted so the worker falls back to its own
     (identical) defaults.
     """
     cmd = [
@@ -61,6 +67,7 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
         "--language", language or DEFAULT_LANGUAGE,
         "--device", device or "auto",
         "--concurrency", str(concurrency),
+        "--seed", str(seed),
     ]
     if model:
         cmd += ["--model", model]
@@ -106,6 +113,25 @@ def _handle_segment(line: str, by_index: dict, total: int, seg_results: dict, ha
     else:
         seg_results[index] = {"ok": False, "path": "", "reason": detail}
         handle.log(f"{num} {speaker}：失败（{detail}）", "ERROR")
+
+
+def _parse_watchdog_indices(line: str):
+    """The in-flight segment indices named in a ``[watchdog] … indices=[…]`` line (a no-op list
+    if the marker / list is absent or unparseable). Used to target a strike at workers==1."""
+    i = line.find("indices=[")
+    if i < 0:
+        return []
+    j = line.find("]", i)
+    if j < 0:
+        return []
+    out = []
+    for tok in line[i + len("indices=["):j].split(","):
+        tok = tok.strip()
+        try:
+            out.append(int(tok))
+        except ValueError:
+            continue
+    return out
 
 
 def _build_segments(script, indices=None):
@@ -253,13 +279,20 @@ def _write_manifest_file(manifest_path, manifest) -> None:
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def synthesize(handle, indices=None, script=None, concurrency=None, force_all=False) -> dict:
+def synthesize(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
     """Task worker: synthesize the script's lines (default = resume: only the not-yet-done).
 
-    ``concurrency`` is the max number of segments synthesized in parallel (a thread pool inside
-    the single TTS subprocess, which still loads each needed model once); when omitted it falls
-    back to the persisted default (``config.tts.batch_concurrency``). Either way it is clamped to
-    ``[1, 32]`` before being handed to the worker.
+    ``concurrency`` is only the *per-batch ceiling* (the most segments that may share one GPU
+    tensor batch); the worker sets the actual size at runtime from the segment-length bands and
+    a measured VRAM governor (never a fixed concurrency). When omitted it falls back to the
+    persisted default (``config.tts.batch_concurrency``); either way it is clamped to
+    ``[1, 64]`` before being handed to the worker. ``seed`` (>=0) makes a run reproducible; when
+    omitted it uses ``config.tts.batch_seed`` (-1 = random).
+
+    A hung / OOM-killed child (the worker's watchdog, exit 124) is *not* a fatal failure: the run
+    shrinks the batch (halving the cap, floor 1) and restarts a fresh subprocess (resume semantics
+    skip the already-done segments), down to batch 1, where a repeat timeout strikes the in-flight
+    segment and two strikes isolate it as a recorded failure (the run continues without it).
 
     The package ``manifest.json`` is the cumulative source of truth and is written *incrementally*
     (after every segment), so a cancel keeps whatever finished. The default run is a *resume* —
@@ -328,28 +361,34 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
         handle.log("警告：未找到 voice_config.json——请先在「角色配音」页生成角色声音，否则所有段都会失败。", "WARNING")
 
     seg_file = layout.temp / f"batch_segments_{uuid.uuid4().hex[:12]}.json"
-    seg_file.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     python, worker = resolve_engine()
     cfg = get_config()
     t = cfg.tts
-    # 并发段数: the request's value, else the persisted default (config.tts.batch_concurrency);
-    # clamped to [1, 32] so a stray value can't spawn a degenerate / unbounded pool.
+    # 批内段数（仅上限）: the request's value, else the persisted default
+    # (config.tts.batch_concurrency); clamped to [1, 64] so a stray value can't spawn a
+    # degenerate / unbounded cap (the worker sets the actual per-batch size at runtime).
     workers = clamp_concurrency(concurrency if concurrency else t.batch_concurrency)
+    # seed: the request's value, else the persisted default (config.tts.batch_seed); -1 = random.
+    seed = seed if seed is not None else t.batch_seed
+    try:
+        seed = int(seed)
+    except (TypeError, ValueError):
+        seed = -1
 
-    cmd = _build_cmd(
-        python, worker, seg_file, vc_path, out_dir,
-        language=t.language, device=t.device,
-        model=t.model, base_model=t.base_model, design_model=t.design_model,
-        ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers,
-    )
-
-    handle.log(f"引擎：.venv-tts（一次性子进程，模型只加载一次）· 并发 {workers} 段")
+    handle.log(f"引擎：.venv-tts（一次性子进程，模型只加载一次）· 批内上限 {workers} 段")
+    # A persistent per-run transcript: the task log is SSE-only and vanishes with the session,
+    # so every line the engine emits is also mirrored to this file (one per run, appended per
+    # restart attempt) — a run that dies mid-batch leaves its exact batch / watchdog / error
+    # trail on disk for diagnosis.
+    run_log = layout.logs / f"tts_batch_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    handle.log(f"运行日志（排障用，含每次重启的完整引擎输出）：{run_log}")
     handle.progress(0.02, "启动引擎")
 
     seg_results: dict = {}  # index -> {ok, path, reason} (this run)
     by_index = {s["index"]: s for s in segments}
+    in_flight: set = set()  # indices the current child was generating (from its [watchdog] line)
 
     def _write_manifest() -> None:
         # The cumulative manifest, flushed after every segment so a cancel keeps what finished.
@@ -359,10 +398,66 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
         if line.startswith("[segment]"):
             _handle_segment(line, by_index, run_total, seg_results, handle)
             _write_manifest()
+        elif line.startswith("[watchdog]"):
+            # The child names the batch that hung before it exits 124: remember the in-flight
+            # indices so a strike at workers==1 targets the right segment(s).
+            in_flight.update(_parse_watchdog_indices(line))
+            handle.log(line, "WARNING")
         else:
             handle.log(line)
 
-    run_worker(cmd, handle, on_line, temp_files=(seg_file,), fail_prefix="音频合成引擎")
+    # -- the watchdog / restart loop ----------------------------------------------
+    # A hung or OOM-killed child (exit 124) is not a fatal task failure: shrink the batch and
+    # restart a fresh subprocess (resume semantics skip the done), down to workers==1, where a
+    # repeat timeout strikes the in-flight segment; two strikes isolate it as a recorded failure.
+    MAX_ATTEMPTS = 8
+    excluded: set = set()
+    struck: dict = {}
+    attempt = 0
+    while True:
+        if attempt > MAX_ATTEMPTS:
+            raise RuntimeError(
+                f"音频合成引擎反复超时（{MAX_ATTEMPTS} 次缩批重试后仍未完成）——已完成进度已保住，"
+                f"请调小「批内段数」后重试。"
+            )
+        remaining = [s for s in segments
+                     if s["index"] not in excluded
+                     and not (seg_results.get(s["index"]) or {}).get("ok")]
+        if not remaining:
+            break
+        seg_file.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
+        cmd = _build_cmd(
+            python, worker, seg_file, vc_path, out_dir,
+            language=t.language, device=t.device,
+            model=t.model, base_model=t.base_model, design_model=t.design_model,
+            ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
+        )
+        in_flight.clear()  # a fresh child starts with an empty in-flight set
+        try:
+            run_worker(cmd, handle, on_line, temp_files=(seg_file,),
+                       fail_prefix="音频合成引擎", watchdog_code=124, log_file=run_log)
+            break  # a clean exit (0)
+        except WorkerWatchdogTimeout:
+            attempt += 1
+            if workers > 1:
+                workers = max(1, workers // 2)
+                handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+                continue
+            # workers == 1: strike the in-flight segment; two strikes isolate a poison segment
+            newly = []
+            for i in list(in_flight):
+                struck[i] = struck.get(i, 0) + 1
+                if struck[i] >= 2:
+                    excluded.add(i)
+                    seg_results[i] = {"ok": False, "path": "", "reason": "超时（已隔离）"}
+                    newly.append(i)
+            if newly:
+                names = "、".join(f"第 {i + 1} 段" for i in sorted(newly))
+                handle.log(f"{names} 连续两次超时 → 隔离为失败，其余段继续", "WARNING")
+                _write_manifest()
+            else:
+                handle.log("看门狗触发（单段超时，首次记罚）→ 重启引擎重试", "WARNING")
+            continue
 
     # Final manifest (the incremental writes already cover it; a safety net in case the child
     # exits before its last line is drained).
