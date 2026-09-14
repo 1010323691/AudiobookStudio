@@ -258,11 +258,23 @@ def _load_unlocked() -> AppConfig:
 
 
 def get_config() -> AppConfig:
-    """Return the in-memory config, loading it on first access (see ``_load_unlocked``)."""
+    """Return the in-memory config, loading it on first access (see ``_load_unlocked``).
+
+    The workspace bookkeeping field is self-healed in memory on every read: the
+    root pointer is the source of truth, so a stale ``paths.working_dir`` left in
+    the workspace config (e.g. the workspace folder was moved and re-selected)
+    must not leak into the UI. The next settings save rewrites it persistently
+    (``update_config`` already forces the field to the live workspace).
+    """
     global _config
     with _lock:
         if _config is None:
             _config = _load_unlocked()
+        ws = _workspace_path()
+        if ws is not None and _config.paths.working_dir != str(ws):
+            _config = _config.model_copy(update={
+                "paths": _config.paths.model_copy(update={"working_dir": str(ws)})
+            })
         return _config
 
 

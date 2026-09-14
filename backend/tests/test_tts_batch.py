@@ -419,8 +419,10 @@ def test_synthesize_resume_manifest_is_cumulative(workspace, monkeypatch):
     tts_batch.synthesize(_Handle(), None, "s.json", None)
     by_index = {e["index"]: e for e in json.loads((out_dir / "manifest.json").read_text("utf-8"))}
     assert set(by_index) == {0, 1}  # pre-done + newly-done: one entry per non-empty segment
-    assert by_index[0]["ok"] is True and by_index[0]["path"] == str(out_dir / "0001.mp3")  # preserved
-    assert by_index[1]["ok"] is True  # newly synthesized this run
+    # The legacy absolute path of the preserved entry is migrated to the workspace-relative
+    # form on load; this run's (absolute, worker-reported) output is stored in the same form.
+    assert by_index[0]["ok"] is True and by_index[0]["path"] == "05_audio_chunk/s/0001.mp3"
+    assert by_index[1]["ok"] is True and by_index[1]["path"] == "05_audio_chunk/s/0002.mp3"
 
 
 def test_synthesize_writes_manifest_incrementally(workspace, monkeypatch):

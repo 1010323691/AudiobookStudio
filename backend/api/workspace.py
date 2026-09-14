@@ -29,10 +29,14 @@ class WorkspaceRequest(BaseModel):
 def _info() -> dict:
     layout = get_layout()
     if layout.workspace is None:
-        return {"set": False, "path": "", "is_default": True, "dirs": {}}
+        return {"set": False, "path": "", "exists": False, "is_default": True, "dirs": {}}
     return {
         "set": True,
         "path": str(layout.workspace),
+        # The folder the pointer names may have been moved or deleted since it was set —
+        # the dashboard uses this to tell the user to re-select it (the pipeline's write
+        # endpoints refuse with a clear error in that state).
+        "exists": layout.workspace.exists(),
         "is_default": False,
         "dirs": layout.dirs(),
     }

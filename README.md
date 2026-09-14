@@ -42,10 +42,11 @@ cd audiobookstudio
 
 ```powershell
 # Python 后端(仓库自带 .venv;没有则 python -m venv .venv 重建)
-.venv\Scripts\pip install -r backend\requirements.txt
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
 
 # 前端
-npm install
+npm.cmd install
 
 # TTS 独立环境(可选,仅「音频合成 / 音频合并」需要;下载数 GB 的 torch)
 powershell -ExecutionPolicy Bypass -File install_tts_env.ps1

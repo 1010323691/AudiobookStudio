@@ -107,6 +107,7 @@ def test_get_layout_unset_is_inert(sandbox, set_pointer):
 
 def test_get_layout_set_creates_workspace_dirs(sandbox, set_pointer):
     ws = sandbox / "MyBook"
+    ws.mkdir()  # the workspace endpoint creates the root folder; get_layout fills in the rest
     set_pointer(str(ws))
     layout = core_paths.get_layout()
     assert layout.workspace == ws
@@ -118,11 +119,26 @@ def test_get_layout_set_creates_workspace_dirs(sandbox, set_pointer):
     core_paths.get_layout()
 
 
+def test_get_layout_missing_root_is_inert(sandbox, set_pointer):
+    """A pointer to a folder that no longer exists (the workspace was moved / deleted)
+    must NOT resurrect an empty skeleton at the old location — the dashboard reports
+    it (``exists: false``) and the write endpoints answer 409 until re-selection."""
+    set_pointer(str(sandbox / "Gone"))
+    layout = core_paths.get_layout()
+    assert layout.workspace == sandbox / "Gone"  # still "set" …
+    assert not (sandbox / "Gone").exists()       # … but nothing is planted on disk
+    assert not (sandbox / "Gone" / "01_input").exists()
+    assert not (sandbox / "Gone" / "logs").exists()
+    assert not (sandbox / "Gone" / "config").exists()
+
+
 def test_get_layout_relative_working_dir_resolves_against_project(sandbox, set_pointer):
+    ws = sandbox / "rel" / "ws"
+    ws.mkdir(parents=True)  # a relative pointer names a folder that (was) created by the endpoint
     set_pointer("rel/ws")
     layout = core_paths.get_layout()
-    assert layout.workspace == sandbox / "rel" / "ws"
-    assert (sandbox / "rel" / "ws" / "01_input").is_dir()
+    assert layout.workspace == ws
+    assert (ws / "01_input").is_dir()
 
 
 def test_get_layout_is_idempotent_across_calls(sandbox, set_pointer):

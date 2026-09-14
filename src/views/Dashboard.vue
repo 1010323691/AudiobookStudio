@@ -32,6 +32,12 @@ const WS_DIR_LABELS: [string, string][] = [
 
 const wsPath = computed(() => ws.value?.path || settings.config?.paths?.working_dir || '')
 
+// The pointer names a folder that no longer exists (moved / deleted): the stored
+// project paths are location-independent (workspace-relative), so re-selecting the
+// moved folder restores the whole project — but the user must be told clearly.
+// (`exists` is absent on older backends → never a false alarm.)
+const wsStale = computed(() => !!ws.value?.set && ws.value.exists === false)
+
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
   try {
@@ -85,14 +91,14 @@ async function clearWorkspace() {
     <!-- 工作空间（流程运行的前提） -->
     <section
       class="rounded-xl border p-5"
-      :class="workspaceSet ? 'border-primary/40 bg-primary/5' : 'border-amber-500/60 bg-amber-500/10'"
+      :class="(!workspaceSet || wsStale) ? 'border-amber-500/60 bg-amber-500/10' : 'border-primary/40 bg-primary/5'"
     >
       <div class="flex flex-wrap items-center justify-between gap-3">
         <h2 class="flex items-center gap-2 text-base font-semibold">
           <Folder class="h-5 w-5 text-primary" />
           工作空间
-          <Badge :variant="workspaceSet ? 'success' : 'warning'">
-            {{ workspaceSet ? '已设置' : '未设置' }}
+          <Badge :variant="!workspaceSet ? 'warning' : (wsStale ? 'destructive' : 'success')">
+            {{ !workspaceSet ? '未设置' : (wsStale ? '目录不存在' : '已设置') }}
           </Badge>
         </h2>
         <div v-if="workspaceSet" class="flex gap-2">
@@ -107,6 +113,13 @@ async function clearWorkspace() {
         class="mt-3 text-sm font-medium text-amber-700 dark:text-amber-400"
       >
         尚未设置工作空间 —— 流水线已锁定，请先选择一个本地文件夹。
+      </p>
+      <p
+        v-else-if="wsStale"
+        class="mt-3 text-sm font-medium text-amber-700 dark:text-amber-400"
+      >
+        工作目录已不存在 —— 它可能被移动或删除。请在下方输入（新位置）的完整路径并确认设置；
+        项目内的文件引用都按相对路径保存，重新指向后即可原样恢复。
       </p>
       <p v-else class="mt-3 text-sm text-muted-foreground">
         流水线的所有产物都会按固定结构保存在该目录下。

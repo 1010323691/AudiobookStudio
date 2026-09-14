@@ -38,6 +38,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from ..core import pathio
 from ..core.config import get_config
 from ..core.paths import ALL_PARSED_JSON, PROJECT_ROOT, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from .persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT
@@ -438,8 +439,14 @@ def _collect_samples(script):
 
 
 def _load_voice_config(handle):
-    """Load the existing voice_config.json (preserving any hand-edited entries)."""
-    vc_path = get_layout().voice_profiles / "voice_config.json"
+    """Load the existing voice_config.json (preserving any hand-edited entries).
+
+    Legacy absolute ``ref_audio`` values that point inside the workspace are
+    migrated to the workspace-relative form on load (and the file rewritten),
+    so the config keeps working after the workspace folder moves.
+    """
+    layout = get_layout()
+    vc_path = layout.voice_profiles / "voice_config.json"
     voice_config = {}
     if vc_path.exists():
         try:
@@ -448,6 +455,12 @@ def _load_voice_config(handle):
                 voice_config = loaded
         except Exception as e:  # noqa: BLE001
             handle.log(f"现有 voice_config.json 无法解析（{e}），将重建。", "WARNING")
+        if voice_config:
+            _n, migrated = pathio.migrate_entries_in(vc_path, layout.workspace, "dict", ("ref_audio",))
+            if migrated is not None:
+                voice_config = migrated
+            if _n:
+                handle.log(f"voice_config.json 已迁移 {_n} 个旧绝对路径为工作目录相对路径。")
     return vc_path, voice_config
 
 
@@ -693,6 +706,7 @@ def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_
     handle.log(f"检测到 {len(order)} 个角色：{'、'.join(order)}")
 
     vc_path, voice_config = _load_voice_config(handle)
+    ws = get_layout().workspace
 
     # Characters eligible for a clone: in-scope, non-alias, already carrying a foundation.
     def _is_alias(sp):
@@ -766,7 +780,10 @@ def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_
             if r["ok"]:
                 entry.update({
                     "type": "clone",
-                    "ref_audio": r["preview"],  # absolute path (the worker reads it directly)
+                    # workspace-relative (the worker resolves it against --workspace) so the
+                    # config survives the workspace folder moving; an out-of-workspace file
+                    # would keep its absolute path
+                    "ref_audio": pathio.to_workspace_relative(r["preview"], ws) or r["preview"],
                     "ref_text": r["ref_text"],
                     "description": r["description"],
                     "character_style": r["description"],

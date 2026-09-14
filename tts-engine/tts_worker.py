@@ -1066,6 +1066,16 @@ def _run_design(args) -> int:
         return 1
 
 
+def _workspace_root(args) -> str:
+    """The root relative path values resolve against inside ``--voice-config`` /
+    ``--segments-file``: the backend passes the live workspace root via ``--workspace``
+    (the worker's own cwd is the project root, not the workspace). Legacy callers
+    that pass nothing keep the old cwd-based behaviour.
+    """
+    ws = getattr(args, "workspace", "") or ""
+    return os.path.abspath(ws) if ws else os.getcwd()
+
+
 def _run_clone(args) -> int:
     """Synthesize one segment with a cloned (Base + reference) voice."""
     if not args.out:
@@ -1101,7 +1111,7 @@ def _run_clone(args) -> int:
 
         progress(0.30, "Building voice clone prompt")
         voice_data = {"ref_audio": args.ref_audio, "ref_text": args.ref_text}
-        prompt = _build_clone_prompt(model, voice_data, os.getcwd(), args.speaker or "clone")
+        prompt = _build_clone_prompt(model, voice_data, _workspace_root(args), args.speaker or "clone")
 
         progress(0.50, "Synthesizing cloned speech")
         wavs, sr = model.generate_voice_clone(
@@ -1462,8 +1472,10 @@ def _run_batch(args) -> int:
                 report_result(r["index"], False, "Base 模型未加载")
             continue
         try:
+            # ``voice_config[canonical]["ref_audio"]`` is workspace-relative in the new
+            # format — resolve it against the workspace root the backend handed us.
             clone_prompts[canonical] = _build_clone_prompt(
-                model, voice_config[canonical], os.getcwd(), canonical)
+                model, voice_config[canonical], _workspace_root(args), canonical)
         except Exception as e:  # noqa: BLE001 — a bad reference poisons only this speaker's rows
             for r in rows:
                 report_result(r["index"], False, f"克隆提示构建失败：{e}")
@@ -1603,7 +1615,7 @@ def _new_windows_kill_job():
         return None, None
 
 
-def _merge_stage1(segs, tmp_dir, pause_ms, same_ms, batch_size, total):
+def _merge_stage1(segs, tmp_dir, pause_ms, same_ms, batch_size, total, root):
     """Stage 1: fold the per-segment files into per-batch part WAVs in ``tmp_dir``.
 
     Reports live progress per batch ("正在合并第 k/M 批") and per ~10 segments.
@@ -1629,7 +1641,9 @@ def _merge_stage1(segs, tmp_dir, pause_ms, same_ms, batch_size, total):
         for i in range(start, end):
             s = segs[i]
             p = s.get("path") or ""
-            full = p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
+            # A relative segment path resolves against the workspace root (--workspace),
+            # never the process cwd (which is the project root).
+            full = p if os.path.isabs(p) else os.path.join(root, p)
             if not p or not os.path.exists(full):
                 skipped += 1
                 continue
@@ -1874,7 +1888,8 @@ def _run_merge(args) -> int:
     tmp_dir = os.path.abspath(args.tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    parts = _merge_stage1(segs, tmp_dir, pause_ms, same_ms, args.merge_batch_size, total)
+    parts = _merge_stage1(segs, tmp_dir, pause_ms, same_ms, args.merge_batch_size,
+                         total, _workspace_root(args))
     if parts is None:
         return 2
     m_plan = len(plan_merge_batches(total, args.merge_batch_size))
@@ -1916,6 +1931,10 @@ def main() -> int:
     ap.add_argument("--instruct", default="", help="style/delivery instruction")
     ap.add_argument("--device", default="auto", help="auto|cuda|cpu|mps")
     ap.add_argument("--ffmpeg", default="", help="path to ffmpeg (its dir is added to PATH)")
+    ap.add_argument("--workspace", default="",
+                    help="workspace root: relative path values in --voice-config / "
+                         "--segments-file resolve against this (batch / clone / merge); "
+                         "empty = legacy cwd-based resolution")
     # model ids
     ap.add_argument("--model", default=DEFAULT_MODEL, help="CustomVoice model id")
     ap.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Base (clone) model id")

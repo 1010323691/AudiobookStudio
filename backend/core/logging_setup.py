@@ -26,8 +26,15 @@ def setup_logging(logs_dir: Path | None, level: str = "INFO") -> None:
     ``None``). Safe to call repeatedly — at startup and on every workspace change:
     only the file handler is re-targeted, the console handler is kept, and a level
     change is applied to the root logger in place.
+
+    A ``logs_dir`` whose parent (the workspace folder) no longer exists — a stale
+    pointer after the workspace was moved / deleted — degrades to console-only
+    instead of resurrecting a ghost ``logs/`` tree at the old location; the next
+    workspace (re-)selection re-points the handler.
     """
     global _console_installed, _file_handler, _file_path
+    if logs_dir is not None and not logs_dir.parent.exists():
+        logs_dir = None
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 

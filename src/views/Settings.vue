@@ -18,7 +18,6 @@ import Input from '@/components/ui/Input.vue'
 import Label from '@/components/ui/Label.vue'
 import Textarea from '@/components/ui/Textarea.vue'
 import Switch from '@/components/ui/Switch.vue'
-import Select from '@/components/ui/Select.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import {
@@ -36,9 +35,6 @@ import {
   MessageSquareText,
   ShieldCheck,
   AudioLines,
-  FileVideo,
-  ScrollText,
-  Mic,
 } from 'lucide-vue-next'
 
 const settings = useSettingsStore()
@@ -345,110 +341,12 @@ async function save() {
             </div>
             <div class="flex items-center gap-3">
               <Label class="w-24 shrink-0">命名格式</Label>
-              <Input v-model="draft.audio.naming_format" placeholder="第 {} 集" class="max-w-[160px]" />
+              <Input v-model="draft.audio.naming_format" placeholder="书名 第 {} 集" class="max-w-[160px]" />
+              <span class="text-xs text-muted-foreground">完整文件名，{} 为编号</span>
             </div>
             <div class="flex items-center gap-3">
               <Label class="w-24 shrink-0">起始编号</Label>
               <Input v-model="draft.audio.start_number" class="max-w-[100px]" />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      <!-- FFmpeg -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><FileVideo class="h-5 w-5" />FFmpeg</CardTitle>
-        </CardHeader>
-        <CardContent class="space-y-3">
-          <div class="space-y-2">
-            <Label>ffmpeg 路径</Label>
-            <Input v-model="draft.ffmpeg.ffmpeg_path" placeholder="留空则从 PATH 解析" />
-          </div>
-          <div class="space-y-2">
-            <Label>ffprobe 路径</Label>
-            <Input v-model="draft.ffmpeg.ffprobe_path" placeholder="留空则从 PATH 解析" />
-          </div>
-          <p class="text-xs text-muted-foreground">音频分集依赖原生 FFmpeg / ffprobe。若系统 PATH 中已有，可留空。</p>
-        </CardContent>
-      </Card>
-
-      <!-- 日志 -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><ScrollText class="h-5 w-5" />日志</CardTitle>
-        </CardHeader>
-        <CardContent class="flex items-center gap-3">
-          <Label class="w-24 shrink-0">级别</Label>
-          <Select v-model="draft.log.level" class="max-w-[180px]">
-            <option value="DEBUG">DEBUG</option>
-            <option value="INFO">INFO</option>
-            <option value="WARNING">WARNING</option>
-            <option value="ERROR">ERROR</option>
-          </Select>
-        </CardContent>
-      </Card>
-
-      <!-- TTS（本地 Qwen3-TTS 引擎） -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2">
-            <Mic class="h-5 w-5" />TTS 引擎
-            <Badge variant="success" class="ml-1">本地引擎</Badge>
-          </CardTitle>
-        </CardHeader>
-        <CardContent class="space-y-3">
-          <p class="text-xs text-muted-foreground">
-            本地 Qwen3-TTS 引擎，运行在独立的 <code class="text-xs">.venv-tts</code> 环境（Python 3.10 · GPU）。
-            若尚未安装，请在项目根目录运行 <code class="text-xs">install_tts_env.ps1</code>。
-          </p>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <div class="space-y-1.5">
-              <Label>模型</Label>
-              <Input v-model="draft.tts.model" placeholder="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" />
-            </div>
-            <div class="space-y-1.5">
-              <Label>音色 (speaker)</Label>
-              <Input v-model="draft.tts.speaker" placeholder="serena" />
-            </div>
-            <div class="space-y-1.5">
-              <Label>语言</Label>
-              <Input v-model="draft.tts.language" placeholder="chinese" />
-            </div>
-            <div class="flex items-center gap-3">
-              <Label class="w-16 shrink-0">设备</Label>
-              <Select v-model="draft.tts.device" class="max-w-[150px]">
-                <option value="auto">自动 (auto)</option>
-                <option value="cuda">CUDA（GPU）</option>
-                <option value="cpu">CPU</option>
-              </Select>
-            </div>
-            <div class="space-y-1.5">
-              <Label>批内段数（音频合成）</Label>
-              <Input
-                v-model.number="draft.tts.batch_concurrency"
-                type="number"
-                min="1"
-                max="64"
-                step="1"
-                class="max-w-[8rem]"
-              />
-              <p class="text-xs text-muted-foreground">
-                只是上限，不是固定并发数；把多段垫成 GPU 张量批一次并行推理（1 = 逐段串行）。
-                实际每批条数按段长自动分档（短段跑满、长段自动降低、超长单独），
-                并按实测显存余量实时升降——显存吃紧 / 吞吐下降时主动降并发。
-              </p>
-            </div>
-            <div class="space-y-1.5">
-              <Label>seed（音频合成 · 可复现）</Label>
-              <Input
-                v-model.number="draft.tts.batch_seed"
-                type="number"
-                step="1"
-                placeholder="-1"
-                class="max-w-[8rem]"
-              />
-              <p class="text-xs text-muted-foreground">-1 = 随机；填 ≥0 的数字 = 可复现（便于定位某段特定输入导致的异常）。</p>
             </div>
           </div>
         </CardContent>

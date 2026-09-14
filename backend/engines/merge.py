@@ -23,6 +23,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from ..core import pathio
 from ..core.config import get_config
 from ..core.paths import get_layout
 from .tts import resolve_engine, run_worker
@@ -34,6 +35,44 @@ MERGE_BATCH_SIZE = 100
 
 # Windows-illegal filename characters (a package name becomes an output file name).
 _BAD_FILENAME_CHARS = set('\\/:*?"<>|')
+
+
+def collect_segments(manifest, ws):
+    """The ordered merge inputs from a parsed manifest (the pure core of ``run``).
+
+    Keeps only ``ok`` entries whose file actually exists at the resolved location, in
+    manifest order, and re-orders by index so the merged file always matches the
+    original JSON order. Each stored path is resolved against the *current* workspace
+    root ``ws`` (relative form; a legacy absolute value still works, and one invalidated
+    by a workspace move is recovered best-effort) — a value that resolves to nothing
+    (or a missing file) counts as ``missing`` and is skipped. The worker receives
+    absolute paths (the transient segments file carries no location dependence on disk).
+
+    Returns ``(segs, missing)``.
+    """
+    segs = []
+    missing = 0
+    for m in manifest:
+        if not m.get("ok"):
+            continue
+        raw = m.get("path") or ""
+        try:
+            p = pathio.resolve_path(raw, ws, strict=False) if (ws is not None and raw) else (Path(raw) if raw else None)
+        except (OSError, TypeError, pathio.PathOutsideWorkspace, pathio.PathNotFoundError):
+            p = None
+        if p is None or not p.exists():
+            missing += 1
+            continue
+        segs.append({
+            "index": m.get("index"),
+            "path": str(p),
+            "speaker": m.get("speaker", ""),
+            "pause_after": m.get("pause_after"),
+            "text": m.get("text", ""),
+        })
+    # Re-order by index so the merged file always matches the original JSON order.
+    segs.sort(key=lambda s: s["index"])
+    return segs, missing
 
 
 def _batch_count(n: int, size: int = MERGE_BATCH_SIZE) -> int:
@@ -73,6 +112,7 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
     top-level manifest for older projects).
     """
     layout = get_layout()
+    ws = layout.workspace
     manifest_path = _find_manifest(layout, package)
     if not manifest_path.exists():
         raise RuntimeError("未找到合成结果清单（05_audio_chunk/<包>/manifest.json）——请先运行「音频合成」。")
@@ -83,33 +123,21 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
     if not isinstance(manifest, list) or not manifest:
         raise RuntimeError("manifest.json 为空——请先运行「音频合成」。")
 
+    # Lazy migration of legacy absolute path values (and the in-memory copy follows
+    # the rewrite), so the merge works on a project whose workspace has moved.
+    _n, migrated = pathio.migrate_entries_in(manifest_path, ws, "list", ("path",))
+    manifest = migrated if migrated is not None else manifest
+
     if m4b:
         handle.log("（M4B 输出将在后续阶段支持；本次生成 MP3。）", "WARNING")
 
-    # Keep only segments that succeeded and whose file actually exists, in order.
-    segs = []
-    missing = 0
-    for m in manifest:
-        if not m.get("ok"):
-            continue
-        p = m.get("path") or ""
-        if not p or not os.path.exists(p):
-            missing += 1
-            continue
-        segs.append({
-            "index": m.get("index"),
-            "path": p,
-            "speaker": m.get("speaker", ""),
-            "pause_after": m.get("pause_after"),
-            "text": m.get("text", ""),
-        })
+    # Keep only segments that succeeded and whose file actually exists, in order
+    # (each stored path resolved against the current workspace root — see collect_segments).
+    segs, missing = collect_segments(manifest, ws)
     if not segs:
         raise RuntimeError("没有可合并的音频——音频合成未产生任何成功段落。")
     if missing:
         handle.log(f"警告：{missing} 段成功记录的文件缺失，将跳过。", "WARNING")
-
-    # Re-order by index so the merged file always matches the original JSON order.
-    segs.sort(key=lambda s: s["index"])
 
     cfg = get_config()
     t = cfg.tts
@@ -139,6 +167,10 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
         "--tmp-dir", str(tmp_dir),
         "--merge-batch-size", str(MERGE_BATCH_SIZE),
     ]
+    if ws:
+        # The workspace root, so a (transient) relative segment path resolves correctly
+        # inside the worker too (its own cwd is the project root, not the workspace).
+        cmd += ["--workspace", str(ws)]
     if cfg.ffmpeg.ffmpeg_path:
         cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
 

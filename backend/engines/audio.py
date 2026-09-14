@@ -17,6 +17,10 @@ wasm core used internally:
 The preserved invariants are the algorithmic ones: even split keeps every segment
 at/below the target; pause-snapping only ever moves *interior* boundaries, stays
 monotonic, and never changes the segment count; ``-c copy`` re-encodes nothing.
+
+A second deliberate change (user-requested): the naming format is the *complete*
+file name — the source tool prefixed the source file's base name, here a format
+like ``重活了 第 {} 集`` yields ``重活了 第 001 集.mp3`` with no prefix.
 """
 from __future__ import annotations
 
@@ -216,11 +220,12 @@ def build_aligned_plan(total_duration: float, target_input, pauses, tolerance) -
 
 # ============================ Naming ============================
 
-def output_name(index: int, file_base_name: str, naming_format: str,
-                start_number, ext: str) -> str:
-    """``原文件名 第 N 集.<ext>`` — ``{}`` in the format is the (start+index) number,
-    zero-padded to the width the user typed for the start number; without ``{}`` the
-    number is appended so files never collide."""
+def output_name(index: int, naming_format: str, start_number, ext: str) -> str:
+    """The naming format is the complete file name: its ``{}`` is the (start+index)
+    number, zero-padded to the width the user typed for the start number — the
+    source file's base name is *not* prefixed (``重活了 第 {} 集`` →
+    ``重活了 第 001 集.mp3``); without ``{}`` the number is appended so files
+    never collide."""
     digits = re.sub(r"\D", "", str(start_number or ""))
     start = int(digits) if digits else 1
     num_str = str(start + index).rjust(max(1, len(digits)), "0")
@@ -231,8 +236,7 @@ def output_name(index: int, file_base_name: str, naming_format: str,
     else:
         base = (fmt + "_" if fmt else "") + num_str
 
-    name = f"{base}.{ext}"
-    return f"{file_base_name} {name}" if file_base_name else name
+    return f"{base}.{ext}"
 
 
 # ============================ Silence parsing (pure) ============================
@@ -371,8 +375,8 @@ def detect_silences(path, total_duration: float, ffmpeg_path: str = "",
     return {"ok": True, "pauses": pauses}
 
 
-def cut_segments(path, segments, out_dir, file_base_name: str, naming_format: str,
-                 start_number, ffmpeg_path: str = "", ext: str = "mp3",
+def cut_segments(path, segments, out_dir, naming_format: str, start_number,
+                 ffmpeg_path: str = "", ext: str = "mp3",
                  on_progress: Optional[Callable] = None,
                  should_cancel: Optional[Callable] = None,
                  on_log: Optional[Callable] = None) -> list:
@@ -391,7 +395,7 @@ def cut_segments(path, segments, out_dir, file_base_name: str, naming_format: st
         if should_cancel and should_cancel():
             raise TaskCancelled()
 
-        name = output_name(i, file_base_name, naming_format, start_number, ext)
+        name = output_name(i, naming_format, start_number, ext)
         out_path = out_dir / name
         cmd = [ffmpeg, "-y",
                "-ss", _fmt_num(seg["start"]),

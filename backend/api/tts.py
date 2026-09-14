@@ -13,11 +13,13 @@ down (requirement #7).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from ..core import pathio
 from ..core.paths import ALL_PARSED_JSON, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from ..core.tasks import get_task_manager
 from ..engines import merge as Merge
@@ -216,6 +218,11 @@ def list_voices(script: str | None = None) -> dict:
                 voice_config = loaded
         except Exception:  # noqa: BLE001
             voice_config = {}
+        # Lazy migration of legacy absolute ref_audio values (the file is rewritten in the
+        # workspace-relative form on first read after the upgrade).
+        _n, migrated = pathio.migrate_entries_in(vc_path, layout.workspace, "dict", ("ref_audio",))
+        if migrated is not None:
+            voice_config = migrated
 
     names = order if has_script else list(voice_config.keys())
     speakers: list[dict] = []
@@ -227,15 +234,17 @@ def list_voices(script: str | None = None) -> dict:
         preview = ""
         ref = entry.get("ref_audio", "")
         if ref:
+            # Resolved against the current workspace root (relative form; a legacy absolute
+            # value still works) so the preview keeps working after the workspace moves.
             try:
-                p = Path(ref)
-                if p.exists():
-                    try:
-                        preview = str(p.relative_to(out_voices))
-                    except ValueError:
-                        preview = str(p)
-            except Exception:  # noqa: BLE001
-                pass
+                p = pathio.resolve_path(ref, layout.workspace, strict=False)
+            except pathio.PathOutsideWorkspace:
+                p = None
+            if p is not None and p.exists():
+                try:
+                    preview = str(p.relative_to(out_voices)).replace(os.sep, "/")
+                except ValueError:
+                    preview = str(p)
         speakers.append({
             "name": sp,
             "line_count": counts.get(sp, 0),

@@ -184,19 +184,20 @@ def test_build_aligned_plan_single_segment():
 # =========================================================================== #
 
 def test_output_name_brace():
-    assert A.output_name(0, "故事", "第 {} 集", "1", "mp3") == "故事 第 1 集.mp3"
-    assert A.output_name(2, "故事", "第 {} 集", "1", "mp3") == "故事 第 3 集.mp3"
-    assert A.output_name(0, "", "第 {} 集", "1", "mp3") == "第 1 集.mp3"
+    # the naming format is the complete file name — no source-file prefix
+    assert A.output_name(0, "第 {} 集", "1", "mp3") == "第 1 集.mp3"
+    assert A.output_name(2, "第 {} 集", "1", "mp3") == "第 3 集.mp3"
+    assert A.output_name(0, "重活了 第 {} 集", "1", "mp3") == "重活了 第 1 集.mp3"
 
 
 def test_output_name_no_brace_appends():
-    assert A.output_name(0, "故事", "EP", "1", "mp3") == "故事 EP_1.mp3"
-    assert A.output_name(0, "故事", "", "1", "mp3") == "故事 1.mp3"
+    assert A.output_name(0, "EP", "1", "mp3") == "EP_1.mp3"
+    assert A.output_name(0, "", "1", "mp3") == "1.mp3"
 
 
 def test_output_name_non_numeric_start():
-    assert A.output_name(0, "", "第 {} 集", "abc", "mp3") == "第 1 集.mp3"
-    assert A.output_name(0, "", "第 {} 集", "10x", "mp3") == "第 10 集.mp3"
+    assert A.output_name(0, "第 {} 集", "abc", "mp3") == "第 1 集.mp3"
+    assert A.output_name(0, "第 {} 集", "10x", "mp3") == "第 10 集.mp3"
 
 
 # =========================================================================== #
@@ -280,10 +281,10 @@ def test_cut_segments_lossless_copy(tmp_path):
     _run_mp3(src, "-f", "lavfi", "-i", "sine=frequency=440:duration=6")
     segs = A.build_plan(6.0, "2")["segments"]  # 3 × 2s
     out = tmp_path / "out"
-    results = A.cut_segments(src, segs, out, "故事", "第 {} 集", "1", "", "mp3")
+    results = A.cut_segments(src, segs, out, "重活了 第 {} 集", "1", "", "mp3")
 
     assert len(results) == 3
     for i, r in enumerate(results):
-        assert r["name"] == f"故事 第 {i + 1} 集.mp3"
+        assert r["name"] == f"重活了 第 {i + 1} 集.mp3"
         assert Path(r["path"]).exists()
         assert Path(r["path"]).stat().st_size > 0

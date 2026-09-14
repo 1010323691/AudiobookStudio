@@ -134,6 +134,21 @@ async function doProbe() {
   }
 }
 
+// Remember the card's parameters in the persisted (workspace) config, so the next
+// visit starts from what was last used. Fire-and-forget: a save failure must never
+// break the action that used the parameters (same pattern as TextFormat / BatchTTS).
+function rememberParams() {
+  void settings.save({
+    audio: {
+      target_duration: targetDuration.value,
+      smart_align: smartAlign.value,
+      align_tolerance: tolerance.value,
+      naming_format: namingFormat.value,
+      start_number: startNumber.value,
+    },
+  })
+}
+
 async function buildPlan() {
   if (!file.value || busyPlan.value) return
   busyPlan.value = true
@@ -152,6 +167,7 @@ async function buildPlan() {
     } else {
       const r = await planAudio(file.value.path, targetDuration.value)
       plan.value = { segments: r.segments, count: r.count, aligned: false, snapped: 0, fallbacks: 0 }
+      rememberParams()
     }
   } catch (e: any) {
     error.value = e?.message || '生成方案失败'
@@ -171,6 +187,7 @@ watch(
       const r = t.result as AudioSilencesResult
       plan.value = { segments: r.segments, count: r.count, aligned: true, snapped: r.snapped, fallbacks: r.fallbacks }
       planTaskId.value = null
+      rememberParams()
       toast({ title: '智能方案已生成', variant: 'success', description: `停顿吸附 ${r.snapped} 处，回退 ${r.fallbacks} 处` })
     } else if (st === 'failed') {
       error.value = t.error || '停顿检测失败'
@@ -194,6 +211,8 @@ async function doCut() {
     })
     cutTaskId.value = task_id
     await taskStore.refresh()
+    // Remember the cut parameters (fire-and-forget; the cut above already carries them).
+    rememberParams()
     // Completion is handled by the watcher on cutTask.status.
   } catch (e: any) {
     error.value = e?.message || '启动切割失败'
@@ -320,6 +339,7 @@ function download(path: string) {
     <Card>
       <CardHeader>
         <CardTitle>切割参数</CardTitle>
+        <span class="text-xs text-muted-foreground">生成方案 / 切割时自动记住到工程配置</span>
       </CardHeader>
       <CardContent>
         <div class="grid gap-4 sm:grid-cols-2">
@@ -340,9 +360,8 @@ function download(path: string) {
           </div>
           <div class="flex items-center gap-3">
             <Label class="w-24 shrink-0">命名格式</Label>
-            <Input v-model="namingFormat" placeholder="第 {} 集" class="max-w-[160px]" />
-            <span class="text-xs text-muted-foreground">{}</span>
-            <span class="text-xs text-muted-foreground">为编号</span>
+            <Input v-model="namingFormat" placeholder="书名 第 {} 集" class="max-w-[160px]" />
+            <span class="text-xs text-muted-foreground">完整文件名，{} 为编号</span>
           </div>
           <div class="flex items-center gap-3">
             <Label class="w-24 shrink-0">起始编号</Label>

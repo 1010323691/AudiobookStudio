@@ -39,9 +39,9 @@ class ProbeRequest(BaseModel):
 @router.post("/probe")
 def probe(req: ProbeRequest) -> dict:
     cfg = get_config()
-    p = Path(req.path)
-    if not p.exists() or not p.is_file():
-        raise HTTPException(400, "文件不存在。")
+    p = _common.resolve_inbound_path(req.path, label="音频文件")
+    if not p.is_file():
+        raise HTTPException(400, "不是一个文件。")
     duration, err = A.probe_duration(p, cfg.ffmpeg.ffprobe_path)
     if err or not (duration > 0):
         raise HTTPException(400, f"无法读取音频时长：{err}")
@@ -67,7 +67,9 @@ def plan(req: PlanRequest) -> dict:
     """Quick even-split preview (the aligned plan comes from the ``/silences`` task)."""
     cfg = get_config()
     target = req.target_duration or cfg.audio.target_duration
-    p = Path(req.path)
+    p = _common.resolve_inbound_path(req.path, label="音频文件")
+    if not p.is_file():
+        raise HTTPException(400, "不是一个文件。")
     duration, err = A.probe_duration(p, cfg.ffmpeg.ffprobe_path)
     if err or not (duration > 0):
         raise HTTPException(400, f"无法读取时长：{err}")
@@ -87,9 +89,12 @@ def plan(req: PlanRequest) -> dict:
 
 def _silences_worker(handle, path, target, tolerance, ffmpeg_path, ffprobe_path) -> dict:
     """Probe → detect pauses (streamed, cancellable) → pause-aligned plan."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        raise RuntimeError("输入文件不存在。")
+    try:
+        p = _common.resolve_inbound_path(path, label="音频文件")
+    except HTTPException as e:
+        raise RuntimeError(str(e.detail))
+    if not p.is_file():
+        raise RuntimeError("输入不是一个文件。")
     handle.progress(0.02, "读取时长")
     duration, err = A.probe_duration(p, ffprobe_path)
     if err or not (duration > 0):
@@ -129,9 +134,12 @@ def _cut_worker(handle, path, target, smart_align, tolerance, naming, start_numb
                 ffmpeg_path, ffprobe_path, ext, segments=None) -> dict:
     """Cut to the workspace's ``07_output/``. Reuses a client-supplied plan if given;
     otherwise probes (and re-detects pauses for smart-align) to build one."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        raise RuntimeError("输入文件不存在。")
+    try:
+        p = _common.resolve_inbound_path(path, label="音频文件")
+    except HTTPException as e:
+        raise RuntimeError(str(e.detail))
+    if not p.is_file():
+        raise RuntimeError("输入不是一个文件。")
 
     handle.progress(0.02, "读取时长")
     duration, err = A.probe_duration(p, ffprobe_path)
@@ -169,7 +177,7 @@ def _cut_worker(handle, path, target, smart_align, tolerance, naming, start_numb
     out_dir = get_layout().output / base
     handle.progress(0.32, "开始切割")
     files = A.cut_segments(
-        p, segments, out_dir, base, naming, start_number,
+        p, segments, out_dir, naming, start_number,
         ffmpeg_path, ext,
         on_progress=lambda f: handle.progress(0.32 + f * 0.66, f"切割 {int(f * 100)}%"),
         should_cancel=handle.cancelled,
@@ -264,9 +272,9 @@ def zip_files(req: ZipRequest) -> dict:
     base = (req.base or "").strip() or "audio"
     entries = []
     for spec in req.files:
-        p = Path(spec.path)
-        if not p.exists() or not p.is_file():
-            raise HTTPException(400, f"文件不存在：{spec.name or p.name}")
+        p = _common.resolve_inbound_path(spec.path, label=f"文件 {spec.name or ''}".strip())
+        if not p.is_file():
+            raise HTTPException(400, f"不是一个文件：{spec.name or p.name}")
         entries.append((spec.name or p.name, p))
     # 打包 zip 与分集产物同处一个按源命名的子文件夹（07_output/<base>/）。
     out_dir = layout.output / base
@@ -288,18 +296,18 @@ def export_to_source(req: ExportRequest) -> dict:
     """Copy the cut files into a ``分集`` folder created beside the source audio, so
     the results land in the user's own folder next to the original file."""
     _common.require_workspace()
-    src = Path(req.source_path)
-    if not src.exists() or not src.is_file():
-        raise HTTPException(400, "源音频文件不存在。")
+    src = _common.resolve_inbound_path(req.source_path, label="源音频文件")
+    if not src.is_file():
+        raise HTTPException(400, "源音频不是一个文件。")
     if not req.files:
         raise HTTPException(400, "没有可输出的文件。")
     dest_dir = src.parent / "分集"
     dest_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for spec in req.files:
-        p = Path(spec.path)
-        if not p.exists() or not p.is_file():
-            raise HTTPException(400, f"文件不存在：{spec.name or p.name}")
+        p = _common.resolve_inbound_path(spec.path, label=f"文件 {spec.name or ''}".strip())
+        if not p.is_file():
+            raise HTTPException(400, f"不是一个文件：{spec.name or p.name}")
         name = spec.name or p.name
         if Path(name).name != name:  # a crafted name must not escape 分集/
             raise HTTPException(400, f"非法文件名：{name}")

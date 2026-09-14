@@ -317,15 +317,6 @@ export interface AppConfig {
     align_tolerance: number
   }
   tts: {
-    enabled: boolean
-    model: string
-    base_model: string
-    design_model: string
-    speaker: string
-    language: string
-    device: string
-    pause_between_speakers_ms: number
-    pause_same_speaker_ms: number
     /** 角色配音·阶段 2（克隆）的并行 TTS 子进程数。 */
     parallel_workers: number
     /** 音频合成（一键合成）的「批内段数」上限（只是上限，不是固定并发数）：把多段垫成
@@ -333,13 +324,6 @@ export interface AppConfig {
      *  分档（短段跑满、长段自动降低、超长单独），并按实测显存余量实时升降。
      *  与 parallel_workers（并行子进程，角色配音·克隆）是两种不同的并行方式。 */
     batch_concurrency: number
-    /** 音频合成 batch 的可复现 seed：>=0 时每子批用「seed + 子批序号」播种（可复现，便于定位
-     *  某段特定输入导致的异常）；-1 = 随机。 */
-    batch_seed: number
-    api_base: string
-    api_key: string
-    voice: string
-    concurrency: number
   }
   llm: {
     base_url: string
@@ -376,8 +360,6 @@ export interface AppConfig {
     /** Max files parsed in parallel (LLM jobs); the rest queue behind a shared gate. */
     max_concurrency: number
   }
-  ffmpeg: { ffmpeg_path: string; ffprobe_path: string }
-  log: { level: string }
   ui: { theme: string }
 }
 
@@ -397,6 +379,8 @@ export interface WorkspaceInfo {
   set: boolean
   /** The workspace folder; empty string when no workspace is set. */
   path: string
+  /** Whether the pointed folder still exists on disk (false = moved/deleted → re-select). */
+  exists?: boolean
   /** True when no user workspace is set yet (pipeline is locked). */
   is_default: boolean
   /** Artifact directory name → absolute path (01_input, 02_split_text, …); empty when unset. */

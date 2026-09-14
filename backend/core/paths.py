@@ -106,8 +106,12 @@ def get_layout() -> Layout:
     """Return the Layout for the configured workspace.
 
     The workspace root (artifact dirs + logs + config) is created idempotently only
-    when a working directory is actually set — an unset workspace yields an inert
-    ``Layout(None)`` and must not plant any folders in the project directory.
+    when a working directory is actually set AND the folder still exists — an unset
+    workspace yields an inert ``Layout(None)`` and must not plant any folders in the
+    project directory. A pointer to a folder that no longer exists (the workspace was
+    moved / deleted) must NOT resurrect an empty skeleton at the old location either:
+    the dashboard then reports the missing folder (``exists: false``) and the write
+    endpoints refuse with a clear 409 until the user re-selects the (moved) folder.
     Relative ``working_dir`` values resolve against ``PROJECT_ROOT``.
     """
     from .config import _workspace_path  # local import to avoid a cycle
@@ -116,7 +120,11 @@ def get_layout() -> Layout:
     if workspace is None:
         return Layout(None)
     layout = Layout(workspace)
-    layout.ensure()
+    if workspace.exists():
+        # Live folder (newly created by the workspace endpoint, or an existing
+        # project) -> create any missing subdirs. A missing folder is the stale-
+        # pointer case: stay inert so nothing is planted at the old location.
+        layout.ensure()
     return layout
 
 

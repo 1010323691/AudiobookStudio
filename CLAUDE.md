@@ -25,7 +25,7 @@ AudiobookStudio 是一个 Web 应用，在一个地方完成中文有声书的�
 # 启动 API（macOS / Linux）
 python -m backend.main
 
-# 运行整个测试套件（164 个测试）—— 在项目根目录运行
+# 运行整个测试套件（363 个测试）—— 在项目根目录运行
 .venv/Scripts/python -m pytest backend/tests/ -v
 # 单个文件
 .venv/Scripts/python -m pytest backend/tests/test_book.py -v
@@ -63,7 +63,8 @@ npm run preview     # 预览构建产物
 
 - **`backend/main.py`** — FastAPI 应用入口。注册所有路由、全开放的 CORS（仅面向本地客户端）、`GET /api/health`，以及一个兜底的 SPA 路由来托管 `dist/`（**注册在最后**，因此每个 `/api/...` 路由都优先命中；未知的 `/api/*` 返回真实的 404，而不是 SPA 外壳）。
 - **`backend/core/`** — 共享基础设施：
-  - `paths.py` — `Layout`（单根）：一切跟随用户选择的工作空间根（`paths.working_dir` = 根 `app.json` 里的指针），持有 `00_temp/` … `07_output/`（八个管线目录）外加 `config/` + `logs/`（工程自己的配置与日志）。`ensure()` 仅当设置了工作空间时执行（只 `mkdir exist_ok`，绝不删除 / 覆盖）；未设置时返回惰性 `Layout(None)`（所有路径属性为 `None`，不落地任何目录）。未设置工作空间时流水线锁定：后端写端点统一经 `require_workspace()`（`api/_common.py`）返回 409，前端以同一条件禁用入口；工作空间在开始页经 `GET/PUT /api/workspace` 设置 / 清除（只读端点不受影响）。
+  - `paths.py` — `Layout`（单根）：一切跟随用户选择的工作空间根（`paths.working_dir` = 根 `app.json` 里的指针），持有 `00_temp/` … `07_output/`（八个管线目录）外加 `config/` + `logs/`（工程自己的配置与日志）。`get_layout()` 仅当设置了工作空间**且该文件夹仍存在**时 `ensure()`（只 `mkdir exist_ok`，绝不删除 / 覆盖）；未设置时返回惰性 `Layout(None)`，指针指向的文件夹已不存在（工程被移动 / 删除）时同样保持惰性——**不在旧位置重建空骨架**，由 `GET /api/workspace` 的 `exists: false` 与 `require_workspace()` 的 409 明确告知用户重新选择。未设置工作空间时流水线锁定：后端写端点统一经 `require_workspace()`（`api/_common.py`）返回 409，前端以同一条件禁用入口；工作空间在开始页经 `GET/PUT /api/workspace` 设置 / 清除（只读端点不受影响）。
+  - `pathio.py` — **路径序列化 / 解析的统一入口**（工程可整体搬家的承重墙）：工作目录**内部**的文件路径在成果物 JSON（`05_audio_chunk/<包>/manifest.json[].path`、`04_voice_profiles/voice_config.json[].ref_audio` 等）中一律存**相对工作目录根**的正斜杠形式（如 `05_audio_chunk/s/0001.mp3`）；运行时一切读取都经 `resolve_path(值, 当前工作目录根)` 解析，绝不假设工作目录固定在某磁盘位置。明确属于用户外部位置的资源（`ffmpeg.ffmpeg_path` / `ffprobe_path`、工作目录指针本身）**保持绝对路径、永不转换**——`to_workspace_relative` 对工作目录外的值返回 `None` 即此约定。旧 JSON 的绝对路径透明兼容：落在当前工作目录内 → 读取时按原值解析、加载 / 保存时**幂等地**迁移为相对形式（`migrate_entries_in` 会重写文件并返回已迁移的数据）；工程移动后旧绝对路径失效 → 按「原目录结构尾部（首个 `01_input/`…`07_output/`、`logs/`、`config/` 之后）重锚 → 全目录唯一文件名」两级恢复，恢复不了才抛**清晰**错误（`PathNotFoundError`，提示重新选择工作目录），绝不静默失败。API 响应中的路径仍为绝对路径（前端是瘦客户端，直接拿绝对路径回传 / 拼接下载 URL）；给 `.venv-tts` worker 的临时清单（`00_temp/merge_segments_*.json`）同样带绝对路径（用完即删，不持久化）——worker 另经 `--workspace` 参数拿到工作目录根，以便解析 voice_config 里的相对 `ref_audio`。`config.py` 的 `paths.working_dir` 在读取时按根指针自愈、在 `update_config` 保存时强制为当前工作空间。
   - `config.py` — 持久化 JSON 配置，拆成两个文件：根 `app.json` = **通用配置模板 + 工作空间指针**（`paths.working_dir` 是唯一允许在根级写入的字段，其余字段只读，作为新工作空间的种子）；`<workspace>/config/app.json` = **当前工程独立配置**（设置工作空间时从根模板复制，已存在则不覆盖；此后所有读写都只针对它，`update_config` 绝不改根模板，并把 `working_dir` 强制为该工作空间）。Pydantic 模型，线程安全（`RLock`）；根文件缺失时由代码默认值自动种子（全新克隆）。
   - `tasks.py` — 异步**任务系统**（见下文）。
   - `logging_setup.py` — 日志跟随工作空间：轮转文件 handler 写入 `<workspace>/logs/app.log`，可在运行时重定向（设置 / 清除工作空间时）；未设置工作空间时仅控制台（不落地文件）。级别取自配置。

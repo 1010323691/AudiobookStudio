@@ -23,6 +23,7 @@ import time
 import uuid
 from pathlib import Path
 
+from ..core import pathio
 from ..core.config import get_config
 from ..core.paths import get_layout, resolve_parsed_json
 from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, WorkerWatchdogTimeout, resolve_engine, run_worker
@@ -50,13 +51,16 @@ def clamp_concurrency(n) -> int:
 
 
 def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
-               model, base_model, design_model, ffmpeg_path, concurrency, seed) -> list:
+               model, base_model, design_model, ffmpeg_path, concurrency, seed,
+               workspace=None) -> list:
     """The one-shot ``.venv-tts`` batch command (pure; factored out for testing).
 
     ``--concurrency`` is always present (a clamped int) — the worker's *per-batch ceiling*
     (the length bands + measured VRAM governor set the actual size); ``--seed`` (-1 = random)
     makes a run reproducible. Empty model ids are omitted so the worker falls back to its own
-    (identical) defaults.
+    (identical) defaults. ``--workspace`` hands the worker the workspace root so the
+    workspace-relative ``ref_audio`` values in ``voice_config.json`` resolve correctly there
+    (the worker's own cwd is the project root, not the workspace).
     """
     cmd = [
         str(python), str(worker),
@@ -69,6 +73,8 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
         "--concurrency", str(concurrency),
         "--seed", str(seed),
     ]
+    if workspace:
+        cmd += ["--workspace", str(workspace)]
     if model:
         cmd += ["--model", model]
     if base_model:
@@ -186,6 +192,11 @@ def load_manifest(out_dir) -> dict:
         return {}
     if not isinstance(data, list):
         return {}
+    # Lazy migration: legacy manifests stored absolute paths (the workspace's location at
+    # write time). Convert any that still point inside the workspace to the relative form
+    # and rewrite the file, so the project keeps working after the workspace moves.
+    _n, migrated = pathio.migrate_entries_in(p, get_layout().workspace, "list", ("path",))
+    data = migrated if migrated is not None else data
     by_index = {}
     for e in data:
         if isinstance(e, dict) and "index" in e:
@@ -200,15 +211,25 @@ def is_done(entry) -> bool:
     """Whether a manifest entry is a *completed* segment: ``ok`` AND its file still on disk.
 
     A missing file (deleted, or a run killed between writing the file and its line being
-    drained) means the segment is not truly done, so a resume re-synthesizes it.
+    drained) means the segment is not truly done, so a resume re-synthesizes it. The path
+    value is resolved against the *current* workspace root (relative form; a legacy
+    absolute value still works, and one invalidated by a workspace move is recovered
+    best-effort) — never against a fixed location.
     """
     if not entry or not entry.get("ok"):
         return False
     path = entry.get("path")
     if not path:
         return False
+    ws = get_layout().workspace
     try:
-        return Path(path).exists()
+        p = pathio.resolve_path(path, ws, strict=False) if ws is not None else Path(path)
+    except (OSError, TypeError, pathio.PathOutsideWorkspace, pathio.PathNotFoundError):
+        return False
+    if p is None:
+        return False
+    try:
+        return p.exists()
     except (OSError, TypeError):
         return False
 
@@ -228,7 +249,17 @@ def plan_to_synthesize(all_indices, done_set, indices=None, force_all=False):
     return all_set - set(done_set)
 
 
-def build_manifest(all_segments, old_entries, run_results):
+def _store_path(path, root):
+    """The manifest's on-disk form of an audio path: workspace-relative when the file
+    lives inside the workspace (the location-independent form), the value unchanged when
+    it does not (an external resource keeps its absolute path)."""
+    if not path or root is None:
+        return path
+    rel = pathio.to_workspace_relative(path, root)
+    return path if rel is None else rel
+
+
+def build_manifest(all_segments, old_entries, run_results, root=None):
     """Rebuild the package manifest: one entry per non-empty segment, in index order.
 
     For each segment this run's result wins; else a prior *done* entry is preserved (its existing
@@ -236,6 +267,11 @@ def build_manifest(all_segments, old_entries, run_results):
     (``ok: false``, empty path) reusing a prior failure's reason when there is one. The same
     function powers both the incremental (per-segment) writes and the final write, so the file
     always holds the cumulative state and a cancel never loses finished work.
+
+    ``root`` (the workspace root) gives every stored path the location-independent,
+    workspace-relative form; with ``None`` (or for out-of-workspace paths) the value is
+    stored as given. Passing the live root also migrates any legacy absolute value a
+    preserved old entry still carries.
     """
     manifest = []
     for s in sorted(all_segments, key=lambda x: x["index"]):
@@ -249,13 +285,15 @@ def build_manifest(all_segments, old_entries, run_results):
         r = run_results.get(index)
         if r is not None:
             if r.get("ok"):
-                manifest.append({**base, "path": r.get("path", ""), "ok": True, "reason": ""})
+                manifest.append({**base, "path": _store_path(r.get("path", ""), root),
+                                 "ok": True, "reason": ""})
             else:
                 manifest.append({**base, "path": "", "ok": False, "reason": r.get("reason", "")})
         else:
             old = old_entries.get(index)
             if old is not None and is_done(old):
-                manifest.append({**base, "path": old.get("path", ""), "ok": True, "reason": ""})
+                manifest.append({**base, "path": _store_path(old.get("path", ""), root),
+                                 "ok": True, "reason": ""})
             elif old is not None:
                 manifest.append({**base, "path": "", "ok": False, "reason": old.get("reason", "")})
             else:
@@ -302,9 +340,12 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
     src = resolve_parsed_json(script)
     script = _load_script(src)
 
+    layout = get_layout()
+    ws = layout.workspace
+
     # voice_config is optional here — a character missing from it becomes a clear
     # per-segment error (the run continues), not a crash.
-    vc_path = get_layout().voice_profiles / "voice_config.json"
+    vc_path = layout.voice_profiles / "voice_config.json"
     voice_config = {}
     if vc_path.exists():
         try:
@@ -313,8 +354,12 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
                 voice_config = loaded
         except Exception as e:  # noqa: BLE001
             handle.log(f"voice_config.json 无法解析（{e}）——相关角色将失败。", "WARNING")
+        # Lazy migration of legacy absolute ref_audio values (the worker resolves the
+        # relative form against --workspace, so the file must be rewritten before spawn).
+        _n, migrated_vc = pathio.migrate_entries_in(vc_path, ws, "dict", ("ref_audio",))
+        if isinstance(migrated_vc, dict):
+            voice_config = migrated_vc
 
-    layout = get_layout()
     out_dir = layout.audio_chunk / package_for(src)
     manifest_path = out_dir / "manifest.json"
 
@@ -343,7 +388,7 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
     # without spawning the engine (no wasted model load).
     if run_total == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
-        _write_manifest_file(manifest_path, build_manifest(all_segments, old_entries, {}))
+        _write_manifest_file(manifest_path, build_manifest(all_segments, old_entries, {}, root=ws))
         done = count_completion(all_segments, old_entries)["completed"]
         handle.log(f"已全部完成，无需合成（{done}/{len(all_segments)} 段）。")
         handle.progress(1.0, "完成")
@@ -392,7 +437,7 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
 
     def _write_manifest() -> None:
         # The cumulative manifest, flushed after every segment so a cancel keeps what finished.
-        _write_manifest_file(manifest_path, build_manifest(all_segments, old_entries, seg_results))
+        _write_manifest_file(manifest_path, build_manifest(all_segments, old_entries, seg_results, root=ws))
 
     def on_line(line: str) -> None:
         if line.startswith("[segment]"):
@@ -431,6 +476,7 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
             language=t.language, device=t.device,
             model=t.model, base_model=t.base_model, design_model=t.design_model,
             ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
+            workspace=ws,
         )
         in_flight.clear()  # a fresh child starts with an empty in-flight set
         try:
