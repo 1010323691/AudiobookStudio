@@ -583,7 +583,7 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
         handle.log(f"chunk {chunk_num} 响应无法解析为 JSON（attempt {attempt + 1}）", "WARNING")
         handle.log(f"JSON preview: {json_text[:300]}...", "WARNING")
         if attempt < max_retries:
-            handle.log("Retrying with lower temperature...")
+            handle.log("Retrying (same sampling parameters)...")
 
         # Last resort: extract individual valid entries with regex.
         salvaged_entries = salvage_json_entries(json_text)

@@ -22,6 +22,7 @@ from ..core.config import PromptsConfig, get_config
 from ..core.concurrency import set_concurrency
 from ..core.paths import get_layout
 from ..core.tasks import get_task_manager
+from ..engines import mix_check as M
 from ..engines import script as S
 from ..engines import speaker_check as C
 from ..engines.script_prompts import load_default_prompts
@@ -63,13 +64,19 @@ def _resolve_split_file(name: str) -> Path:
     return candidate
 
 
-def _resolve_parsed_file(name: str) -> Path:
-    """Resolve a ``03_parsed_json`` base file name to an absolute path, rejecting traversal.
+def _resolve_parsed_file(name: str, prefer_latest: bool = False) -> Path:
+    """Resolve a ``03_parsed_json`` file name to an absolute path, rejecting traversal.
 
     The frontend sends the base ``<stem>.json`` name of an already-parsed chapter. A name
     that already ends in ``_checked.json`` is reduced to its base, so re-checking re-derives
     from the original and never yields ``..._checked_checked.json``. Anything that resolves
     outside ``03_parsed_json`` is refused.
+
+    ``prefer_latest`` (角色匹配检查): when the ``_checked`` artifact exists and is NOT older
+    than the base (mtime guard — a re-parse leaves a stale ``_checked`` behind, which must
+    not shadow the fresh base), it is returned so the stage updates the mix check's output
+    in place; otherwise the base is returned (the stage then (re)creates ``_checked``).
+    段落混合检查 always passes ``prefer_latest=False`` — it re-derives from the pristine base.
     """
     if name.endswith("_checked.json"):
         name = name[: -len("_checked.json")] + ".json"
@@ -83,6 +90,14 @@ def _resolve_parsed_file(name: str) -> Path:
         raise HTTPException(400, f"非法文件路径：{name}")
     if not candidate.is_file():
         raise HTTPException(400, f"文件不存在：{name}")
+    if prefer_latest:
+        checked = candidate.with_name(candidate.stem + "_checked.json")
+        if checked.is_file():
+            try:
+                if checked.stat().st_mtime >= candidate.stat().st_mtime:
+                    return checked
+            except OSError:
+                pass  # unreadable stat → fall back to the base
     return candidate
 
 
@@ -124,11 +139,13 @@ class CheckFilesRequest(BaseModel):
 
 @router.post("/check-files")
 def check_files(req: CheckFilesRequest) -> dict:
-    """Start one Speaker-check Task per selected parsed file (``<stem>.json``).
+    """Start one 角色匹配检查 Task per selected parsed file (``<stem>.json``).
 
     Each file is re-judged entry-by-entry (a ``±N`` context window per entry,
-    ``N = speaker_check.context_window``) and written to ``<stem>_checked.json`` — the
-    original ``<stem>.json`` is never modified. Bounded by the shared concurrency gate
+    ``N = speaker_check.context_window``). Input = the ``_checked`` artifact when it is
+    fresh (the 段落混合检查's output; mtime ≥ the base), else the base; the result updates
+    ``<stem>_checked.json`` IN PLACE, changing only ``speaker`` — the original
+    ``<stem>.json`` is never modified. Bounded by the shared concurrency gate
     (``config.generation.max_concurrency``). Returns the created task ids so the UI can
     stream each one over SSE.
     """
@@ -140,11 +157,45 @@ def check_files(req: CheckFilesRequest) -> dict:
     set_concurrency(cfg.generation.max_concurrency)  # share the LLM gate with parsing
     created = []
     for name in names:
-        path = _resolve_parsed_file(name)
+        path = _resolve_parsed_file(name, prefer_latest=True)
         task = get_task_manager().create(
-            "speaker-check", f"Speaker 检查（{name}）",
+            "speaker-check", f"角色匹配检查（{name}）",
             C.check_file,
             str(path), cfg.llm, cfg.speaker_check, cfg.generation,
         )
+        created.append({"file": name, "task_id": task.id})
+    return {"task_ids": [c["task_id"] for c in created], "files": created}
+
+
+class MixFilesRequest(BaseModel):
+    files: list[str]  # 03_parsed_json 下的基文件名 <stem>.json（不含路径）
+
+
+@router.post("/mix-files")
+def mix_files(req: MixFilesRequest) -> dict:
+    """Start one 段落混合检查 Task per selected parsed file (``<stem>.json``).
+
+    Each file is audited entry-by-entry (the SAME batch geometry as 角色匹配检查 —
+    ``speaker_check.batch_size`` / ``context_window``) and rewritten to ``<stem>_checked.json``:
+    multi-subject entries (narration mixed with a character's line, or lines of 2+
+    characters) are split into separate entries in original order, and punctuation-only
+    entries are deleted (deterministically, no LLM). The original ``<stem>.json`` is never
+    modified; 角色匹配检查 later updates the same ``_checked`` file in place. Bounded by the
+    shared concurrency gate. Returns the created task ids so the UI can stream each one.
+    """
+    _common.require_workspace()
+    names = list(dict.fromkeys(req.files))  # dedupe, preserving order
+    if not names:
+        raise HTTPException(400, "请选择要混合检查的文件。")
+    cfg = get_config()
+    set_concurrency(cfg.generation.max_concurrency)  # share the LLM gate with parsing
+    created = []
+    for name in names:
+        path = _resolve_parsed_file(name)  # BASE only — the mix check re-derives from the base
+        task = get_task_manager().create(
+            "mix-check", f"段落混合检查（{name}）",
+            M.mix_check_file,
+            str(path), cfg.llm, cfg.mix_check, cfg.speaker_check, cfg.generation,
+        )  # mix (prompts) + speaker_check (batch geometry, shared by design) + generation
         created.append({"file": name, "task_id": task.id})
     return {"task_ids": [c["task_id"] for c in created], "files": created}

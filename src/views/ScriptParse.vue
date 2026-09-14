@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
-import { generateScriptFiles, checkScriptFiles } from '@/api/script'
+import { generateScriptFiles, checkScriptFiles, mixScriptFiles } from '@/api/script'
 import { listDir } from '@/api/files'
 import { downloadFile } from '@/utils/fileops'
 import { formatBytes } from '@/utils/format'
@@ -26,6 +26,7 @@ import {
   FileText,
   ScanText,
   ShieldCheck,
+  Scissors,
   Loader2,
   XCircle,
   CheckCircle2,
@@ -40,8 +41,8 @@ const settings = useSettingsStore()
 const taskStore = useTaskStore()
 const { workspaceSet } = useWorkspaceGate()
 
-// LLM / 生成参数 / Prompt / Speaker 检查 的配置编辑已迁移到「设置」页；本页只从
-// settings.config 读取已保存的值（用于并发数显示与模型名校验），不再本地编辑 / 保存。
+// LLM / 生成参数 / Prompt / 两项检查（混合 / 角色匹配）的配置编辑已迁移到「设置」页；本页
+// 只从 settings.config 读取已保存的值（用于并发数显示与模型名校验），不再本地编辑 / 保存。
 
 // ---- File selection (02_split_text) + per-file parse jobs ------------------------
 // The user checks one or more split .txt files; each becomes an independent backend
@@ -51,7 +52,12 @@ const { workspaceSet } = useWorkspaceGate()
 interface ParseFile extends FileItem {
   /** True when 03_parsed_json/<file-stem>.json already exists (already parsed). */
   done: boolean
-  /** True when 03_parsed_json/<file-stem>_checked.json exists (Speaker 检查 已完成). */
+  /**
+   * True when 03_parsed_json/<file-stem>_checked.json exists — the "processed" artifact
+   * shared by BOTH check stages (段落混合检查 produces it; 角色匹配检查 updates it in
+   * place). Disk can't tell which stage wrote it — the live task rows are the precise
+   * signal; this badge is the persisted fallback.
+   */
   checked: boolean
 }
 const files = ref<ParseFile[]>([])
@@ -62,12 +68,31 @@ const selected = reactive<Record<string, boolean>>({})
 const selectedNames = computed(() => files.value.filter((f) => selected[f.name]).map((f) => f.name))
 const doneCount = computed(() => files.value.filter((f) => f.done).length)
 const checkedCount = computed(() => files.value.filter((f) => f.checked).length)
-/** Selected files that are already parsed — the only ones a Speaker 检查 can run on. */
+/** Stems with a SUCCEEDED 段落混合检查 task in the current backend run — the precise
+ *  "mix check done" signal: the shared `_checked.json` on disk can't tell mix-only from
+ *  mix+match, and tasks are in-memory (backend-process lifetime), so this badge reflects
+ *  the current run only; the disk 「已处理」badge stays the persisted fallback.
+ */
+const mixDoneStems = computed(() => {
+  const stems = new Set<string>()
+  for (const t of taskStore.tasks) {
+    if (t.module !== 'mix-check' || t.status !== 'succeeded') continue
+    const inName = t.result?.input_name
+    if (typeof inName === 'string' && inName.endsWith('.json')) stems.add(inName.replace(/\.[^.]+$/, ''))
+  }
+  return stems
+})
+const mixDoneCount = computed(() => files.value.filter((f) => mixDoneStems.value.has(f.name.replace(/\.[^.]+$/, ''))).length)
+/** Row-level mix-check marker (see mixDoneStems). */
+function mixDone(f: ParseFile) {
+  return mixDoneStems.value.has(f.name.replace(/\.[^.]+$/, ''))
+}
+/** Selected files that are already parsed — the only ones either check stage can run on. */
 const checkableSelected = computed(() => files.value.filter((f) => selected[f.name] && f.done).length)
 const allSelected = computed(() => files.value.length > 0 && files.value.every((f) => selected[f.name]))
 
 const error = ref('')
-const fileJobs = ref<{ name: string; taskId: string; kind: 'parse' | 'check' }[]>([])
+const fileJobs = ref<{ name: string; taskId: string; kind: 'parse' | 'mix' | 'check' }[]>([])
 
 function jobTask(taskId: string): TaskSnapshot | undefined {
   return taskStore.tasks.find((t) => t.id === taskId)
@@ -77,7 +102,7 @@ type JobState = {
   label: string
   variant: 'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
 }
-function jobState(task: TaskSnapshot | undefined, kind: 'parse' | 'check' = 'parse'): JobState {
+function jobState(task: TaskSnapshot | undefined, kind: 'parse' | 'mix' | 'check' = 'parse'): JobState {
   if (!task) return { label: '待处理', variant: 'secondary' }
   switch (task.status) {
     case 'succeeded':
@@ -91,6 +116,7 @@ function jobState(task: TaskSnapshot | undefined, kind: 'parse' | 'check' = 'par
     case 'running':
       // Still waiting on the concurrency gate reads as "queued", not actively working.
       if (/排队/.test(task.current || '')) return { label: '待处理', variant: 'secondary' }
+      if (kind === 'mix') return { label: '混合检查中', variant: 'default' }
       return kind === 'check'
         ? { label: '检查中', variant: 'default' }
         : { label: '解析中', variant: 'default' }
@@ -102,7 +128,7 @@ function jobState(task: TaskSnapshot | undefined, kind: 'parse' | 'check' = 'par
 interface JobRow {
   name: string
   taskId: string
-  kind: 'parse' | 'check'
+  kind: 'parse' | 'mix' | 'check'
   task: TaskSnapshot | undefined
   state: JobState
   progress: number
@@ -266,7 +292,7 @@ async function startCheck() {
     .filter((f) => selected[f.name] && f.done)
     .map((f) => f.name.replace(/\.[^.]+$/, '') + '.json')
   if (!names.length) {
-    error.value = '请先勾选至少一个已完成解析（[已完成]）的文件，再开始 Speaker 检查。'
+    error.value = '请先勾选至少一个已完成解析（[已完成]）的文件，再开始角色匹配检查。'
     return
   }
   error.value = ''
@@ -275,7 +301,31 @@ async function startCheck() {
     fileJobs.value = r.files.map((f) => ({ name: f.file, taskId: f.task_id, kind: 'check' as const }))
     await taskStore.refresh()
   } catch (e: any) {
-    error.value = e?.message || '启动检查失败'
+    error.value = e?.message || '启动角色匹配检查失败'
+  }
+}
+
+async function startMixCheck() {
+  if (busy.value) return
+  if (!(settings.config?.llm.model_name || '').trim()) {
+    error.value = '请先填写 LLM 模型名称（模型不能为空）。'
+    return
+  }
+  // 与角色匹配检查同一选择门：只有已解析完成（[已完成]）的文件才能混合检查。
+  const names = files.value
+    .filter((f) => selected[f.name] && f.done)
+    .map((f) => f.name.replace(/\.[^.]+$/, '') + '.json')
+  if (!names.length) {
+    error.value = '请先勾选至少一个已完成解析（[已完成]）的文件，再开始段落混合检查。'
+    return
+  }
+  error.value = ''
+  try {
+    const r = await mixScriptFiles(names)
+    fileJobs.value = r.files.map((f) => ({ name: f.file, taskId: f.task_id, kind: 'mix' as const }))
+    await taskStore.refresh()
+  } catch (e: any) {
+    error.value = e?.message || '启动混合检查失败'
   }
 }
 
@@ -309,7 +359,8 @@ function downloadJob(row: JobRow) {
         <CardTitle class="flex items-center gap-2"><FileText class="h-5 w-5" />选择待解析文件</CardTitle>
         <CardDescription>
           列出工作空间 <code class="text-xs">02_split_text/</code> 下的分册文本，勾选要处理的分册（可多选）；
-          已生成 <code class="text-xs">03_parsed_json/</code> 的标记为「已完成」（可再次勾选以重新解析 / 跑其他流程）。
+          已生成 <code class="text-xs">03_parsed_json/</code> 的标记为「已完成」（可再次勾选以重新解析 / 跑其他流程）；
+          「已混合」= 本次运行有成功的段落混合检查任务（内存态信号，后端重启后消失）。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
@@ -336,7 +387,18 @@ function downloadJob(row: JobRow) {
             />
             <span class="min-w-0 flex-1 truncate text-sm">{{ f.name }}</span>
             <Badge v-if="f.done" variant="success" class="shrink-0">已完成</Badge>
-            <Badge v-if="f.checked" variant="secondary" class="shrink-0">已检查</Badge>
+            <Badge
+              v-if="mixDone(f)"
+              variant="outline"
+              class="shrink-0"
+              title="本次运行存在成功的「段落混合检查」任务（内存态信号，后端重启后消失；持久状态看「已处理」徽章与任务行）"
+            >已混合</Badge>
+            <Badge
+              v-if="f.checked"
+              variant="secondary"
+              class="shrink-0"
+              title="已存在 <基名>_checked.json（段落混合检查或角色匹配检查任一阶段的产物；具体进度见任务行）"
+            >已处理</Badge>
             <span class="shrink-0 text-xs text-muted-foreground">{{ formatBytes(f.size) }}</span>
           </label>
         </div>
@@ -357,7 +419,8 @@ function downloadJob(row: JobRow) {
           <span class="ml-auto text-xs text-muted-foreground">
             已选 {{ selectedNames.length }} / {{ files.length }} 个
             <span v-if="doneCount"> · 已完成 {{ doneCount }} 个</span>
-            <span v-if="checkedCount"> · 已检查 {{ checkedCount }} 个</span>
+            <span v-if="mixDoneCount"> · 已混合 {{ mixDoneCount }} 个</span>
+            <span v-if="checkedCount"> · 已处理 {{ checkedCount }} 个</span>
             · 并发 {{ settings.config?.generation.max_concurrency ?? '—' }}
           </span>
         </div>
@@ -377,18 +440,29 @@ function downloadJob(row: JobRow) {
             class="min-w-[10rem] flex-1"
             variant="secondary"
             :disabled="!checkableSelected || !workspaceSet || busy"
+            @click="startMixCheck"
+          >
+            <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
+            <Scissors v-else class="h-4 w-4" />
+            {{ busy ? '处理中…' : '开始混合检查' }}
+          </Button>
+          <Button
+            class="min-w-[10rem] flex-1"
+            variant="secondary"
+            :disabled="!checkableSelected || !workspaceSet || busy"
             @click="startCheck"
           >
             <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
             <ShieldCheck v-else class="h-4 w-4" />
-            {{ busy ? '处理中…' : '开始检查' }}
+            {{ busy ? '处理中…' : '开始角色匹配检查' }}
           </Button>
         </div>
       </CardContent>
       <CardFooter>
         <span class="text-xs text-muted-foreground">
-          解析输出：<code class="text-xs">03_parsed_json/&lt;文件基名&gt;.json</code>；
-          检查输出：<code class="text-xs">&lt;文件基名&gt;_checked.json</code>（下游流程优先读取 _checked 版本）。
+          解析输出：<code class="text-xs">03_parsed_json/&lt;文件基名&gt;.json</code>（永不改写）；
+          段落混合检查 生成 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>（多主体拆条 + 删除纯标点）；
+          角色匹配检查 在其上就地只改 speaker；下游流程优先读取 _checked 版本。
         </span>
       </CardFooter>
     </Card>
@@ -398,7 +472,7 @@ function downloadJob(row: JobRow) {
       <CardHeader>
         <CardTitle class="flex items-center gap-2"><ScanText class="h-5 w-5" />解析 / 检查进度</CardTitle>
         <CardDescription>
-          每个文件一个独立任务：待处理 / 解析中 / 检查中 / 已完成 / 失败 / 已取消；一个文件失败不影响其他。
+          每个文件一个独立任务：待处理 / 解析中 / 混合检查中 / 检查中 / 已完成 / 失败 / 已取消；一个文件失败不影响其他。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -424,9 +498,9 @@ function downloadJob(row: JobRow) {
             <Badge :variant="row.state.variant">{{ row.state.label }}</Badge>
             <span
               class="shrink-0 text-xs tabular-nums"
-              :class="['解析中', '检查中'].includes(row.state.label) ? 'text-primary' : 'text-muted-foreground'"
+              :class="['解析中', '混合检查中', '检查中'].includes(row.state.label) ? 'text-primary' : 'text-muted-foreground'"
               title="本窗口近 10 秒平均生成速度（字/s，按 LLM 流式输出实测）"
-            >{{ ['解析中', '检查中'].includes(row.state.label) ? `${Math.round(row.task?.llm_cps_10s ?? 0)} 字/s` : '—' }}</span>
+            >{{ ['解析中', '混合检查中', '检查中'].includes(row.state.label) ? `${Math.round(row.task?.llm_cps_10s ?? 0)} 字/s` : '—' }}</span>
             <span class="shrink-0 w-10 text-right text-xs text-muted-foreground">
               {{ Math.round(row.progress * 100) }}%
             </span>

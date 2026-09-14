@@ -152,6 +152,17 @@ class SpeakerCheckConfig(BaseModel):
     user_prompt: str = ""
 
 
+class MixCheckConfig(BaseModel):
+    # 段落混合检查 (post-parse, runs BEFORE 角色匹配检查) settings.
+    # NO batch_size / context_window here: the mix check deliberately shares the
+    # 角色匹配检查 geometry (``SpeakerCheckConfig.batch_size / context_window``) by
+    # design, so the two stages stay batched identically from one set of settings.
+    # Prompts are its own: empty values fall back to the bundled defaults
+    # (``backend/engines/mix_check_prompts.py`` / ``resources/default_mix_check_prompts.txt``).
+    system_prompt: str = ""
+    user_prompt: str = ""
+
+
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000  # chars per chunk sent to the LLM
     max_tokens: int = 4096  # max completion tokens per call
@@ -176,6 +187,7 @@ class AppConfig(BaseModel):
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     persona_prompts: PersonaPromptsConfig = Field(default_factory=PersonaPromptsConfig)
     speaker_check: SpeakerCheckConfig = Field(default_factory=SpeakerCheckConfig)
+    mix_check: MixCheckConfig = Field(default_factory=MixCheckConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)

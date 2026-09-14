@@ -19,10 +19,13 @@ Per batch:
   re-sample (+ 4× tie-break): a clean 2:1 now costs one retry instead of always three.
 
 Only a target entry's ``speaker`` may change — ``text``/``instruct`` and every context
-neighbour are untouched, and every window is built from the ORIGINAL speakers (a batch is
-never judged against a partially-updated one). A NEW file ``<stem>_checked.json`` is
-written once at the end; the original is never modified, and downstream stages read the
-checked copy preferentially (``resolve_parsed_json``).
+neighbour are untouched, and every window is built from the INPUT speakers (a batch is
+never judged against a partially-updated one). ``<stem>_checked.json`` is written once at
+the end: it is the "processed" artifact shared with the 段落混合检查, which runs FIRST and
+rebuilds it (splits / deletions / renumbering) from the base file; this stage then updates
+the SAME file in place (input = the fresh ``_checked`` or the base). The base
+``<stem>.json`` is never modified by either stage, and downstream stages read the checked
+copy preferentially (``resolve_parsed_json``).
 
 ``check_file`` is a Task worker (first arg is the :class:`TaskHandle`), mirroring
 ``script.generate_file``'s concurrency: it holds ONE shared-gate slot for the whole file
@@ -51,7 +54,7 @@ from .script import _llm_chat_completion, _llm_chat_completion_stream
 BATCH_SIZE = 20
 
 
-def build_batch_window(entries: list, start: int, size: int, n: int) -> list[dict]:
+def build_batch_window(entries: list, start: int, size: int, n: int, skip=None) -> list[dict]:
     """The context window for a batch of ``size`` target entries starting at ``start``.
 
     The target range ``entries[start .. start+size)`` (clamped to the file) is flagged
@@ -60,12 +63,18 @@ def build_batch_window(entries: list, start: int, size: int, n: int) -> list[dic
     ORIGINAL ``speaker``, and the ``text`` (``instruct`` is dropped to keep the window
     compact — speaker judgment does not need the voice direction). Yields the union, in
     index order, so the LLM sees the full scope of what it may reason from.
+
+    ``skip`` (optional) is a set of absolute indices inside the target range that must
+    NOT be flagged as targets (the 段落混合检查 passes its punctuation-only entries, which
+    are removed deterministically without an LLM verdict); they still appear in the window
+    unflagged, like context. ``None`` (the default) preserves the original contract.
     """
     total = len(entries)
     t_lo = max(0, start)
     t_hi = min(total, start + size)
     lo = max(0, start - n)
     hi = min(total, start + size + n)
+    skipped = frozenset(skip) if skip is not None else frozenset()
     out = []
     for j in range(lo, hi):
         item = {
@@ -73,7 +82,7 @@ def build_batch_window(entries: list, start: int, size: int, n: int) -> list[dic
             "speaker": entries[j].get("speaker", ""),
             "text": entries[j].get("text", ""),
         }
-        if t_lo <= j < t_hi:
+        if t_lo <= j < t_hi and j not in skipped:
             item["target"] = True
         out.append(item)
     return out
@@ -334,14 +343,17 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
     """Task worker: re-judge every entry's speaker in batches → ``<stem>_checked.json``.
 
     Contract: first arg is the :class:`TaskHandle`; the second is the absolute path of the
-    ORIGINAL ``<stem>.json`` in ``03_parsed_json/``. Entries are re-judged in batches of
-    ``check.batch_size`` (default 20) at a time (one LLM call each); a batch whose re-judged
+    file to check — the base ``<stem>.json`` (when no 段落混合检查 ran yet) or the mix
+    check's ``<stem>_checked.json`` (when it ran; the API layer picks the fresher of the
+    two). Entries are re-judged in batches of ``check.batch_size`` (default 20) at a time
+    (one LLM call each); a batch whose re-judged
     speakers disagree with the
     originals is resolved by dynamic majority voting (original + first check + 1–3 retries,
     stopping at the first 2:1). Concurrency
     is bounded by the shared gate (``generation.max_concurrency``) like parsing — one slot
-    held for the whole file. Only a target entry's ``speaker`` may change; the original
-    file is never modified (a new ``<stem>_checked.json`` is written once at the end).
+    held for the whole file. Only a target entry's ``speaker`` may change; the base file
+    is never modified (the ``<stem>_checked.json`` artifact is written once at the end —
+    in place when the input already is the ``_checked`` file, never double-suffixed).
     """
     # Fail fast on a misconfigured model *before* taking a concurrency slot.
     if not (llm.model_name or "").strip():
@@ -474,7 +486,9 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             handle.progress((start + size) / total, f"已检查 {start + size}/{total} 条")
 
         # Write the NEW file — the original ``<stem>.json`` is left byte-for-byte intact.
-        out_path = src.with_name(src.stem + "_checked.json")
+        # If the input already IS a ``_checked`` file (the 段落混合检查's output), update it
+        # in place — never double-suffix into ``..._checked_checked.json``.
+        out_path = src if src.name.endswith("_checked.json") else src.with_name(src.stem + "_checked.json")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 

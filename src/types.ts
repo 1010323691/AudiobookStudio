@@ -339,12 +339,17 @@ export interface AppConfig {
     user_prompt: string
     advanced_prompt: string
   }
-  /** Speaker 检查 — 每次送检段落数 + 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
+  /** 角色匹配检查 — 每次送检段落数 + 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
   speaker_check: {
-    /** 每次送检段落数：每批送入 LLM 重判的目标条数（每批再在前后各加 `context_window` 条上下文）。 */
+    /** 每次送检段落数：每批送入 LLM 重判的目标条数（每批再在前后各加 `context_window` 条上下文）。段落混合检查共用此两项。 */
     batch_size: number
-    /** 上下文窗口大小：每批送检块前后各取 N 条上下文（仅供理解、不改判）。 */
+    /** 上下文窗口大小：每批送检块前后各取 N 条上下文（仅供理解、不改判）。段落混合检查共用此两项。 */
     context_window: number
+    system_prompt: string
+    user_prompt: string
+  }
+  /** 段落混合检查 — 独立提示词；批大小 / 上下文窗口与 `speaker_check`（角色匹配检查）共用，此处不重复配置。 */
+  mix_check: {
     system_prompt: string
     user_prompt: string
   }

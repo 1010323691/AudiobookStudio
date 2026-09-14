@@ -2,8 +2,9 @@
 
 Pins the batch context-window builder, the per-target speaker parser, the majority vote,
 and the core invariants — "only ``speaker`` changes", "the original file is untouched",
-batched disagreement re-sampling (3×, then a 4× tie-break), and per-item failure
-isolation — with no network access: the LLM transport is a mocked
+disagreement voting (one first check pass, then up to 3 majority retries; a strict
+majority wins, and an entry still tied keeps its original speaker), and per-item
+failure isolation — with no network access: the LLM transport is a mocked
 ``urllib.request.urlopen`` (the same pattern ``test_script.py`` uses).
 """
 from __future__ import annotations
