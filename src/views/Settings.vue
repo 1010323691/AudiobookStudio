@@ -33,8 +33,6 @@ import {
   Server,
   SlidersHorizontal,
   MessageSquareText,
-  Scissors,
-  ShieldCheck,
   AudioLines,
 } from 'lucide-vue-next'
 
@@ -229,7 +227,7 @@ async function save() {
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><SlidersHorizontal class="h-5 w-5" />生成参数</CardTitle>
-          <CardDescription>分段大小与采样设置，作用于文本解析 / Speaker 检查的每次 LLM 请求。</CardDescription>
+          <CardDescription>分段大小与采样设置，作用于文本解析的每次 LLM 请求（含解析内校验 / 抽样）。</CardDescription>
         </CardHeader>
         <CardContent class="space-y-3">
           <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -272,6 +270,20 @@ async function save() {
               </span>
             </div>
           </div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">断句失败校验</Label>
+              <Switch v-model="draft.generation.revalidate_splits" />
+            </div>
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">纯归属标签删除</Label>
+              <Switch v-model="draft.generation.delete_saying_tags" />
+            </div>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            解析内的两个检查阶段：断句失败校验（疑似断句失败的条目逐条重判）与纯归属标签删除
+            （独立短标签条确定性删除，不经 LLM）。关闭 = 解析时跳过该阶段并记录日志。
+          </p>
         </CardContent>
       </Card>
 
@@ -289,71 +301,6 @@ async function save() {
           <div class="space-y-1.5">
             <Label>User Prompt（模板，含 <code class="text-xs">context</code> / <code class="text-xs">chunk</code> 占位符）</Label>
             <Textarea v-model="draft.prompts.user_prompt" rows="8" class="font-mono text-xs" />
-          </div>
-        </CardContent>
-      </Card>
-
-      <!-- 段落混合检查（几何与角色匹配检查共用；仅独立提示词） -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><Scissors class="h-5 w-5" />段落混合检查</CardTitle>
-          <CardDescription>
-            解析完成后先运行：把一条里混了多主体的段落按原文顺序拆开（旁白与各角色各成一条），并删除纯标点条目（本地判定、不经 LLM）；
-            结果生成 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>。只处理「多主体拆分」与「纯标点删除」，
-            不纠正单主体 <code class="text-xs">speaker</code>（那是下方角色匹配检查的职责）。
-            每次送检段落数 / 上下文窗口与「角色匹配检查」共用（在下方配置），此处只配置独立提示词。
-          </CardDescription>
-        </CardHeader>
-        <CardContent class="space-y-3">
-          <div class="space-y-1.5">
-            <Label>混合检查 System Prompt</Label>
-            <Textarea v-model="draft.mix_check.system_prompt" rows="6" class="font-mono text-xs" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>混合检查 User Prompt（模板，含 <code class="text-xs">context</code> 占位符）</Label>
-            <Textarea v-model="draft.mix_check.user_prompt" rows="6" class="font-mono text-xs" />
-          </div>
-        </CardContent>
-      </Card>
-
-      <!-- 角色匹配检查（独立于解析提示词 / 生成参数） -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><ShieldCheck class="h-5 w-5" />角色匹配检查</CardTitle>
-          <CardDescription>
-            段落混合检查之后运行：输入为较新的 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>（混合检查产物）否则基文件；
-            对每批（默认 20 条待检查段落）用「前后各 N 条」的上下文让 LLM 重新判断 <code class="text-xs">speaker</code>，
-            不同则只改 <code class="text-xs">speaker</code>，就地更新 <code class="text-xs">&lt;文件基名&gt;_checked.json</code>
-            （原始 <code class="text-xs">.json</code> 永不改写）。检查提示词与上方解析提示词完全独立；
-            每次送检段落数 / 上下文窗口同时被段落混合检查共用。
-          </CardDescription>
-        </CardHeader>
-        <CardContent class="space-y-3">
-          <div class="space-y-1.5">
-            <Label>每次送检段落数（每批送检的目标条数，段落混合检查共用）</Label>
-            <div class="flex flex-wrap items-center gap-3">
-              <Input v-model.number="draft.speaker_check.batch_size" type="number" min="1" step="1" class="max-w-[8rem]" />
-              <span class="text-xs text-muted-foreground">
-                例如 50 → 每批把 50 条待检查段落一次性送入 LLM 重判。
-              </span>
-            </div>
-          </div>
-          <div class="space-y-1.5">
-            <Label>上下文窗口大小（每批送检块前后各取 N 条，段落混合检查共用）</Label>
-            <div class="flex flex-wrap items-center gap-3">
-              <Input v-model.number="draft.speaker_check.context_window" type="number" min="0" step="1" class="max-w-[8rem]" />
-              <span class="text-xs text-muted-foreground">
-                例如 4 → 每批在送检块前后各加 4 条上下文（仅供理解、不改判），一批最多 50 + 4 + 4 = 58 条。
-              </span>
-            </div>
-          </div>
-          <div class="space-y-1.5">
-            <Label>检查 System Prompt</Label>
-            <Textarea v-model="draft.speaker_check.system_prompt" rows="6" class="font-mono text-xs" />
-          </div>
-          <div class="space-y-1.5">
-            <Label>检查 User Prompt（模板，含 <code class="text-xs">context</code> 占位符）</Label>
-            <Textarea v-model="draft.speaker_check.user_prompt" rows="6" class="font-mono text-xs" />
           </div>
         </CardContent>
       </Card>

@@ -201,19 +201,21 @@ def test_resolve_parsed_json_legacy_fallback_when_empty(sandbox, set_pointer):
     assert core_paths.resolve_parsed_json() == ws / "03_parsed_json" / "annotated_script.json"
 
 
-# -- resolve_parsed_json: Speaker-check ``_checked.json`` preference -------------
+# -- resolve_parsed_json: orphan ``_checked.json`` files are inert ----------------
+# (the retired check stages once wrote ``_checked`` copies; nothing reads them anymore)
 
-def test_resolve_parsed_json_named_prefers_checked(sandbox, set_pointer):
+def test_resolve_parsed_json_named_base_ignores_orphan_checked(sandbox, set_pointer):
     ws = sandbox / "ws"
     set_pointer(str(ws))
     d = ws / "03_parsed_json"
     d.mkdir(parents=True, exist_ok=True)
     (d / "第一册.json").write_text("[]", encoding="utf-8")
     (d / "第一册_checked.json").write_text("[]", encoding="utf-8")
-    assert core_paths.resolve_parsed_json("第一册.json") == d / "第一册_checked.json"
+    # An orphan _checked file never shadows the base: a named base file reads the base.
+    assert core_paths.resolve_parsed_json("第一册.json") == d / "第一册.json"
 
 
-def test_resolve_parsed_json_named_falls_back_when_no_checked(sandbox, set_pointer):
+def test_resolve_parsed_json_named_base_reads_base(sandbox, set_pointer):
     ws = sandbox / "ws"
     set_pointer(str(ws))
     d = ws / "03_parsed_json"
@@ -246,7 +248,7 @@ def test_resolve_parsed_json_autopick_most_recent_base_without_checked(sandbox, 
     assert core_paths.resolve_parsed_json() == b
 
 
-def test_resolve_parsed_json_autopick_uses_checked_when_present(sandbox, set_pointer):
+def test_resolve_parsed_json_autopick_ignores_orphan_checked(sandbox, set_pointer):
     ws = sandbox / "ws"
     set_pointer(str(ws))
     d = ws / "03_parsed_json"
@@ -254,15 +256,15 @@ def test_resolve_parsed_json_autopick_uses_checked_when_present(sandbox, set_poi
     a = d / "a.json"; a.write_text("[]", encoding="utf-8")
     ac = d / "a_checked.json"; ac.write_text("[]", encoding="utf-8")
     b = d / "b.json"; b.write_text("[]", encoding="utf-8")
-    # ``a`` is the most recent base (``a_checked`` is excluded from the base pool even
-    # though it is newer) and has a checked copy -> resolves to ``a_checked``.
+    # ``a`` is the most recent base; its ``a_checked`` orphan (even though newer) is
+    # inert and never shadows the base.
     os.utime(a, (10, 10))
     os.utime(ac, (20, 20))
     os.utime(b, (5, 5))
-    assert core_paths.resolve_parsed_json() == ac
+    assert core_paths.resolve_parsed_json() == a
 
 
-def test_resolve_parsed_json_autopick_only_checked(sandbox, set_pointer):
+def test_resolve_parsed_json_autopick_only_orphans_uses_legacy_fallback(sandbox, set_pointer):
     ws = sandbox / "ws"
     set_pointer(str(ws))
     d = ws / "03_parsed_json"
@@ -270,8 +272,9 @@ def test_resolve_parsed_json_autopick_only_checked(sandbox, set_pointer):
     c1 = d / "x_checked.json"; c1.write_text("[]", encoding="utf-8")
     c2 = d / "y_checked.json"; c2.write_text("[]", encoding="utf-8")
     os.utime(c1, (5, 5)); os.utime(c2, (10, 10))
-    # No base files at all -> degrade to the most recent _checked file.
-    assert core_paths.resolve_parsed_json() == c2
+    # Only orphan _checked files (no base): they are never read — the resolver falls
+    # through to the legacy single-file name.
+    assert core_paths.resolve_parsed_json() == d / "annotated_script.json"
 
 
 # -- resolve_parsed_json_all (whole-book "all files" aggregate) -----------------
@@ -302,11 +305,11 @@ def test_resolve_parsed_json_all_order_is_mtime_then_name(sandbox, set_pointer):
     dd = d / "d.json"; dd.write_text("[]", encoding="utf-8")
     os.utime(a, (30, 30)); os.utime(b, (20, 20))
     os.utime(c, (10, 10)); os.utime(dd, (5, 5))
-    # c has a _checked copy -> upgraded; the rest return their base file.
-    assert core_paths.resolve_parsed_json_all() == [dd, d / "c_checked.json", b, a]
+    # The orphan c_checked file is excluded; the base files come back in mtime order.
+    assert core_paths.resolve_parsed_json_all() == [dd, c, b, a]
 
 
-def test_resolve_parsed_json_all_orphan_checked_degrades_to_them(sandbox, set_pointer):
+def test_resolve_parsed_json_all_only_orphans_is_empty(sandbox, set_pointer):
     ws = sandbox / "ws"
     set_pointer(str(ws))
     d = ws / "03_parsed_json"
@@ -314,8 +317,8 @@ def test_resolve_parsed_json_all_orphan_checked_degrades_to_them(sandbox, set_po
     x = d / "x_checked.json"; x.write_text("[]", encoding="utf-8")
     y = d / "y_checked.json"; y.write_text("[]", encoding="utf-8")
     os.utime(x, (5, 5)); os.utime(y, (10, 10))
-    # No base files -> return the standalone _checked files (mtime order).
-    assert core_paths.resolve_parsed_json_all() == [x, y]
+    # Orphan _checked files are never part of the aggregate.
+    assert core_paths.resolve_parsed_json_all() == []
 
 
 def test_resolve_parsed_json_all_ignores_non_json_and_dirs(sandbox, set_pointer):

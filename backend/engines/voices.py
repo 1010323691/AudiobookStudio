@@ -298,8 +298,9 @@ def _llm_persona(handle, llm, system, user_template, speaker, script, bands):
 def _load_script(handle, script_name):
     """Load the parsed script: the chosen file, the most recent one, or ALL of them."""
     if script_name == ALL_PARSED_JSON:
-        # Whole-book aggregate: concatenate every 分册 (each upgraded to its _checked
-        # copy) in reading order. An unreadable/empty file is skipped — the run continues.
+        # Whole-book aggregate: concatenate every 分册's base JSON (orphan _checked
+        # leftovers are excluded by the resolver) in reading order. An unreadable/empty
+        # file is skipped — the run continues.
         script_paths = resolve_parsed_json_all()
         if not script_paths:
             raise RuntimeError("未找到脚本 JSON（03_parsed_json/）——请先在「文本解析」生成脚本。")

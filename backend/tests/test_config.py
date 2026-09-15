@@ -14,7 +14,7 @@ import pytest
 
 from backend.core import config as core_config
 from backend.core import paths as core_paths
-from backend.core.config import AppConfig, TTSConfig, _deep_update
+from backend.core.config import AppConfig, GenerationConfig, TTSConfig, _deep_update
 
 
 # --------------------------------------------------------------------------- #
@@ -51,6 +51,21 @@ def test_tts_config_keeps_legacy_fields():
     assert t.api_key == ""
     assert t.voice == ""
     assert t.concurrency == 1
+
+
+# --------------------------------------------------------------------------- #
+# GenerationConfig: in-parse check toggles (migrated off the retired check sections)
+# --------------------------------------------------------------------------- #
+
+def test_generation_config_check_stage_defaults():
+    # 断句失败校验 / 纯归属标签条清理 default ON (existing behavior unchanged); the
+    # re-judgment batch geometry moved here from the deleted ``speaker_check`` section.
+    g = GenerationConfig()
+    assert g.revalidate_splits is True
+    assert g.delete_saying_tags is True
+    assert g.check_batch_size == 20
+    assert g.check_context_window == 4
+    assert g.spot_check_rate == 0.05
 
 
 # --------------------------------------------------------------------------- #

@@ -5,8 +5,6 @@ from fastapi import APIRouter, HTTPException
 
 from ..core import config as core_config
 from ..engines.script_prompts import load_default_prompts
-from ..engines.check_prompts import load_default_check_prompts
-from ..engines.mix_check_prompts import load_default_mix_prompts
 from . import _common
 
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -26,22 +24,6 @@ def get_config() -> dict:
         prompts["system_prompt"] = load_default_prompts()[0]
     if not prompts.get("user_prompt"):
         prompts["user_prompt"] = load_default_prompts()[1]
-    # Speaker 检查 prompts are independent of the 解析 prompts — seed them separately so
-    # the page can show/edit the full check prompt on first open (response only, never
-    # written to the stored config).
-    check = data.setdefault("speaker_check", {})
-    if not check.get("system_prompt"):
-        check["system_prompt"] = load_default_check_prompts()[0]
-    if not check.get("user_prompt"):
-        check["user_prompt"] = load_default_check_prompts()[1]
-    # 段落混合检查 prompts are independent of both the 解析 and 角色匹配检查 prompts — seed
-    # them separately (response only, never written to the stored config). Its batch
-    # geometry is NOT a config of its own: it shares speaker_check's by design.
-    mix = data.setdefault("mix_check", {})
-    if not mix.get("system_prompt"):
-        mix["system_prompt"] = load_default_mix_prompts()[0]
-    if not mix.get("user_prompt"):
-        mix["user_prompt"] = load_default_mix_prompts()[1]
     return data
 
 

@@ -391,20 +391,6 @@ export interface AppConfig {
     user_prompt: string
     advanced_prompt: string
   }
-  /** 角色匹配检查 — 每次送检段落数 + 上下文窗口大小 + 独立的检查提示词（与 `prompts` 完全分离）。 */
-  speaker_check: {
-    /** 每次送检段落数：每批送入 LLM 重判的目标条数（每批再在前后各加 `context_window` 条上下文）。段落混合检查共用此两项。 */
-    batch_size: number
-    /** 上下文窗口大小：每批送检块前后各取 N 条上下文（仅供理解、不改判）。段落混合检查共用此两项。 */
-    context_window: number
-    system_prompt: string
-    user_prompt: string
-  }
-  /** 段落混合检查 — 独立提示词；批大小 / 上下文窗口与 `speaker_check`（角色匹配检查）共用，此处不重复配置。 */
-  mix_check: {
-    system_prompt: string
-    user_prompt: string
-  }
   generation: {
     chunk_size: number
     max_tokens: number
@@ -419,6 +405,14 @@ export interface AppConfig {
     /** 解析后归属抽样率（0 = 关闭）：1/3 纯随机（整书错误率仪表）+ 2/3 风险加权。
      *  每本读数记入任务日志与 config/spot_check_history.json；降不降由用户手动决定。 */
     spot_check_rate: number
+    /** 断句失败校验开关（解析内阶段；关闭 = 跳过该阶段并记录日志）。 */
+    revalidate_splits: boolean
+    /** 纯归属标签条删除开关（解析内阶段；关闭 = 跳过该阶段并记录日志）。 */
+    delete_saying_tags: boolean
+    /** 解析内重判批大小（断句失败校验 / 归属抽样共用）；不在设置页露出。 */
+    check_batch_size: number
+    /** 解析内重判上下文窗口（断句失败校验 / 归属抽样共用）；不在设置页露出。 */
+    check_context_window: number
   }
   ui: { theme: string }
 }

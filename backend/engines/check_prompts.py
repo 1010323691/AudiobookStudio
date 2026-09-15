@@ -1,10 +1,12 @@
-"""Default Speaker-check prompts — port of the ``script_prompts`` pattern.
+"""Default re-judgment prompts — port of the ``script_prompts`` pattern.
 
 Reads the bundled ``backend/resources/default_check_prompts.txt`` and splits it on
 ``---SEPARATOR---`` into a ``(system_prompt, user_prompt_template)`` pair. The user
-template carries a ``{context}`` placeholder that the check engine fills with the
-per-entry context window. An mtime cache picks up edits without a restart. Config-supplied
-check prompts (``config.speaker_check``) override these defaults when non-empty.
+template carries a ``{context}`` placeholder that the re-judgment stages fill with the
+per-batch context window. An mtime cache picks up edits without a restart. The in-parse
+断句失败校验 / 归属抽样 stages always use these bundled defaults — the re-judgment prompts
+are NOT user-configurable (the retired check stages' ``config.speaker_check`` prompt
+override is gone with those stages).
 
 This is deliberately a separate file / loader from the 解析 prompts
 (``script_prompts.py`` / ``default_prompts.txt``) so the two stay fully independent.
@@ -29,7 +31,7 @@ def load_default_check_prompts() -> tuple[str, str]:
     if not _PROMPTS_FILE.exists():
         raise RuntimeError(
             f"default_check_prompts.txt not found at {_PROMPTS_FILE}. "
-            "This file is required for Speaker-check prompt defaults."
+            "This file is required for the in-parse re-judgment prompt defaults."
         )
 
     mtime = os.path.getmtime(_PROMPTS_FILE)
@@ -53,5 +55,5 @@ def load_default_check_prompts() -> tuple[str, str]:
     return prompts
 
 
-# Cached at import time — the fallbacks used when the config carries no custom check prompts.
+# Cached at import time — the (sole) re-judgment prompts used by both in-parse stages.
 DEFAULT_CHECK_SYSTEM_PROMPT, DEFAULT_CHECK_USER_PROMPT = load_default_check_prompts()

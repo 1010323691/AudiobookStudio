@@ -17,7 +17,7 @@ import pytest
 
 from backend.core import config as core_config
 from backend.core import paths as core_paths
-from backend.core.config import GenerationConfig, LLMConfig, PromptsConfig, SpeakerCheckConfig
+from backend.core.config import GenerationConfig, LLMConfig, PromptsConfig
 from backend.core.tasks import TaskCancelled
 from backend.engines.script import (
     DEFAULT_SYSTEM_PROMPT,
@@ -30,17 +30,22 @@ from backend.engines.script import (
     _llm_chat_completion_stream,
     _load_spot_history,
     _parse_entries_reply,
+    _pick_majority,
     _reparse_vote,
     _risk_tier,
     _strip_leading_saying_tag,
     _tag_in,
+    build_batch_window,
     check_chunk_fidelity,
     clean_json_string,
     delete_pure_saying_tags,
     fix_mojibake,
     generate_file,
+    group_retry_indices,
     is_suspicious_entry_text,
     merge_adjacent_narrator,
+    parse_speaker,
+    parse_speaker_map_full,
     process_chunk,
     revalidate_entry,
     repair_json_array,
@@ -50,6 +55,7 @@ from backend.engines.script import (
     spot_check_speakers,
     split_chunk_balanced,
     split_into_chunks,
+    strip_outer_quotes,
     suspicious_entry_indices,
     validate_sentence_splits,
 )
@@ -60,7 +66,7 @@ LQ, RQ = chr(0x201C), chr(0x201D)  # curly double quotes — via chr() (hand-typ
 SQ = chr(0x0022)  # straight double quote — via chr()
 
 
-def _entry(speaker: str, text: str, instruct: str) -> dict:
+def _entry(speaker: str, text: str, instruct: str = "tone") -> dict:
     return {"speaker": speaker, "text": text, "instruct": instruct}
 
 
@@ -273,6 +279,17 @@ class _Handle:
 
     def progress(self, *a, **k):
         pass
+
+
+class _LogHandle(_Handle):
+    """A ``_Handle`` that also records ``log()`` calls as ``(level, msg)`` pairs."""
+
+    def __init__(self):
+        super().__init__()
+        self.logs: list = []
+
+    def log(self, msg, level=None):
+        self.logs.append((level or "INFO", str(msg)))
 
 
 def test_stream_llm_accumulates_and_forwards(monkeypatch):
@@ -943,6 +960,201 @@ def test_validate_no_consensus_keeps_entries_and_list(monkeypatch):
     assert calls["n"] == 4  # 基础 1 + 重试 2 无共识 → 再跑第 4 次
 
 
+# --------------------------------------------------------------------------- #
+# 重判批协议（断句失败校验 / 归属抽样共用）——自已退役的独立检查模块整体搬入
+# --------------------------------------------------------------------------- #
+
+def test_batch_window_flags_the_targets():
+    entries = [_entry("N", f"t{i}") for i in range(30)]
+    # A middle batch of 3 targets starting at index 10, with ±1 context.
+    w = build_batch_window(entries, start=10, size=3, n=1)
+    assert [e["index"] for e in w] == [9, 10, 11, 12, 13]
+    assert [e.get("target") for e in w] == [None, True, True, True, None]
+    assert all("instruct" not in e for e in w)  # instruct is dropped to save tokens
+
+
+def test_batch_window_clamps_at_start():
+    entries = [_entry("N", f"t{i}") for i in range(5)]
+    w = build_batch_window(entries, start=0, size=3, n=2)  # no context before index 0
+    assert [e["index"] for e in w] == [0, 1, 2, 3, 4]
+    assert [e.get("target") for e in w] == [True, True, True, None, None]
+
+
+def test_batch_window_clamps_at_end():
+    entries = [_entry("N", f"t{i}") for i in range(5)]
+    w = build_batch_window(entries, start=3, size=5, n=2)  # the block runs past the end
+    assert [e["index"] for e in w] == [1, 2, 3, 4]
+    assert [e.get("target") for e in w] == [None, None, True, True]
+
+
+def test_batch_window_zero_n_only_targets():
+    entries = [_entry("N", f"t{i}") for i in range(6)]
+    w = build_batch_window(entries, start=2, size=3, n=0)
+    assert [e["index"] for e in w] == [2, 3, 4]
+    assert all(e.get("target") is True for e in w)
+
+
+def test_batch_window_carries_original_speaker_and_text():
+    entries = [_entry("ALICE", "你好"), _entry("NARRATOR", "他走了"), _entry("BOB", "再见")]
+    w = build_batch_window(entries, start=0, size=2, n=1)
+    assert w[0] == {"index": 0, "speaker": "ALICE", "text": "你好", "target": True}
+    assert w[1] == {"index": 1, "speaker": "NARRATOR", "text": "他走了", "target": True}
+    assert w[2] == {"index": 2, "speaker": "BOB", "text": "再见"}  # context: no target key
+
+
+def test_batch_window_skip_excludes_skipped_targets():
+    entries = [_entry("N", f"t{i}") for i in range(5)]
+    # Index 2 sits inside the target range but is skipped (the spot audit's in-span
+    # non-targets ride along unflagged, like context). (The block starts at 0, so the
+    # window has no leading context and one trailing entry, index 3.)
+    w = build_batch_window(entries, start=0, size=3, n=1, skip={2})
+    assert [e["index"] for e in w] == [0, 1, 2, 3]
+    assert [e.get("target") for e in w] == [True, True, None, None]
+    # The default (skip=None) flags the whole range.
+    w0 = build_batch_window(entries, start=0, size=3, n=1)
+    assert [e["index"] for e in w0] == [0, 1, 2, 3]
+    assert [e.get("target") for e in w0] == [True, True, True, None]
+
+
+def test_parse_speaker_clean_object():
+    assert parse_speaker('{"speaker": "ELENA"}') == "ELENA"
+
+
+def test_parse_speaker_object_with_extra_keys():
+    assert parse_speaker('{"speaker": "NARRATOR", "reason": "it is narration"}') == "NARRATOR"
+
+
+def test_parse_speaker_strips_closed_thinking_tags():
+    lt, gt = chr(60), chr(62)  # build the tags so no literal <> / newline lives in the file
+    raw = lt + "think" + gt + "hmm, it is dialogue" + lt + "/think" + gt + ' {"speaker": "BOB"}'
+    assert parse_speaker(raw) == "BOB"
+
+
+def test_parse_speaker_markdown_fence():
+    raw = "```json\n" + '{"speaker": "CARL"}' + "\n```"
+    assert parse_speaker(raw) == "CARL"
+
+
+def test_parse_speaker_single_element_array():
+    assert parse_speaker('["ELENA"]') == "ELENA"
+
+
+def test_parse_speaker_bare_token():
+    assert parse_speaker("ELENA") == "ELENA"
+
+
+def test_parse_speaker_sentence_is_none():
+    assert parse_speaker("I think the speaker is probably ELENA because...") is None
+
+
+def test_parse_speaker_empty_is_none():
+    assert parse_speaker("") is None
+    assert parse_speaker(None) is None
+
+
+def test_parse_speaker_object_without_speaker_is_none():
+    assert parse_speaker('{"foo": "bar"}') is None
+
+
+def test_parse_speaker_map_full_captures_text():
+    text = ('{"results": [{"index": 0, "speaker": "A", "text": "t0"},'
+            ' {"index": 1, "speaker": "B"}]}')
+    assert parse_speaker_map_full(text, [0, 1]) == {0: ("A", "t0"), 1: ("B", None)}
+
+
+def test_parse_speaker_map_full_ignores_non_targets_and_blank_text():
+    # A text for a non-target index is dropped; a blank text key is treated as absent.
+    text = ('{"results": [{"index": 0, "speaker": "A", "text": "  "},'
+            ' {"index": 9, "speaker": "X", "text": "z"}]}')
+    assert parse_speaker_map_full(text, [0, 1]) == {0: ("A", None)}
+
+
+def test_parse_speaker_map_full_speaker_projection():
+    # The speaker projection of the full parser lands exactly on the target indices,
+    # one speaker each (the legacy speaker-only contract).
+    text = '{"results": [{"index": 3, "speaker": "A", "text": "t"}, {"index": 7, "speaker": "B"}]}'
+    full = parse_speaker_map_full(text, [3, 7])
+    assert {i: sp for i, (sp, _tx) in full.items()} == {3: "A", 7: "B"}
+
+
+def test_strip_outer_quotes_all_supported_pairs():
+    # Corner / double-corner / curly-single pairs via chr() — hand-typed quotes are unreliable.
+    CB, CC = chr(0x300C), chr(0x300D)  # corner
+    DB, DC = chr(0x300E), chr(0x300F)  # double corner
+    LS, RS = chr(0x2018), chr(0x2019)  # curly single
+    assert strip_outer_quotes(LQ + "你终于来了。" + RQ) == "你终于来了。"
+    assert strip_outer_quotes(CB + "快跑！" + CC) == "快跑！"
+    assert strip_outer_quotes(DB + "小心！" + DC) == "小心！"
+    assert strip_outer_quotes(LS + "小声点。" + RS) == "小声点。"
+    assert strip_outer_quotes(SQ + "hello" + SQ) == "hello"
+    assert strip_outer_quotes(chr(39) + "hi" + chr(39)) == "hi"
+
+
+def test_strip_outer_quotes_keeps_inner_quotes():
+    # Only the outermost pair is stripped — an inner quoted term is preserved.
+    CB, CC = chr(0x300C), chr(0x300D)
+    inner = "他说" + CB + "快跑" + CC + "。"
+    assert strip_outer_quotes(LQ + inner + RQ) == inner
+
+
+def test_strip_outer_quotes_not_wrapped_is_none():
+    assert strip_outer_quotes("他走进了房间") is None
+    # A leading CLOSER (the pair is reversed) is not a wrap.
+    assert strip_outer_quotes(RQ + "你来了。" + LQ) is None
+
+
+def test_strip_outer_quotes_empty_interior_is_none():
+    CB, CC = chr(0x300C), chr(0x300D)
+    assert strip_outer_quotes(LQ + RQ) is None
+    assert strip_outer_quotes(CB + CC) is None
+    assert strip_outer_quotes(LQ) is None
+    assert strip_outer_quotes("") is None
+    assert strip_outer_quotes(None) is None
+
+
+def test_majority_two_of_three():
+    assert _pick_majority(["A", "A", "B"]) == "A"
+
+
+def test_majority_all_three():
+    assert _pick_majority(["A", "A", "A"]) == "A"
+
+
+def test_majority_all_distinct_is_none():
+    assert _pick_majority(["A", "B", "C"]) is None
+
+
+def test_majority_tie_is_none():
+    assert _pick_majority(["A", "A", "B", "B"]) is None
+
+
+def test_majority_ignores_none_and_rejects_lone_vote():
+    assert _pick_majority(["A"]) is None              # a lone vote is not a majority
+    assert _pick_majority([None, "A", "A"]) == "A"    # None votes are ignored
+    assert _pick_majority([None, None]) is None
+
+
+def test_majority_four_with_and_without_majority():
+    assert _pick_majority(["A", "B", "A", "C"]) == "A"
+    assert _pick_majority(["A", "B", "C", "D"]) is None
+
+
+def test_retry_grouping_gap_and_batch_cap():
+    # Consecutive failures share a call while their ±n context windows overlap; a
+    # larger gap or the batch cap starts a new group (one LLM call per group).
+    assert group_retry_indices([], 4, 20) == []
+    assert group_retry_indices([5], 4, 20) == [[5]]
+    # Gaps ≤ n (4) stay together: 6-5=1, 10-6=4.
+    assert group_retry_indices([5, 6, 10], 4, 20) == [[5, 6, 10]]
+    # Gap 6 > 4 → a new group (one call must not span the gap).
+    assert group_retry_indices([5, 11], 4, 20) == [[5], [11]]
+    # The batch cap splits a long run into groups of ≤ batch targets.
+    assert group_retry_indices(list(range(25)), 4, 10) == [
+        list(range(0, 10)), list(range(10, 20)), list(range(20, 25))]
+    # n=0: only truly adjacent (gap ≤ 1) indices share a call.
+    assert group_retry_indices([5, 6, 8], 0, 20) == [[5, 6], [8]]
+
+
 @pytest.fixture
 def workspace(monkeypatch, tmp_path):
     """A throwaway project root + workspace (mirrors ``test_merge.py``) —
@@ -1007,7 +1219,6 @@ def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch,
     src.write_bytes(source.encode("utf-8"))  # write_text 在 Windows 会翻译 \n → \r\n
     result = generate_file(
         _Handle(), str(src), _LLM, PromptsConfig(), GenerationConfig(spot_check_rate=0.0),
-        SpeakerCheckConfig(),
     )  # spot_check_rate=0：默认 0.05 会在此跑归属抽样，打破下面的调用数断言
 
     assert calls["n"] == 5  # 1 解析 + 2×2 校验
@@ -1031,6 +1242,90 @@ def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch,
     ]
     assert out[0]["instruct"] == "a"
     assert result["entries"] == out
+
+
+def test_generate_file_revalidate_off_skips_stage(tmp_path, monkeypatch, workspace):
+    # revalidate_splits=False：断句失败校验整体跳过——零校验调用、suspicious /
+    # suspicious_fixed = 0、日志留一行「已关闭（配置）」；疑似条目原样留在结果里，
+    # 后续阶段（标签清理 / 抽样 / 合并）不受影响。
+    source = (
+        f"说道：{SQ}嗯，好。{SQ}\n"
+        f"林某：{SQ}嗯，去吧。{SQ}\n"
+    )
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": f"{SQ}说道：{SQ}嗯，好。{SQ}{SQ}", "instruct": "a"},
+        {"speaker": "林某", "text": f"{SQ}嗯，去吧。{SQ}", "instruct": "b"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "noval.txt"
+    src.write_bytes(source.encode("utf-8"))
+    handle = _LogHandle()
+    result = generate_file(
+        handle, str(src), _LLM, PromptsConfig(),
+        GenerationConfig(revalidate_splits=False, spot_check_rate=0.0),
+    )
+
+    assert calls["n"] == 1  # 仅解析——校验阶段零 LLM 调用
+    assert result["suspicious"] == 0
+    assert result["suspicious_fixed"] == 0
+    assert any("已关闭（配置）" in msg for _lv, msg in handle.logs)
+    out = json.loads((workspace / "03_parsed_json" / "noval.json").read_text("utf-8"))
+    # 疑似条目保持原样（未重推）
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", f"{SQ}说道：{SQ}嗯，好。{SQ}{SQ}"),
+        ("林某", f"{SQ}嗯，去吧。{SQ}"),
+    ]
+
+
+def test_generate_file_delete_tags_off_keeps_tags(tmp_path, monkeypatch, workspace):
+    # delete_saying_tags=False：纯归属标签条清理整体跳过——标签条保留在结果里
+    # （随后与紧邻旁白机械合并，成为被念出来的旁白行），tags_deleted=0、
+    # 日志留一行「已关闭（配置）」。
+    source = (
+        "老道士坐在堂中，闭目养神。\n"
+        "老道士瞪眼怒道。\n"
+        f"老道士：{LQ}你敢动我的弟子？{RQ}\n"
+    )
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "老道士坐在堂中，闭目养神。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "老道士瞪眼怒道。", "instruct": "b"},
+        {"speaker": "老道士", "text": f"{LQ}你敢动我的弟子？{RQ}", "instruct": "c"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "tag3.txt"
+    src.write_bytes(source.encode("utf-8"))
+    handle = _LogHandle()
+    result = generate_file(
+        handle, str(src), _LLM, PromptsConfig(),
+        GenerationConfig(delete_saying_tags=False, spot_check_rate=0.0),
+    )
+
+    assert calls["n"] == 1
+    assert result["tags_deleted"] == 0
+    assert result["count"] == 2  # 保留的标签条与紧邻旁白合并（机械合并照常运行）
+    assert result["merged_narrator"] == 1
+    assert any("已关闭（配置）" in msg for _lv, msg in handle.logs)
+    out = json.loads((workspace / "03_parsed_json" / "tag3.json").read_text("utf-8"))
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", "老道士坐在堂中，闭目养神。老道士瞪眼怒道。"),
+        ("老道士", f"{LQ}你敢动我的弟子？{RQ}"),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -1126,7 +1421,6 @@ def test_generate_file_e2e_pure_tag_delete(tmp_path, monkeypatch, workspace):
     src.write_bytes(source.encode("utf-8"))
     result = generate_file(
         _Handle(), str(src), _LLM, PromptsConfig(), GenerationConfig(spot_check_rate=0.0),
-        SpeakerCheckConfig(),
     )
     assert calls["n"] == 1  # 除解析外零 LLM 调用（断句校验零命中、标签清理纯机械）
     assert result["count"] == 2
@@ -1178,8 +1472,7 @@ def test_generate_file_e2e_pure_tag_gone_before_spot(tmp_path, monkeypatch, work
     src.write_bytes(source.encode("utf-8"))
     result = generate_file(
         _Handle(), str(src), _LLM, PromptsConfig(),
-        GenerationConfig(spot_check_rate=1.0),
-        SpeakerCheckConfig(context_window=10),
+        GenerationConfig(spot_check_rate=1.0, check_context_window=10),
         rng=random.Random(7),
     )
     # 标签条在抽样前已删除：抽样窗口里根本没有它
@@ -1403,21 +1696,21 @@ def test_spot_off_makes_zero_llm_calls(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     entries = [dict(e) for e in _SPOT_FIXTURE]
-    res, st = spot_check_speakers(
-        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.0)
+    res, st = spot_check_speakers(_Handle(), _LLM, _SPOT_GEN, entries, 0.0)
     assert res is entries
     assert st == {
         "checked": 0, "fixed": 0, "rate": 0.0,
         "random_n": 0, "random_errors": 0, "random_rate": None,
         "risk_n": 0, "risk_errors": 0,
     }
-    # check=None → 同样关闭（无批几何 / 提示词）
-    res, st = spot_check_speakers(
-        _Handle(), _LLM, GenerationConfig(), None, entries, 0.05)
+    # rate ≤ 0 → 关闭；空条目 → 关闭（零统计、零调用）
+    res, st = spot_check_speakers(_Handle(), _LLM, _SPOT_GEN, entries, -0.5)
     assert res is entries and st["checked"] == 0
+    res, st = spot_check_speakers(_Handle(), _LLM, _SPOT_GEN, [], 0.05)
+    assert res == [] and st["checked"] == 0
 
 
-# 6 条小文件：context_window=10 → 任何目标组合都只有一组（一次调用）
+# 6 条小文件：check_context_window=10 → 任何目标组合都只有一组（一次调用）
 _SPOT_FIXTURE = [
     {"speaker": "NARRATOR", "text": "夜色渐浓，街上的行人稀落下来。", "instruct": "a"},
     {"speaker": "林某", "text": f"{LQ}你终于来了。{RQ}", "instruct": "b"},
@@ -1426,7 +1719,7 @@ _SPOT_FIXTURE = [
     {"speaker": "李四", "text": f"{SQ}知道了。{SQ}", "instruct": "e"},
     {"speaker": "NARRATOR", "text": "两人转身，走进了巷子深处。", "instruct": "f"},
 ]
-_SPOT_CHECK = SpeakerCheckConfig(batch_size=20, context_window=10)
+_SPOT_GEN = GenerationConfig(check_batch_size=20, check_context_window=10)
 
 
 def test_spot_zero_disagreement_one_call_no_change(monkeypatch):
@@ -1447,7 +1740,7 @@ def test_spot_zero_disagreement_one_call_no_change(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     result, stats = spot_check_speakers(
-        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+        _Handle(), _LLM, _SPOT_GEN, entries, 0.5, random.Random(1))
     assert calls["n"] == 1  # 无分歧 → 无重试
     assert result is entries  # 零修正 → 原列表对象
     assert stats["checked"] == len(targets)
@@ -1472,7 +1765,7 @@ def test_spot_21_majority_applies_after_two_calls(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     result, stats = spot_check_speakers(
-        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+        _Handle(), _LLM, _SPOT_GEN, entries, 0.5, random.Random(1))
 
     flipped = [t for t in targets if entries[t]["speaker"] != "林某"]
     assert flipped  # 6 条中至多 2 条是林某 → 必有可翻转目标
@@ -1509,7 +1802,7 @@ def test_spot_no_consensus_four_calls_keeps_original(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     result, stats = spot_check_speakers(
-        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+        _Handle(), _LLM, _SPOT_GEN, entries, 0.5, random.Random(1))
 
     assert calls["n"] == 4  # 首判 + 3 次重试（始终无严格多数）
     assert stats["fixed"] == 0
@@ -1526,16 +1819,6 @@ def test_spot_quote_strip_adoption_rules(monkeypatch):
     rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(1))
     targets = sorted(set(rt) | set(rk))
     assert targets == list(range(6))
-
-    from backend.engines.speaker_check import strip_outer_quotes
-
-    class _LogHandle(_Handle):
-        def __init__(self):
-            super().__init__()
-            self.logs: list = []
-
-        def log(self, msg, level=None):
-            self.logs.append((level, str(msg)))
 
     handle = _LogHandle()
     calls = {"n": 0}
@@ -1558,7 +1841,7 @@ def test_spot_quote_strip_adoption_rules(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     result, stats = spot_check_speakers(
-        handle, _LLM, GenerationConfig(), _SPOT_CHECK, entries, 1.0, random.Random(1))
+        handle, _LLM, _SPOT_GEN, entries, 1.0, random.Random(1))
 
     assert calls["n"] == 1  # 零分歧 → 无重试
     assert stats["fixed"] == 0
@@ -1586,8 +1869,7 @@ def test_spot_cancel_propagates_and_changes_nothing(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     with pytest.raises(TaskCancelled):
         spot_check_speakers(
-            _Handle(cancelled=True), _LLM, GenerationConfig(),
-            _SPOT_CHECK, entries, 0.5, random.Random(1))
+            _Handle(cancelled=True), _LLM, _SPOT_GEN, entries, 0.5, random.Random(1))
     # 输入列表原样（浅拷贝在取消前不落地）
     assert entries == [dict(e) for e in _SPOT_FIXTURE]
 
@@ -1638,8 +1920,7 @@ def test_generate_file_e2e_spot_check(tmp_path, monkeypatch, workspace):
     src.write_bytes(source.encode("utf-8"))
     result = generate_file(
         _Handle(), str(src), _LLM, PromptsConfig(),
-        GenerationConfig(spot_check_rate=rate),
-        SpeakerCheckConfig(context_window=10),
+        GenerationConfig(spot_check_rate=rate, check_context_window=10),
         rng=random.Random(rng_seed),
     )
 
@@ -1704,8 +1985,7 @@ def test_generate_file_cancel_mid_spot_writes_nothing(tmp_path, monkeypatch, wor
     with pytest.raises(TaskCancelled):
         generate_file(
             _Handle(), str(src), _LLM, PromptsConfig(),
-            GenerationConfig(spot_check_rate=1.0),
-            SpeakerCheckConfig(context_window=10),
+            GenerationConfig(spot_check_rate=1.0, check_context_window=10),
         )
     assert not (workspace / "03_parsed_json" / "chapter.json").exists()
     assert not (workspace / "config" / "spot_check_history.json").exists()

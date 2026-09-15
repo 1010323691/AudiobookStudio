@@ -24,7 +24,7 @@ import urllib.request
 
 from pathlib import Path
 
-from ..core.config import GenerationConfig, LLMConfig, PromptsConfig, SpeakerCheckConfig
+from ..core.config import GenerationConfig, LLMConfig, PromptsConfig
 from ..core.concurrency import gate
 from ..core.paths import get_layout
 from ..core.tasks import TaskCancelled
@@ -532,7 +532,7 @@ def _llm_chat_completion_stream(base_url, api_key, model, messages,
 # ---------------------------------------------------------------------------
 
 # 引语段抽取：六组常用引号对（弯双 / 弯单 / 六角 / 双六角 / 直双 / 直单）。
-# 手写引号字符不可靠，一律 \uXXXX 转义（同 mix_check 的既有教训）。
+# 手写引号字符不可靠，一律 \uXXXX 转义（同忠实性校验的既有教训）。
 _FIDELITY_QUOTE_PATTERNS = (
     re.compile("\\u201c([^\\u201c\\u201d]+)\\u201d"),   # “…” 弯双引号
     re.compile("\\u2018([^\\u2018\\u2019]+)\\u2019"),   # ‘…’ 弯单引号
@@ -869,17 +869,17 @@ def merge_adjacent_narrator(entries, title_test, max_len=100):
 # 信号：条目 text 被外层双引号（弯 “ ” 或直 " "——任意形式）整体包裹，且引号跨度内
 # 出现「…道」语气标签（说道 / 问道 / 答道 / 冷笑道 / xx道 等）后紧跟冒号——标签被包进
 # 了台词里，说明断句没把内层台词拆出去。冒号是硬性条件：知道 / 难道 / 道理 / 道路
-# 的「道」后无冒号，绝不触发。这种「标签在引号内」的形态对下游段落混合检查不可见
-# （混合检查视其为单主体 → keep），故必须在解析阶段就地重跑校验。
+# 的「道」后无冒号，绝不触发。这种「标签在引号内」的形态对下游各阶段不可见
+# （TTS 会照常规行把标签一起念出），故必须在解析阶段就地重跑校验。
 # ---------------------------------------------------------------------------
 
 _SAYING_TAG_RE = re.compile("(?:^|[\\u4e00-\\u9fffA-Za-z])道\\s*[:：]")
 # 外层双引号对（弯双 + 直双——「任意形式」的引号对均被接受）。引号字符一律 \uXXXX
-# 转义（同 mix_check / 忠实性校验的既有教训：手写引号字符不可靠）；此处是普通字符串
+# 转义（同忠实性校验的既有教训：手写引号字符不可靠）；此处是普通字符串
 # 比较（startswith / rfind）而非正则，故用单反斜杠让 Python 解码出真实引号字符。
 _OUTER_DQUOTE_PAIRS = (("\u201c", "\u201d"), ("\u0022", "\u0022"))
 # 引号内**开头**的「…道：」标签——重判提示词允许模型整段丢弃的纯语气标签（解析提示词
-# 编辑 (e)）；只剥开头这一处：中段「…道：」可能是别的混合形态（交给段落混合检查），
+# 编辑 (e)）；只剥开头这一处：中段「…道：」可能是别的混合形态（本阶段不处理），
 # 且按位置剥可避免把「知道：」这类真词误当标签剥掉。
 _LEADING_SAYING_TAG_RE = re.compile("[\\u4e00-\\u9fffA-Za-z]+道\\s*[:：]")
 
@@ -944,9 +944,9 @@ def _reparse_vote(parts, entry: dict, roster: frozenset):
     tags are omitted). The skeleton is immune to the prompt-permitted formatting edits
     (quote / colon / seam-punctuation changes) while any added, dropped, or reordered
     word character is caught. Part speakers must be ``NARRATOR`` or in the file-wide
-    roster (no invented names); a multi-part answer needs ≥2 distinct speakers (the mix
-    check's same-subject gate — same-character parts would be one entry per the parse
-    prompt). Returns the vote value (a hashable ``(speaker, skeleton)`` sequence) or
+    roster (no invented names); a multi-part answer needs ≥2 distinct speakers —
+    same-character parts would be one entry per the parse prompt (a single-subject
+    "split" is not a split). Returns the vote value (a hashable ``(speaker, skeleton)`` sequence) or
     ``None`` (the reply contributes no vote — the entry is never changed on a guess).
     """
     if not parts or not all(isinstance(p, dict) for p in parts):
@@ -972,6 +972,379 @@ def _reparse_vote(parts, entry: dict, roster: frozenset):
     return tuple((p["speaker"].strip(), _skeleton(p["text"])) for p in parts)
 
 
+# ---------------------------------------------------------------------------
+# 重判批协议（断句失败校验 / 归属抽样共用）
+#
+# 批窗口构建、LLM 回复解析、多者胜投票、去外层引号、全书角色花名册、重试分组与
+# LLM 调用封装。原属已退役的独立检查模块（speaker_check / mix_check），两检查链路
+# 拆除后整体并入本模块——解析内两个重判阶段是它们如今唯一的调用方。
+# ---------------------------------------------------------------------------
+
+# Outer quotation-mark pairs the re-judgment may strip from a character entry's
+# stored text. The prompt's optional ``text`` key = the stored text minus EXACTLY
+# ONE such outer pair (inner quotes — a quoted term inside the utterance — are
+# preserved).
+_QUOTE_PAIRS = (
+    ("\u201c", "\u201d"),  # curly double
+    ("\u300c", "\u300d"),  # corner
+    ("\u300e", "\u300f"),  # double corner
+    ("\u2018", "\u2019"),  # curly single
+    ("\u0022", "\u0022"),  # ASCII double
+    ("\u0027", "\u0027"),  # ASCII single
+)
+
+# All quote characters (the full inventory, both halves of every pair above) — a
+# text containing ANY of them is not "quote-free". Hand-written quote chars are
+# unreliable: \uXXXX escapes only (the same lesson the fidelity quote patterns use).
+_QUOTE_CHARS = frozenset(
+    "\u0022\u0027\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f"  # the 10 quote chars: ascii + curly + corner (both halves of every pair)
+)
+
+
+def strip_outer_quotes(text: str) -> str | None:
+    """The text with its ONE outermost pair of quotation marks removed, or ``None`` when
+    the text is not wrapped in a matching outer pair (the caller then leaves it alone).
+
+    Only the outermost pair is stripped; an empty interior (``“”``) also yields ``None``
+    so a degenerate quote-only text is never reduced to an empty entry.
+    """
+    if not text or len(text) < 2:
+        return None
+    for open_q, close_q in _QUOTE_PAIRS:
+        if text.startswith(open_q) and text.endswith(close_q):
+            inner = text[len(open_q):-len(close_q)]
+            return inner if inner else None
+    return None
+
+
+def build_roster(entries: list) -> list[str]:
+    """The book-wide character roster: sorted, de-duplicated, non-empty, non-NARRATOR
+    ``speaker`` values over the WHOLE input file.
+
+    A re-judged speaker may name any roster character — not just those present in the
+    local batch window (which would wrongly reject a character whose first appearance
+    sits outside the window). Computed deterministically from the input, never from the
+    LLM; mirrors the 解析 stage's roster injection.
+    """
+    roster = set()
+    for e in entries:
+        sp = (e.get("speaker") or "").strip()
+        if sp and sp != "NARRATOR":
+            roster.add(sp)
+    return sorted(roster)
+
+
+def build_batch_window(entries: list, start: int, size: int, n: int, skip=None) -> list[dict]:
+    """The context window for a batch of ``size`` target entries starting at ``start``.
+
+    The target range ``entries[start .. start+size)`` (clamped to the file) is flagged
+    ``"target": true``; ``n`` entries before ``start`` and ``n`` after the block (clamped)
+    are context only (no target flag). Each item carries its absolute ``index``, the
+    ORIGINAL ``speaker``, and the ``text`` (``instruct`` is dropped to keep the window
+    compact — speaker judgment does not need the voice direction). Yields the union, in
+    index order, so the LLM sees the full scope of what it may reason from.
+
+    ``skip`` (optional) is a set of absolute indices inside the target range that must
+    NOT be flagged as targets (the 归属抽样 passes its in-span non-targets, which ride
+    along unflagged like context); they still appear in the window unflagged. ``None``
+    (the default) flags the whole range.
+    """
+    total = len(entries)
+    t_lo = max(0, start)
+    t_hi = min(total, start + size)
+    lo = max(0, start - n)
+    hi = min(total, start + size + n)
+    skipped = frozenset(skip) if skip is not None else frozenset()
+    out = []
+    for j in range(lo, hi):
+        item = {
+            "index": j,
+            "speaker": entries[j].get("speaker", ""),
+            "text": entries[j].get("text", ""),
+        }
+        if t_lo <= j < t_hi and j not in skipped:
+            item["target"] = True
+        out.append(item)
+    return out
+
+
+def _strip_thinking(text: str) -> str:
+    """Drop thinking/reasoning tags (a Qwen3 thinking model may leak them into content)."""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"<think>[\s\S]*$", "", text)
+    for tag in ("thinking", "reflection", "reasoning"):
+        text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text)
+        text = re.sub(rf"<{tag}>[\s\S]*$", "", text)
+    return text
+
+
+def _extract_balanced(text: str, start: int, opener: str, closer: str):
+    """Parse the JSON value that begins at ``text[start]`` (an ``opener``), string/escape
+    aware, counting only ``opener``/``closer`` depth. Returns the parsed value or ``None``.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except Exception:  # noqa: BLE001
+                    return None
+    return None
+
+
+def _extract_json(text: str):
+    """The first top-level JSON value (object or array) in ``text``, else ``None``.
+
+    Whichever bracket opens first wins, so a bare ``[...]`` reply is not mistaken for the
+    ``{...}`` object nested inside it.
+    """
+    o = text.find("{")
+    a = text.find("[")
+    if o == -1 and a == -1:
+        return None
+    if a != -1 and (o == -1 or a < o):
+        return _extract_balanced(text, a, "[", "]")
+    return _extract_balanced(text, o, "{", "}")
+
+
+def _clean_reply(text: str) -> str:
+    """Strip markdown code fences and thinking/reasoning tags from an LLM reply."""
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            text = m.group(1).strip()
+    return _strip_thinking(text).strip()
+
+
+def parse_speaker(text: str | None) -> str | None:
+    """Extract the re-judged speaker from a single-entry LLM response; ``None`` if unreadable.
+
+    A ``None`` result means "keep the entry's original speaker" (the caller's safe
+    default). Order: strip thinking tags / code fences → read a JSON object's ``speaker``
+    (or a one-element string array); if no object, accept a single short bare token (a
+    lone word with no spaces, not shaped like JSON) so a model that replies ``ELENA``
+    instead of ``{"speaker": "ELENA"}`` still lands correctly. Anything else → ``None``.
+    """
+    if not text:
+        return None
+    text = _clean_reply(text.strip())
+
+    value = _extract_json(text)
+    if isinstance(value, dict):
+        sp = value.get("speaker")
+        if isinstance(sp, str) and sp.strip():
+            return sp.strip()
+        return None  # an object was present but had no usable speaker → don't guess
+    if isinstance(value, list) and len(value) == 1:
+        if isinstance(value[0], str) and value[0].strip():
+            return value[0].strip()
+
+    candidate = text.strip()
+    if (
+        candidate
+        and " " not in candidate
+        and len(candidate) <= 32
+        and not candidate.startswith(("[", "{"))
+    ):
+        return candidate
+    return None
+
+
+def _as_int(v):
+    """``int(v)`` when ``v`` is an int or an int-like string, else ``None``."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_speaker_map_full(text: str | None, target_indices: list) -> dict:
+    """Parse a batch LLM reply into ``{absolute_index: (speaker, text)}``.
+
+    Robust to thinking tags / code fences and to the reply being a wrapped
+    ``{"results": [...]}`` object, a bare ``[...]`` array, or an index-keyed object.
+    Returns ``{}`` for anything unreadable — the caller then keeps the original speaker
+    for those entries (per-item isolation). ``text`` is the reply item's optional
+    ``text`` key — the re-judgment prompt asks for the entry's stored text with its
+    surrounding quotation marks removed (applied only after strict validation) —
+    ``None`` when the item omits the key or it is blank. A single-target batch falls
+    back to :func:`parse_speaker`.
+    """
+    targets = list(target_indices)
+    if not targets or not text:
+        return {}
+    text = _clean_reply(text.strip())
+    tset = set(targets)
+    # Primary: the batch mapping ({"results": [...]}, a bare array, or an index-keyed object).
+    value = _extract_json(text)
+    if value is not None:
+        m = _map_from_value(value, tset, targets)
+        if m:
+            return m
+    # Single-target fallback: the scalar parser, so a reply shaped for one entry
+    # ({"speaker": ...}, a bare token, or a one-element string array) still lands.
+    if len(targets) == 1:
+        sp = parse_speaker(text)
+        if sp:
+            return {targets[0]: (sp, None)}
+    return {}
+
+
+def _map_from_value(v, tset: set, targets: list) -> dict:
+    """Extract ``{index: (speaker, text)}`` from a parsed JSON value (object or array);
+    ``text`` is ``None`` whenever the reply item carries no usable ``text`` key."""
+    if isinstance(v, dict):
+        # {"results" / "speakers" / ... : [ ... ]}
+        for key in ("results", "speakers", "entries", "items", "list"):
+            inner = v.get(key)
+            if isinstance(inner, list):
+                m = _map_from_list(inner, tset, targets)
+                if m:
+                    return m
+        # index-keyed object: {"0": "NARRATOR", "3": "BOB"} (speaker-only values)
+        m = {}
+        for k, sp in v.items():
+            idx = _as_int(k)
+            if isinstance(sp, str) and sp.strip() and idx is not None and idx in tset:
+                m[idx] = (sp.strip(), None)
+        return m
+    if isinstance(v, list):
+        return _map_from_list(v, tset, targets)
+    return {}
+
+
+def _map_from_list(lst: list, tset: set, targets: list) -> dict:
+    if not lst:
+        return {}
+    # form A: [{"index": .., "speaker": .., "text": ..?}, ...]
+    if all(isinstance(x, dict) for x in lst):
+        m = {}
+        for x in lst:
+            idx = _as_int(x.get("index"))
+            sp = x.get("speaker")
+            if idx is not None and isinstance(sp, str) and sp.strip() and idx in tset:
+                tx = x.get("text")
+                m[idx] = (sp.strip(), tx.strip() if isinstance(tx, str) and tx.strip() else None)
+        if m:
+            return m
+    # form B: ["SPEAKER", ...] in target order
+    if all(isinstance(x, str) for x in lst):
+        m = {}
+        for i, sp in enumerate(lst):
+            if i < len(targets) and sp.strip():
+                m[targets[i]] = (sp.strip(), None)
+        if m:
+            return m
+    return {}
+
+
+def _pick_majority(candidates):
+    """The unique speaker holding a strict majority (≥2 votes) of ``candidates``, else ``None``.
+
+    ``None`` entries (a re-run that failed to return a speaker for an entry) are ignored;
+    a tie at the top — or fewer than 2 votes for the leader — yields ``None`` so the caller
+    keeps the original speaker rather than guessing.
+    """
+    counts: dict = {}
+    for c in candidates:
+        if c:
+            counts[c] = counts.get(c, 0) + 1
+    if not counts:
+        return None
+    top = max(counts.values())
+    if top < 2:
+        return None
+    leaders = [sp for sp, c in counts.items() if c == top]
+    return leaders[0] if len(leaders) == 1 else None
+
+
+def group_retry_indices(failed: list[int], n: int, batch: int) -> list[list[int]]:
+    """Group target indices that need one more LLM call per group (retry passes, and the
+    归属抽样's initial grouping of close-together targets).
+
+    Indices are walked in ascending order. A group keeps growing while the gap to the next
+    index is ≤ ``n`` (the two entries' ±n context windows overlap, so one call covers
+    both) and it holds at most ``batch`` targets — otherwise a new group starts, so one
+    call never spans a huge run of irrelevant entries between two far-apart entries.
+    """
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    for i in sorted(failed):
+        if cur and (i - cur[-1] > max(n, 1) or len(cur) >= batch):
+            groups.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _llm_call(llm: LLMConfig, generation: GenerationConfig, messages, handle=None) -> str:
+    """One chat-completion against the configured LLM (streaming or not); returns the text.
+
+    Shares the parse pipeline's transport (which already handles a Qwen3 thinking model's
+    ``reasoning_content``) and its sampling params, so the in-parse re-judgment stages make
+    the exact same kind of call the parse does — only the prompt differs.
+    """
+    if llm.stream:
+        content, _fr, _usage = _llm_chat_completion_stream(
+            llm.base_url, llm.api_key, llm.model_name, messages,
+            temperature=generation.temperature, top_p=generation.top_p,
+            presence_penalty=generation.presence_penalty,
+            max_tokens=generation.max_tokens, top_k=generation.top_k,
+            min_p=generation.min_p, banned_tokens=generation.banned_tokens,
+            handle=handle,
+        )
+    else:
+        content, _fr, _usage = _llm_chat_completion(
+            llm.base_url, llm.api_key, llm.model_name, messages,
+            temperature=generation.temperature, top_p=generation.top_p,
+            presence_penalty=generation.presence_penalty,
+            max_tokens=generation.max_tokens, top_k=generation.top_k,
+            min_p=generation.min_p, banned_tokens=generation.banned_tokens,
+        )
+    return content
+
+
+def _batch_user_prompt(template: str, context: str, size: int, n: int,
+                       roster: list[str] | None = None) -> str:
+    """Fill the user template's ``{context}`` and append the roster + context-scope notes.
+
+    ``replace`` (not ``format``) keeps a user-edited template containing other braces from
+    raising. The appended notes carry the book-wide character roster (a corrected speaker
+    may name a character absent from the local window; omitted when the roster is empty)
+    and the target count with the ``±n`` context scope, so the model knows exactly what it
+    may copy from and reason over.
+    """
+    body = template.replace("{context}", context)
+    extra = []
+    if roster:
+        extra.append("【本书角色】" + "、".join(roster))
+    extra.append(
+        f"【上下文范围】上方窗口含 {size} 个 target=true 的目标条目（请逐一给出 speaker），"
+        f"目标块前后各有 {n} 条未标记 target 的上下文条目，仅供理解、不得改动。"
+    )
+    return body + "\n\n" + "\n".join(extra)
+
+
 def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, context,
                      roster) -> list | None:
     """Re-run the parse LLM on one flagged entry and resolve the re-derivation by
@@ -987,9 +1360,6 @@ def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, c
     re-derived entries (the raw reply dicts), or ``None`` when no consensus forms —
     the caller then keeps the entry unchanged.
     """
-    # Local imports: speaker_check imports this module at top level (cycle).
-    from .speaker_check import _llm_call, _pick_majority
-
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user",
@@ -1058,10 +1428,6 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
     Returns ``(entries, flagged, fixed)`` — the updated list (the original list object
     when nothing was applied), the count of flagged entries, the count rewritten.
     """
-    # Local imports: mix_check / speaker_check both import this module (cycle).
-    from .mix_check import build_roster
-    from .speaker_check import build_batch_window
-
     flagged = suspicious_entry_indices(entries)
     if not flagged:
         # 零命中也留一行日志：静默退出会被用户误读成「这个阶段没跑/不在链路里」
@@ -1144,7 +1510,7 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
 #    知/难 时是 知道/难道 而非标签（形态守卫，不是词表黑名单）；
 # ② 极短条目 len(text.strip()) ≤ 10（「嗯」/「好」式单行应答）；
 # ③ 多角色场景——±10 条窗口内 ≥4 个不同非 NARRATOR 说话人。
-# 重判完全镜像 check_file 的批内协议（首判 → 分歧条目动态多数投票：票 =
+# 重判走共享的重判批协议（首判 → 分歧条目动态多数投票：票 =
 # [原值, 首判] + 至多 3 次同窗口重试，逐条一出严格多数即停，3 次后仍无共识 →
 # 保留原值）；只允许 speaker 变化 + 台词确定性去外层引号。每本的纯随机桶读数
 # 记入任务日志 + ``<workspace>/config/spot_check_history.json``——采样率永不自动
@@ -1327,7 +1693,7 @@ def _append_spot_history(handle, file_stem: str, stats: dict) -> None:
 
 
 def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
-                        check: SpeakerCheckConfig | None, entries: list, rate: float,
+                        entries: list, rate: float,
                         rng: "random.Random" | None = None) -> tuple:
     """Post-parse speaker spot audit (runs in ``generate_file`` after
     ``validate_sentence_splits`` and BEFORE the mechanical NARRATOR merge — a
@@ -1336,17 +1702,18 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
 
     Samples ``rate`` of ALL entries into two disjoint buckets (1/3 pure random = the
     unbiased error-rate gauge; 2/3 risk-weighted, feature-count cascade) and re-judges
-    them through the 角色匹配检查 prompt and the exact ``check_file`` batch protocol
-    (first pass → dynamic majority vote per discrepant entry, ≤3 same-window retries,
-    strict majority or keep original; only ``speaker`` may change, plus the
-    deterministic outer-quote strip of a character line). Fixes are applied in memory
-    on shallow copies — the parse task then bakes them into ITS OWN base file (the
-    检查阶段-never-rewrite-the-base invariant constrains the two standalone check
-    stages, not the parse task, which owns the file it is writing).
+    them through the bundled re-judgment prompts (``check_prompts`` — no longer
+    user-configurable) and the shared batch protocol (first pass → dynamic majority
+    vote per discrepant entry, ≤3 same-window retries, strict majority or keep
+    original; only ``speaker`` may change, plus the deterministic outer-quote strip of
+    a character line). Batch geometry comes from
+    ``generation.check_batch_size`` / ``check_context_window``. Fixes are applied in
+    memory on shallow copies — the parse task then bakes them into ITS OWN base file,
+    which is the parse output (nothing else may rewrite it).
 
-    ``check is None`` / rate ≤ 0 / empty list → the list unchanged with zeroed stats.
-    ``rng`` (tests) injects a seeded ``random.Random``; ``None`` → a fresh one per run
-    (no cross-book correlation). Cancel propagates and nothing is applied.
+    rate ≤ 0 / empty list → the list unchanged with zeroed stats. ``rng`` (tests)
+    injects a seeded ``random.Random``; ``None`` → a fresh one per run (no cross-book
+    correlation). Cancel propagates and nothing is applied.
 
     Returns ``(entries, stats)`` — the updated list (the original list object when
     nothing was applied) and ``{checked, fixed, rate, random_n, random_errors,
@@ -1357,20 +1724,11 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
         "random_n": 0, "random_errors": 0, "random_rate": None,
         "risk_n": 0, "risk_errors": 0,
     }
-    if check is None or rate <= 0 or not entries:
+    if rate <= 0 or not entries:
         return entries, stats
 
-    # Local imports: speaker_check / mix_check both import this module (cycle).
-    from . import check_prompts
-    from .mix_check import build_roster, group_retry_indices
-    from .speaker_check import (
-        _batch_user_prompt,
-        _llm_call,
-        _pick_majority,
-        build_batch_window,
-        parse_speaker_map_full,
-        strip_outer_quotes,
-    )
+    from . import check_prompts  # bundled re-judgment prompt defaults
+
     n_random, n_risk = spot_budget(len(entries), float(rate))
     if n_random + n_risk == 0:
         return entries, stats
@@ -1382,16 +1740,17 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
     risk_set = set(risk_targets)
     all_targets = sorted(random_targets + risk_targets)
 
-    n = max(0, int(check.context_window or 0))
-    batch = max(1, int(check.batch_size or 0))
+    n = max(0, int(generation.check_context_window or 0))
+    batch = max(1, int(generation.check_batch_size or 0))
     original = entries  # every window (first pass + all re-runs) is built from ORIGINAL
     result = [dict(e) for e in original]
     roster = build_roster(original)
-    sys_prompt = check.system_prompt or check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
-    usr_template = check.user_prompt or check_prompts.DEFAULT_CHECK_USER_PROMPT
+    # Bundled defaults — the re-judgment prompts are no longer user-configurable.
+    sys_prompt = check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
+    usr_template = check_prompts.DEFAULT_CHECK_USER_PROMPT
 
     # Groups pre-built ONCE outside the loop: each group of close-together targets is
-    # one LLM call (the mix retry grouping rule), non-targets inside the span ride
+    # one LLM call (the shared retry grouping rule), non-targets inside the span ride
     # along as unflagged context — wider coverage than the nominal rate, cheaper.
     groups = group_retry_indices(all_targets, n, batch)
 
@@ -1401,7 +1760,7 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
 
     handle.log(
         f"归属抽样：{len(all_targets)} 条（纯随机 {len(random_targets)} + 风险加权 "
-        f"{len(risk_targets)}，共 {len(groups)} 组），复用角色匹配检查协议重判…"
+        f"{len(risk_targets)}，共 {len(groups)} 组），复用重判批协议…"
     )
 
     fixed = 0
@@ -1457,7 +1816,7 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
         ]
 
         if discrepant:
-            # -- Disagreement → dynamic majority voting (the check_file protocol) --
+            # -- Disagreement → dynamic majority voting (the shared protocol) --
             handle.log(f"  检测到 {len(discrepant)} 条分歧，进入动态投票…")
             # votes[t] = [原值, 首判, 重试1, (重试2), (重试3)]
             votes: dict = {t: [original[t].get("speaker"), first_map[t]] for t in discrepant}
@@ -1509,8 +1868,8 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
                 # winner None (no consensus) or == original → the original is kept.
         # (no disagreement → the group matches the originals; nothing to re-vote)
 
-        # The check prompt's optional "text" keys: the stored text unwrapped of its
-        # outer quotation marks. Applied only when the entry's FINAL speaker is a
+        # The re-judgment prompt's optional "text" keys: the stored text unwrapped of
+        # its outer quotation marks. Applied only when the entry's FINAL speaker is a
         # character and the reply matches the mechanically computed strip (the value
         # written is the computed one — this stage can never rewrite text beyond the
         # quote removal; instruct and every context neighbour stay untouched).
@@ -1574,8 +1933,6 @@ def _is_pure_saying_tag(entry, title_test) -> bool:
     t = (entry.get("text") or "").strip()
     if not t or len(t) > PURE_SAY_TAG_MAX_LEN:
         return False
-    from .mix_check import _QUOTE_CHARS  # 局部 import：与 spot 段同一循环依赖规避模式
-
     if any(ch in _QUOTE_CHARS for ch in t):
         return False
     if title_test(t):
@@ -1622,7 +1979,6 @@ def delete_pure_saying_tags(entries, title_test) -> tuple:
 
 
 def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generation: GenerationConfig,
-                  check: SpeakerCheckConfig | None = None,
                   rng: "random.Random" | None = None) -> dict:
     """Task worker: turn one ``02_split_text`` file into its ``{speaker, text, instruct}``
     JSON entries.
@@ -1641,14 +1997,14 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     double quotes that still contain a ``…道：`` speech tag inside are treated as
     likely failed sentence splits and re-validated: each such entry is re-run
     through the *same parse prompt* with the entry's text as the chunk plus a
-    ±``check.context_window`` entry context window. The re-derivations vote
-    (1 base call + up to 2 retries, majority wins; a 4th call only if the 3 calls
-    are still undecided) and a strict majority replaces the entry — a 1-part
+    ±``generation.check_context_window`` entry context window. The re-derivations
+    vote (1 base call + up to 2 retries, majority wins; a 4th call only if the 3
+    calls are still undecided) and a strict majority replaces the entry — a 1-part
     consensus is a clean rewrite (outer wrap / leading tag stripped), a
-    multi-part one a split. No consensus keeps the entry unchanged (never
-    guess). ``check`` is the ``speaker_check`` config section (its
-    ``context_window`` is reused for the validation windows); ``None`` defaults
-    the window to 4.
+    multi-part one a split. No consensus keeps the entry unchanged (never guess).
+    Gated by ``generation.revalidate_splits`` (default on): when off the stage is
+    skipped with one log line and the ``suspicious`` / ``suspicious_fixed`` result
+    fields stay zero.
 
     Before the spot audit, standalone pure-attribution-tag entries are deleted
     deterministically (no LLM calls): a NARRATOR entry of ≤10 chars, quote-free,
@@ -1663,9 +2019,9 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     After that, an attribution spot audit (``spot_check_speakers``,
     ``generation.spot_check_rate`` — 0 disables) re-judges a small sample of ALL
     entries (1/3 pure random = the unbiased whole-book error-rate gauge, 2/3
-    risk-weighted by feature-count cascade) through the 角色匹配检查 prompt and
-    ``check_file``'s batch protocol; high-confidence corrections are baked into the
-    base file this task writes. Each book's pure-random-bucket reading is logged and
+    risk-weighted by feature-count cascade) through the bundled re-judgment prompts
+    (``check_prompts``) and the shared re-judgment batch protocol; high-confidence
+    corrections are baked into the base file this task writes. Each book's pure-random-bucket reading is logged and
     appended to ``<workspace>/config/spot_check_history.json`` — the rate itself is
     NEVER auto-reduced (the user decides manually from the settings page).
     ``rng`` (tests) injects a seeded ``random.Random`` for deterministic sampling.
@@ -1741,35 +2097,45 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
         # 断句失败校验（机械旁白合并之前——拆出的旁白段随后照常合并）：外层双引号
         # 包裹、引号内含「…道：」标签的条目 = 疑似断句失败 → 带上下文窗口重跑解析
         # LLM，多者胜投票（1+2 次，无共识再第 4 次），胜出者整体替换该条目。
-        all_entries, suspicious, suspicious_fixed = validate_sentence_splits(
-            handle, llm, generation, sys_prompt, usr_template, all_entries,
-            context_window=(int(check.context_window) if check is not None else 4),
-        )
+        if generation.revalidate_splits:
+            all_entries, suspicious, suspicious_fixed = validate_sentence_splits(
+                handle, llm, generation, sys_prompt, usr_template, all_entries,
+                context_window=int(generation.check_context_window or 0),
+            )
+        else:
+            # 开关关闭：整体跳过并留一行日志（防静默被误读为阶段缺失），结果字段保持 0。
+            handle.log("断句失败校验已关闭（配置）——本任务跳过该阶段")
+            suspicious, suspicious_fixed = 0, 0
 
         # 纯归属标签清理（零 LLM 成本；在归属抽样之前——抽样重判可能把标签条改成角色
         # speaker，使其逃过本规则，且角色会用本人声音念第三人称标签）：整条内容就是
         # 语气标签（老道瞪眼怒道。——无引号，断句校验不可见）的短 NARRATOR 条，紧邻
         # 台词条目时删除；标题守卫与机械合并同一 is_chapter_title；知道/难道 形态守卫。
-        all_entries, tags_deleted, deleted_tag_texts = delete_pure_saying_tags(
-            all_entries, is_chapter_title,
-        )
-        if tags_deleted:
-            handle.log(
-                f"纯归属标签清理：删除 {tags_deleted} 条独立短标签条（≤10 字 NARRATOR、"
-                f"末尾「说/道/问/喊/答」、邻接对白）"
-                + "、".join(f"「{t[:15]}」" for t in deleted_tag_texts[:3])
+        if generation.delete_saying_tags:
+            all_entries, tags_deleted, deleted_tag_texts = delete_pure_saying_tags(
+                all_entries, is_chapter_title,
             )
+            if tags_deleted:
+                handle.log(
+                    f"纯归属标签清理：删除 {tags_deleted} 条独立短标签条（≤10 字 NARRATOR、"
+                    f"末尾「说/道/问/喊/答」、邻接对白）"
+                    + "、".join(f"「{t[:15]}」" for t in deleted_tag_texts[:3])
+                )
+            else:
+                # 零命中也留一行日志：与断句校验同一理由——静默退出会被误读成阶段缺失。
+                handle.log("纯归属标签清理：0 条独立短标签条（无删除，零 LLM 调用）")
         else:
-            # 零命中也留一行日志：与断句校验同一理由——静默退出会被误读成阶段缺失。
-            handle.log("纯归属标签清理：0 条独立短标签条（无删除，零 LLM 调用）")
+            # 开关关闭：整体跳过并留一行日志，结果字段保持 0。
+            handle.log("纯归属标签条删除已关闭（配置）——本任务跳过该阶段")
+            tags_deleted, deleted_tag_texts = 0, []
 
         # 归属抽样（机械旁白合并之前——重判可把 NARRATOR 条改成角色条，合并必须看到
         # 改后 speaker）：按 spot_check_rate 从全部条目抽 1/3 纯随机（整书错误率仪表）
-        # + 2/3 风险加权（特征数级联），复用角色匹配检查的提示词与批内投票协议重判，
+        # + 2/3 风险加权（特征数级联），用捆绑重判提示词 + 共享重判批协议重判，
         # 高置信改判在内存中生效、随本任务自己的基文件写出。
         spot_rate = float(generation.spot_check_rate or 0)
         all_entries, spot_stats = spot_check_speakers(
-            handle, llm, generation, check, all_entries, spot_rate, rng,
+            handle, llm, generation, all_entries, spot_rate, rng,
         )
 
         # 机械后处理：相邻旁白合并（确定性，不经 LLM；章标题两侧不合并）——去掉 TTS
@@ -1809,7 +2175,7 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "merged_narrator": merged_pairs,
             "suspicious": suspicious,
             "suspicious_fixed": suspicious_fixed,
-            # 纯归属标签清理：确定性删除的独立短标签条数（零 LLM 成本，恒执行）
+            # 纯归属标签清理：确定性删除的独立短标签条数（零 LLM 成本；开关关闭时为 0）
             "tags_deleted": tags_deleted,
             "speakers": speakers,
             # 归属抽样（解析任务自有的基文件内修正，不违反「检查阶段不改写基文件」）

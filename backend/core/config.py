@@ -135,34 +135,6 @@ class PromptsConfig(BaseModel):
     user_prompt: str = ""
 
 
-class SpeakerCheckConfig(BaseModel):
-    # Speaker 检查 (post-parse) settings — fully independent of the 解析 prompts above.
-    # batch_size: how many TARGET entries are re-judged per LLM call (one batch); each batch
-    # is flanked by ``±context_window`` context entries, so a full batch sends at most
-    # ``batch_size + 2*context_window`` entries (clamped down at the file's start / end).
-    # A batch of 50 with a window of 4 → 50 targets + 4 before + 4 after = ≤ 58 entries.
-    batch_size: int = 20
-    # context_window: how many surrounding entries (on EACH side of the target block) are
-    # sent as context when checking a batch (they are marked non-target: used to reason,
-    # never re-judged).
-    context_window: int = 4
-    # Dedicated 检查 prompts. Empty values fall back to the bundled defaults
-    # (``backend/engines/check_prompts.py`` / ``resources/default_check_prompts.txt``).
-    system_prompt: str = ""
-    user_prompt: str = ""
-
-
-class MixCheckConfig(BaseModel):
-    # 段落混合检查 (post-parse, runs BEFORE 角色匹配检查) settings.
-    # NO batch_size / context_window here: the mix check deliberately shares the
-    # 角色匹配检查 geometry (``SpeakerCheckConfig.batch_size / context_window``) by
-    # design, so the two stages stay batched identically from one set of settings.
-    # Prompts are its own: empty values fall back to the bundled defaults
-    # (``backend/engines/mix_check_prompts.py`` / ``resources/default_mix_check_prompts.txt``).
-    system_prompt: str = ""
-    user_prompt: str = ""
-
-
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000  # chars per chunk sent to the LLM
     max_tokens: int = 4096  # max completion tokens per call
@@ -181,6 +153,18 @@ class GenerationConfig(BaseModel):
     # 每本的纯随机桶读数记入任务日志 + <workspace>/config/spot_check_history.json；
     # 降不降采样率由用户在设置页按读数手动决定（不自动降）。
     spot_check_rate: float = 0.05
+    # 解析内「断句失败校验」开关（设置页可切换，默认开 = 现有行为不变）：外层双引号包裹
+    # 且引号内含「…道：」标签的条目逐条重跑解析 LLM 校验。关 = 解析任务跳过该阶段并留
+    # 一行日志（结果字段 suspicious / suspicious_fixed 为 0）。
+    revalidate_splits: bool = True
+    # 解析内「纯归属标签条清理」开关（设置页可切换，默认开）：整条即纯归属标签的短
+    # NARRATOR 条确定性删除（零 LLM 成本）。关 = 跳过该阶段并留一行日志（tags_deleted 为 0）。
+    delete_saying_tags: bool = True
+    # 解析内重判阶段的批几何（自已退役的 speaker_check 段迁入）：每次 LLM 调用重判的
+    # 目标条目数 / 目标块两侧的上下文条数。断句失败校验只用 context_window；归属抽样两者
+    # 都用。设置页不露出（config/app.json 可编辑）。
+    check_batch_size: int = 20
+    check_context_window: int = 4
 
 
 class AppConfig(BaseModel):
@@ -192,8 +176,6 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
     persona_prompts: PersonaPromptsConfig = Field(default_factory=PersonaPromptsConfig)
-    speaker_check: SpeakerCheckConfig = Field(default_factory=SpeakerCheckConfig)
-    mix_check: MixCheckConfig = Field(default_factory=MixCheckConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)
