@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
-import { listVoices, makeClones, prepareFoundations, ttsStatus } from '@/api/tts'
+import { listVoices, makeClones, prepareFoundations, selectVoice, ttsStatus } from '@/api/tts'
 import { downloadUrl } from '@/utils/fileops'
 import type { MakeClonesResult, PrepareFoundationsResult, TTSStatus, VoiceItem } from '@/types'
 
@@ -16,6 +16,7 @@ import CardTitle from '@/components/ui/CardTitle.vue'
 import CardDescription from '@/components/ui/CardDescription.vue'
 import CardContent from '@/components/ui/CardContent.vue'
 import Input from '@/components/ui/Input.vue'
+import Select from '@/components/ui/Select.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
@@ -27,7 +28,9 @@ import {
   Users,
   Sparkles,
   AudioWaveform,
+  Ear,
   Loader2,
+  X,
   XCircle,
   CheckCircle2,
   RefreshCw,
@@ -63,8 +66,29 @@ const cloneTaskId = ref<string | null>(null)
 const cloneResult = ref<MakeClonesResult | null>(null)
 const cloneTask = computed(() => taskStore.tasks.find((t) => t.id === cloneTaskId.value) ?? null)
 
-// TTS concurrency for Phase 2 (parallel subprocesses; VRAM scales with it). Seeded from config.
-const cloneConcurrency = ref(1)
+// Phase 2 rows-per-batch cap (ONE long-lived worker process, tensor batches; VRAM scales
+// with it). Seeded from config — shares tts.batch_concurrency with 音频合成.
+const cloneConcurrency = ref(4)
+
+// Per-character clone-candidate count for Phase 2: 'auto' (absolute log-scale ladder on each
+// character's OWN line count — a 20k-line 旁白 can't demote the leads) or a fixed 2/4/6/8.
+// Page-local (not persisted to config) — a per-run choice.
+const candidateCount = ref('auto')
+
+// 选择音色 overlay state: which character's candidates are shown, and which candidate the
+// user staged (null = no explicit pick → the default first candidate stays active).
+const pickerName = ref<string | null>(null)
+const pickerChoice = ref<string | null>(null)
+const pickerBusy = ref(false)
+const pickerError = ref('')
+// The overlay always reads the LATEST list (a running task's progress watcher re-loads it,
+// so the rows track live results); the character vanishing from the list closes the overlay.
+const pickerTarget = computed(
+  () => (pickerName.value ? speakers.value.find((s) => s.name === pickerName.value) ?? null : null),
+)
+watch(pickerTarget, (t) => {
+  if (!t && pickerName.value) closePicker()
+})
 
 // Which characters the in-flight phase task targets: null = 全部（批量）; a list = the specific
 // row(s) of a single-character run. Lets the per-row 生成中/制作中 overlay light up ONLY the rows
@@ -146,7 +170,7 @@ watch(() => project.activeScript, (v) => {
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
-  cloneConcurrency.value = settings.config?.tts.parallel_workers ?? 1
+  cloneConcurrency.value = settings.config?.tts.batch_concurrency ?? 4
   try {
     status.value = await ttsStatus()
   } catch {
@@ -191,6 +215,7 @@ async function doClones(opts: {
       ...opts,
       concurrency: cloneConcurrency.value,
       script: script.value || undefined,
+      candidate_count: candidateCount.value === 'auto' ? null : Number(candidateCount.value),
     })
     cloneTaskId.value = task_id
     await taskStore.refresh()
@@ -201,10 +226,11 @@ async function doClones(opts: {
   }
 }
 
-// Coerce the TTS concurrency input (the Input component emits a string) to a sane integer ≥ 1.
+// Coerce the rows-per-batch input (the Input component emits a string) to an integer in
+// [1, 64] — the backend's clamp_concurrency is the final guard.
 function onConcurrency(v: string | number) {
   const n = Math.trunc(Number(v))
-  cloneConcurrency.value = Number.isFinite(n) && n >= 1 ? n : 1
+  cloneConcurrency.value = Number.isFinite(n) ? Math.min(64, Math.max(1, n)) : 1
 }
 
 // Phase 1: re-call the LLM for this character's foundation (honours the per-row prompt override).
@@ -220,6 +246,55 @@ function remakeClone(v: VoiceItem) {
 
 function previewUrl(v: VoiceItem): string {
   return v.preview ? downloadUrl('04_voice_profiles', v.preview) : ''
+}
+
+function candidateUrl(c: { preview: string }): string {
+  return c.preview ? downloadUrl('04_voice_profiles', c.preview) : ''
+}
+
+// The currently ACTIVE candidate id: the explicit pick, or the default first one.
+function activeCandidateId(v: VoiceItem): string {
+  return v.selected_audio_id ?? '1'
+}
+
+// 选择音色 is only meaningful once the character holds ≥2 distinct candidates (auto-mode
+// cameos get 1, as do legacy single-take entries — those rows show 默认 and stay disabled).
+function pickDisabled(v: VoiceItem): boolean {
+  return cloneRunning.value || foundationRunning.value || (v.candidates?.length ?? 0) < 2
+}
+
+function pickLabel(v: VoiceItem): string {
+  return v.selected_audio_id ? `已选 #${v.selected_audio_id}` : '默认'
+}
+
+function openPicker(v: VoiceItem) {
+  pickerError.value = ''
+  pickerChoice.value = v.selected_audio_id // null = the default first candidate
+  pickerName.value = v.name
+}
+
+function closePicker() {
+  pickerName.value = null
+  pickerChoice.value = null
+  pickerError.value = ''
+}
+
+async function confirmPick() {
+  const v = pickerTarget.value
+  if (!v || pickerBusy.value) return
+  pickerBusy.value = true
+  pickerError.value = ''
+  try {
+    const r = await selectVoice(v.name, pickerChoice.value)
+    const what = r.selected_audio_id ? `候选 #${r.selected_audio_id}` : '默认（第 1 条）'
+    toast({ title: '音色已更新', variant: 'success', description: `已为 ${r.speaker} 应用 ${what} 作为最终音色` })
+    closePicker()
+    loadVoices()
+  } catch (e: any) {
+    pickerError.value = e?.message || '保存失败'
+  } finally {
+    pickerBusy.value = false
+  }
 }
 
 function cancelFoundation() {
@@ -303,7 +378,9 @@ watch(
 </script>
 
 <template>
-  <div class="space-y-4">
+  <!-- -mx-16：角色表新增「选择音色」按钮后 1152px 列宽不够——本页整体向两侧各借 64px（≈一个按钮宽），
+       只借 MainLayout max-w-6xl 居中留出的空白，不改共享布局，其余页面不受影响。 -->
+  <div class="-mx-16 space-y-4">
     <div>
       <h1 class="flex items-center gap-3 text-2xl font-bold tracking-tight">
         角色配音
@@ -379,7 +456,8 @@ watch(
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><AudioWaveform class="h-5 w-5" />阶段 2 · 制作克隆音频</CardTitle>
           <CardDescription>
-            仅调用 TTS（<b>不使用 LLM</b>），读回已保存的语音推理基础，为每个角色渲染克隆种子音频。
+            仅调用 TTS（<b>不使用 LLM</b>），读回已保存的语音推理基础，为每个角色渲染若干条候选克隆音频
+            （备选音频数可选 自动 / 2 / 4 / 6 / 8）；完成后在下方角色列表试听并单选最终音色，未选择时默认使用第 1 条。
             <br /><span class="font-medium text-amber-500">请先关闭 LLM，以释放显存后再开始 TTS 合成。</span>
           </CardDescription>
         </CardHeader>
@@ -391,15 +469,31 @@ watch(
               {{ cloneBusy ? '制作中…' : '批量制作克隆音频' }}
             </Button>
             <label class="flex items-center gap-2 text-sm text-muted-foreground">
-              TTS 并发数
+              批内行数（上限）
               <Input
                 :modelValue="cloneConcurrency"
                 type="number"
                 min="1"
+                max="64"
                 class="h-8 w-20"
                 :disabled="cloneBlocked"
                 @update:modelValue="onConcurrency"
               />
+            </label>
+            <label class="flex items-center gap-2 text-sm text-muted-foreground">
+              备选音频数
+              <Select
+                :modelValue="candidateCount"
+                class="h-8 w-28"
+                :disabled="cloneBlocked"
+                @update:modelValue="candidateCount = String($event)"
+              >
+                <option value="auto">自动</option>
+                <option value="2">2</option>
+                <option value="4">4</option>
+                <option value="6">6</option>
+                <option value="8">8</option>
+              </Select>
             </label>
             <span class="ml-auto text-xs text-muted-foreground">克隆音频：{{ cloneDone }} / {{ nonAlias.length }}</span>
           </div>
@@ -495,6 +589,12 @@ watch(
                   <td class="py-2">
                     <div class="flex items-center justify-end gap-2">
                       <MiniAudioPlayer v-if="v.preview" :src="previewUrl(v)" />
+                      <span class="w-14 shrink-0 text-right text-xs text-muted-foreground" :title="pickLabel(v)">
+                        {{ pickLabel(v) }}
+                      </span>
+                      <Button variant="outline" size="sm" :disabled="pickDisabled(v)" @click="openPicker(v)">
+                        <Ear class="h-3.5 w-3.5" />选择音色
+                      </Button>
                       <Button variant="outline" size="sm" :disabled="foundationBlocked" @click="regenFoundation(v)">
                         <RefreshCw class="h-3.5 w-3.5" />重新生成
                       </Button>
@@ -522,5 +622,72 @@ watch(
       <template #icon><XCircle class="h-4 w-4 shrink-0" /></template>
       {{ error }}
     </Alert>
+
+    <!-- 选择音色 overlay：试听该角色全部候选克隆音频，单选一个为最终音色（单选后行内试听随之切换） -->
+    <div
+      v-if="pickerTarget"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      @click.self="closePicker"
+    >
+      <div class="max-h-[80vh] w-full max-w-lg space-y-4 overflow-y-auto rounded-lg border bg-background p-5 shadow-lg">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold">选择音色 · {{ pickerTarget.name }}</h2>
+            <p class="mt-1 text-xs text-muted-foreground">
+              逐个试听候选，单选一个作为该角色的最终音色；不选则默认使用第 1 条。
+            </p>
+          </div>
+          <Button variant="ghost" size="icon" :disabled="pickerBusy" @click="closePicker">
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
+
+        <div class="space-y-1.5">
+          <label
+            v-for="c in pickerTarget.candidates"
+            :key="c.id"
+            class="flex cursor-pointer items-center gap-3 rounded px-2 py-1.5 hover:bg-accent/50"
+            :class="{ 'bg-accent/60': pickerChoice === c.id }"
+          >
+            <input
+              type="radio"
+              class="h-4 w-4 shrink-0 accent-primary"
+              name="voice-candidate"
+              :checked="pickerChoice === c.id"
+              :disabled="pickerBusy"
+              @change="pickerChoice = c.id"
+            />
+            <span class="min-w-0 flex-1 truncate text-sm">
+              候选 #{{ c.id }}
+              <span v-if="c.id === '1'" class="ml-1 text-xs text-muted-foreground">（默认）</span>
+            </span>
+            <Badge v-if="c.id === activeCandidateId(pickerTarget)" variant="success" class="shrink-0">当前</Badge>
+            <MiniAudioPlayer v-if="c.preview" :src="candidateUrl(c)" class="shrink-0" />
+          </label>
+          <p v-if="!pickerTarget.candidates.length" class="px-2 py-1.5 text-sm text-muted-foreground">
+            该角色暂无候选音频——请先在阶段 2 制作克隆音频。
+          </p>
+        </div>
+
+        <Alert v-if="pickerError" variant="destructive">{{ pickerError }}</Alert>
+
+        <div class="flex items-center justify-end gap-2">
+          <Button
+            v-if="pickerTarget.selected_audio_id"
+            variant="outline"
+            size="sm"
+            :disabled="pickerBusy"
+            @click="pickerChoice = null"
+          >
+            恢复默认（第 1 条）
+          </Button>
+          <Button variant="outline" size="sm" :disabled="pickerBusy" @click="closePicker">取消</Button>
+          <Button :disabled="pickerBusy || !pickerTarget.candidates.length" @click="confirmPick">
+            <Loader2 v-if="pickerBusy" class="h-4 w-4 animate-spin" />
+            确认
+          </Button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

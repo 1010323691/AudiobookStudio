@@ -283,6 +283,40 @@ def test_migrate_entries_in_dict_kind(tmp_path):
     assert data["A"]["ref_audio"] == "04_voice_profiles/designed_voices/x.wav"
 
 
+def test_migrate_entries_in_voice_config_candidates_untouched(tmp_path):
+    # voice_config entries may also carry a candidates list (per-character clone
+    # candidates): the migration must touch only each entry's top-level ref_audio and
+    # leave the nested candidates' already-relative paths byte-for-byte intact.
+    ws = tmp_path / "ws"
+    dv = ws / "04_voice_profiles" / "designed_voices"
+    dv.mkdir(parents=True)
+    for name in ("x.wav", "y.wav"):
+        (dv / name).write_bytes(b"0")
+    f = ws / "04_voice_profiles" / "voice_config.json"
+    f.write_text(json.dumps({
+        "A": {
+            "type": "clone",
+            "ref_audio": str(ws / dv / "x.wav"),  # legacy absolute -> migrated
+            "candidates": [
+                {"id": "1", "ref_audio": "04_voice_profiles/designed_voices/x.wav", "seed": 1},
+                {"id": "2", "ref_audio": "04_voice_profiles/designed_voices/y.wav", "seed": 2},
+            ],
+            "selected_audio_id": "1",
+        },
+    }), encoding="utf-8")
+    n, data = pathio.migrate_entries_in(f, ws, "dict", ("ref_audio",))
+    assert n == 1
+    assert data["A"]["ref_audio"] == "04_voice_profiles/designed_voices/x.wav"
+    assert [c["ref_audio"] for c in data["A"]["candidates"]] == [
+        "04_voice_profiles/designed_voices/x.wav",
+        "04_voice_profiles/designed_voices/y.wav",
+    ]
+    assert data["A"]["selected_audio_id"] == "1"
+    # idempotent: a second pass migrates nothing new
+    n2, _ = pathio.migrate_entries_in(f, ws, "dict", ("ref_audio",))
+    assert n2 == 0
+
+
 def test_migrate_entries_in_missing_file_is_inert(tmp_path):
     n, data = pathio.migrate_entries_in(tmp_path / "nope.json", tmp_path / "ws", "list")
     assert n == 0 and data is None

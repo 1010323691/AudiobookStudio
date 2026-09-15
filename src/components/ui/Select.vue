@@ -14,5 +14,8 @@ const emit = defineEmits<{ (e: 'update:modelValue', v: string | number): void }>
       props.class,
     )"
     @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)"
-  />
+  >
+    <!-- 原生 <select> 的选项来自父组件的默认插槽（<option>…），必须在此渲染。 -->
+    <slot />
+  </select>
 </template>

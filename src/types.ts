@@ -164,6 +164,11 @@ export interface VoiceItem {
   alias_of: string // non-empty -> this label points at another character's voice
   description: string
   preview: string // path relative to 04_voice_profiles/ (playable via downloadUrl('04_voice_profiles', preview)); '' if none
+  /** The character's clone candidates (new format; a legacy single-take entry synthesises
+   *  one, entries without a clone yield []). ``preview`` is relative to 04_voice_profiles/. */
+  candidates: { id: string; preview: string; seed: number }[]
+  /** The user's candidate pick; null = no explicit pick (the first candidate is active). */
+  selected_audio_id: string | null
 }
 export interface VoicesListResult {
   has_script: boolean
@@ -182,16 +187,26 @@ export interface PrepareFoundationsOptions {
 export interface MakeClonesOptions {
   speakers?: string[]
   new_only?: boolean
-  /** Number of parallel TTS subprocesses; undefined → backend default (1). */
+  /** 批内行数上限（单个 worker 进程内的 GPU 张量批；1 = 逐条串行；1..64）；
+   *  undefined → 后端缺省 (config.tts.batch_concurrency=4)。 */
   concurrency?: number
   /** Which parsed JSON to read for the character set; undefined → most recent. */
   script?: string
+  /** Per-character clone-candidate count: undefined/null → auto (absolute log-scale
+   *  ladder on each character's OWN line count — the 旁白's 10×+ line count can't
+   *  demote the leads); 2/4/6/8 → fixed count. */
+  candidate_count?: number | null
 }
 /** Options for ``POST /api/tts/batch`` (音频合成). */
 export interface BatchRunOptions {
   indices?: number[]
   /** Which parsed JSON (in 03_parsed_json/) to synthesize; undefined → most recent. */
   script?: string
+  /** Multi-file run (the 待合成 card's multi-select): parsed JSON file names in 03_parsed_json/.
+   *  Takes precedence over `script`; the files are synthesized one by one in a single task —
+   *  each file is its own package, a fully-done file is skipped without loading the model,
+   *  and a per-file failure is isolated (the rest of the batch continues). */
+  scripts?: string[]
   /** 批内段数（上限，1..64，不是固定并发数）：把多段垫成一个 GPU 张量批一次并行推理；
    *  undefined → 持久默认 (config.tts.batch_concurrency)。实际每批条数按段长自动分档
    *  （短段跑满、长段自动降低、超长单独），并按实测显存余量实时升降。 */
@@ -218,18 +233,59 @@ export interface MakeClonesResult {
   speakers: string[]
   voice_config_path: string
   output_dir: string
-  results: { speaker: string; ok: boolean; type: string; preview: string; reason?: string }[]
+  results: { speaker: string; ok: boolean; type: string; preview: string; reason?: string; candidates?: number }[]
 }
 export interface BatchResult {
   total: number
   completed: number
-  failed: { index: number; speaker: string; reason: string }[]
+  /** Failed segments (a multi-file run tags each entry with its file name in `script`). */
+  failed: { index: number; speaker: string; reason: string; script?: string }[]
   output_dir: string
   manifest_path: string
   /** Cumulative (after this run) number of segments already synthesized — 「累计已合成 X」. */
   done_count?: number
   /** Total synthesizable segments in the script — 「全部 Y」 (denominator of the cumulative count). */
   all_count?: number
+  /** Per-file outcomes (multi-file runs only; one entry per requested file, in request order). */
+  files?: BatchFileResult[]
+}
+/** Per-file outcome of a multi-file synthesis run (``BatchResult.files``). */
+export interface BatchFileResult {
+  /** The parsed JSON file name (03_parsed_json/). */
+  script: string
+  total: number
+  completed: number
+  /** Number of failed segments in this file (top-level `failed` carries the details, tagged). */
+  failed: number
+  output_dir: string
+  manifest_path: string
+  /** Cumulative done segments after the run (resume-aware). */
+  done_count: number
+  /** Total synthesizable segments in the file. */
+  all_count: number
+  /** Non-null when the file itself failed fatally (e.g. unreadable JSON) — isolated, the rest
+   *  of the batch continues (the reason is in the task log). */
+  error: string | null
+}
+/** Per-file synthesis stats (the 待合成 rows; ``GET /api/tts/batch-status?scripts=…``). */
+export interface BatchFileStatus {
+  name: string
+  total: number
+  completed: number
+  remaining: number
+  /** Every segment synthesized (ok + file on disk) → the row's 【已合成】 badge. */
+  complete: boolean
+  /** Distinct speakers in the file (first-appearance order, incl. NARRATOR). */
+  speakers: number
+  /** Speakers with a usable voice (an alias, or a ready clone/design/custom) — the same rule
+   *  the 角色配音 page uses for its ready state. */
+  ready: number
+  /** Speakers without a usable voice (warned before the run). */
+  missing: string[]
+}
+/** Response of ``GET /api/tts/batch-status?scripts=…`` (one entry per requested file, in order). */
+export interface BatchStatusFiles {
+  files: BatchFileStatus[]
 }
 /** Synthesis progress for the 待合成 card's 【已合成 / 总段落】 (``GET /api/tts/batch-status``). */
 export interface BatchStatus {
@@ -317,12 +373,11 @@ export interface AppConfig {
     align_tolerance: number
   }
   tts: {
-    /** 角色配音·阶段 2（克隆）的并行 TTS 子进程数。 */
+    /** 遗留字段（无读取方，仅为旧配置 round-trip 保留）。 */
     parallel_workers: number
-    /** 音频合成（一键合成）的「批内段数」上限（只是上限，不是固定并发数）：把多段垫成
-     *  一个 GPU 张量批一次并行推理（1 = 逐段串行；范围 1..64）。实际每批条数按段长自动
-     *  分档（短段跑满、长段自动降低、超长单独），并按实测显存余量实时升降。
-     *  与 parallel_workers（并行子进程，角色配音·克隆）是两种不同的并行方式。 */
+    /** 音频合成与角色配音·克隆共用的「批内行数」上限（只是上限，不是固定并发数）：把多行
+     *  垫成一个 GPU 张量批一次并行推理（1 = 逐行串行；范围 1..64）。实际每批条数按行长自动
+     *  分档（短行跑满、长行自动降低、超长单独），并按实测显存余量实时升降。 */
     batch_concurrency: number
   }
   llm: {

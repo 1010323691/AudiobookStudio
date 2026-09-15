@@ -506,3 +506,340 @@ def test_batch_status_counts(workspace):
 def test_batch_status_missing_script_degrades(workspace):
     from backend.api.tts import batch_status
     assert batch_status("nope.json") == {"total": 0, "completed": 0, "remaining": 0}
+
+
+# --------------------------------------------------------------------------- #
+# multi-file run (synthesize_multi) — the 待合成 card's multi-select
+# --------------------------------------------------------------------------- #
+
+def _seed_second_file(ws, name="t.json"):
+    """A second parsed script with its own speaker set (multi-file tests)."""
+    (ws / "03_parsed_json" / name).write_text(
+        json.dumps([{"speaker": "C", "text": "uno"}, {"speaker": "C", "text": "dos"}]),
+        encoding="utf-8",
+    )
+
+
+def _seed_voice_config(ws, entries):
+    (ws / "04_voice_profiles").mkdir(parents=True, exist_ok=True)
+    (ws / "04_voice_profiles" / "voice_config.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+
+def _seed_done_package(ws, pkg, done):
+    """Pre-seed a package with completed segments: manifest entries + files on disk.
+
+    ``done`` = a list of ``(index, speaker, text, filename)`` tuples.
+    """
+    out_dir = ws / "05_audio_chunk" / pkg
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for index, speaker, text, fname in done:
+        (out_dir / fname).write_bytes(b"fake")
+        manifest.append({"index": index, "speaker": speaker, "text": text,
+                         "path": str(out_dir / fname), "ok": True, "reason": "",
+                         "pause_after": None})
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False),
+                                           encoding="utf-8")
+    return out_dir
+
+
+def test_synthesize_multi_one_done_short_circuits(workspace, monkeypatch):
+    """A fully-done file never spawns the engine; the pending file runs; results aggregate."""
+    ws = workspace
+    _seed_second_file(ws)
+    _seed_done_package(ws, "t", [(0, "C", "uno", "0001.mp3"), (1, "C", "dos", "0002.mp3")])
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            # write the file the line claims to have produced (is_done = ok + file on disk)
+            (Path(out_dir) / f"{s['index'] + 1:04d}.mp3").write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+
+    assert len(calls) == 1  # the done file short-circuits (no wasted model load)
+    assert _cmd_flag(calls[0], "--out-dir").endswith(os.path.join("05_audio_chunk", "s"))
+    assert [f["script"] for f in result["files"]] == ["s.json", "t.json"]  # request order
+    assert result["files"][0]["completed"] == 2 and result["files"][0]["error"] is None
+    assert result["files"][1]["completed"] == 2 and result["files"][1]["error"] is None
+    assert result["total"] == 4 and result["completed"] == 4 and result["failed"] == []
+    assert result["done_count"] == 4 and result["all_count"] == 4
+
+
+def test_synthesize_multi_all_done_no_engine(workspace, monkeypatch):
+    """Everything already done → zero engine spawns and NO failure (resume semantics)."""
+    ws = workspace
+    _seed_done_package(ws, "s", [(0, "A", "hello", "0001.mp3"), (1, "B", "world", "0002.mp3")])
+    calls = []
+
+    def run_worker(cmd, handle, on_line, **kw):
+        calls.append(cmd)
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json"], 4)
+    assert calls == []
+    assert result["completed"] == 2 and result["files"][0]["error"] is None
+
+
+def test_synthesize_multi_zero_segment_files_succeed(workspace, monkeypatch):
+    """A file with entries but no synthesizable segments takes the zero-short-circuit:
+    success, no engine, no (misleading) 'all failed' error."""
+    ws = workspace
+    (ws / "03_parsed_json" / "empty.json").write_text(
+        json.dumps([{"speaker": "A", "text": "   "}]), encoding="utf-8")
+    calls = []
+
+    def run_worker(cmd, handle, on_line, **kw):
+        calls.append(cmd)
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["empty.json"], 4)
+    assert calls == []
+    assert result["completed"] == 0 and result["files"][0]["error"] is None
+    assert result["files"][0]["total"] == 0
+
+
+def test_synthesize_multi_failed_segments_tagged_with_script(workspace, monkeypatch):
+    """One failed segment in file 2: the run succeeds; the failure carries its file name."""
+    ws = workspace
+    _seed_second_file(ws)
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            # fail exactly one segment — in file 2 only (the package dir is named after the stem)
+            if Path(out_dir).name == "t" and s["index"] == 1:
+                on_line(f"[segment] {s['index']} error 强制失败（fake worker）")
+            else:
+                (Path(out_dir) / f"{s['index'] + 1:04d}.mp3").write_bytes(b"fake")
+                on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert result["completed"] == 3  # 2 from s.json + 1 from t.json
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["script"] == "t.json" and result["failed"][0]["index"] == 1
+    assert result["files"][0]["failed"] == 0 and result["files"][1]["failed"] == 1
+
+
+def test_synthesize_multi_progress_windowed_and_monotonic(workspace, monkeypatch):
+    """File i of n runs in the progress window [i/n, (i+1)/n]; the bar never dips and the
+    step label always names the active file (no lingering '完成' from the previous file)."""
+    ws = workspace
+    _seed_second_file(ws)
+    _stub_engine(monkeypatch, {})
+    h = _Handle()
+    tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    fracs = [p[0] for p in h.progresses]
+    assert fracs == pytest.approx([0.01, 0.5, 0.51, 1.0, 1.0])  # per-file windows, then the final 完成
+    assert all(a <= b + 1e-9 for a, b in zip(fracs, fracs[1:]))
+    labels = [lbl for _f, lbl in h.progresses]
+    assert "s.json · 启动引擎" in labels and "s.json · 完成" in labels
+    assert "t.json · 启动引擎" in labels and "t.json · 完成" in labels
+
+
+def test_synthesize_multi_per_file_fatal_error_isolated(workspace, monkeypatch):
+    """A corrupt file 2 is a recorded per-file error — file 1's success is kept, no exception."""
+    ws = workspace
+    (ws / "03_parsed_json" / "bad.json").write_text("{ not json", encoding="utf-8")
+    _stub_engine(monkeypatch, {})
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "bad.json"], 4)
+    assert result["files"][0]["completed"] == 2 and result["files"][0]["error"] is None
+    assert result["files"][1]["error"] and "无法解析" in result["files"][1]["error"]
+    assert result["completed"] == 2  # the batch as a whole succeeded
+    assert any(lvl == "ERROR" for lvl, _msg in h.logs)  # the isolation is logged
+
+
+def test_synthesize_multi_all_files_fail_raises(workspace):
+    """Nothing got synthesized while files WERE attempted → the task fails."""
+    ws = workspace
+    (ws / "03_parsed_json" / "bad.json").write_text("{ not json", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        tts_batch.synthesize_multi(_Handle(), ["bad.json", "also-missing.json"], 4)
+
+
+def test_synthesize_multi_cancel_between_files(workspace, monkeypatch):
+    """A cancel at the file boundary propagates (never 'file failed, keep going') — file 1's
+    work is kept, file 2 never reaches the engine."""
+    ws = workspace
+    _seed_second_file(ws)
+    from backend.core.tasks import TaskCancelled
+
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+
+    h = _Handle()
+    n = 0
+
+    def check():
+        nonlocal n
+        n += 1
+        if n == 2:  # the boundary check before file 2
+            raise TaskCancelled()
+
+    h.check = check
+
+    with pytest.raises(TaskCancelled):
+        tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert len(calls) == 1  # file 2 never spawned the engine
+    by = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert by[0]["ok"] and by[1]["ok"]  # file 1's finished work is kept
+    assert not (ws / "05_audio_chunk" / "t").exists()
+
+
+# --------------------------------------------------------------------------- #
+# batch-status multi-file (the per-row 待合成 stats)
+# --------------------------------------------------------------------------- #
+
+def test_batch_status_multi_counts(workspace):
+    from backend.api.tts import batch_status
+    _seed_second_file(workspace)
+    _seed_voice_config(workspace, {
+        "A": {"type": "clone", "ref_audio": "04_voice_profiles/a.wav"},
+        # B deliberately absent from voice_config -> not ready
+        "C": {"type": "clone", "ref_audio": "04_voice_profiles/c.wav"},
+    })
+    r = batch_status(None, ["s.json", "t.json", "nope.json"])
+    assert [f["name"] for f in r["files"]] == ["s.json", "t.json", "nope.json"]  # request order
+    s, t, z = r["files"]
+    assert (s["total"], s["completed"], s["remaining"]) == (2, 0, 2)
+    assert s["complete"] is False
+    assert (s["speakers"], s["ready"]) == (2, 1) and s["missing"] == ["B"]
+    assert (t["total"], t["completed"]) == (2, 0)
+    assert (t["speakers"], t["ready"], t["missing"]) == (1, 1, [])
+    assert z == {"name": "nope.json", "total": 0, "completed": 0, "remaining": 0,
+                 "complete": False, "speakers": 0, "ready": 0, "missing": []}
+    # a file whose every segment is done (ok + file on disk) earns the 已合成 flag
+    _seed_done_package(workspace, "s", [(0, "A", "hello", "0001.mp3"),
+                                        (1, "B", "world", "0002.mp3")])
+    assert batch_status(None, ["s.json"])["files"][0]["complete"] is True
+
+
+def test_batch_status_multi_rejects_all(workspace):
+    from fastapi import HTTPException
+
+    from backend.api.tts import batch_status
+    with pytest.raises(HTTPException) as ei:
+        batch_status(None, ["__all__"])
+    assert ei.value.status_code == 400
+
+
+def test_batch_status_multi_no_workspace_degrades(monkeypatch, tmp_path):
+    monkeypatch.setattr(core_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
+    (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
+    core_config.reset_config_cache()
+    try:
+        from backend.api.tts import batch_status
+        r = batch_status(None, ["a.json", "b.json"])
+        assert r == {"files": [
+            {"name": n, "total": 0, "completed": 0, "remaining": 0,
+             "complete": False, "speakers": 0, "ready": 0, "missing": []}
+            for n in ("a.json", "b.json")]}
+    finally:
+        core_config.reset_config_cache()
+
+
+# --------------------------------------------------------------------------- #
+# run_batch dispatch (the API layer)
+# --------------------------------------------------------------------------- #
+
+class _RecordingManager:
+    """A task-manager stand-in that records create() calls without spawning threads."""
+
+    def __init__(self):
+        self.created = []
+
+    def create(self, module, label, func, *args, **kwargs):
+        self.created.append((module, label, func, args))
+
+        class _Task:
+            id = "fake"
+
+        return _Task()
+
+
+def _stub_manager(monkeypatch):
+    import backend.api.tts as tts_api
+
+    mgr = _RecordingManager()
+    monkeypatch.setattr(tts_api, "get_task_manager", lambda: mgr)
+    return mgr
+
+
+def test_run_batch_dispatches_multi(workspace, monkeypatch):
+    from backend.api.tts import BatchRequest, run_batch
+
+    mgr = _stub_manager(monkeypatch)
+    run_batch(BatchRequest(scripts=["s.json", "t.json"], concurrency=4, seed=7))
+    module, label, func, args = mgr.created[0]
+    assert module == "tts-batch"
+    assert func is tts_batch.synthesize_multi
+    assert args == (["s.json", "t.json"], 4, False, 7)
+    assert "2 个文件" in label and "续合" in label
+
+
+def test_run_batch_single_file_via_scripts_uses_legacy_path(workspace, monkeypatch):
+    from backend.api.tts import BatchRequest, run_batch
+
+    mgr = _stub_manager(monkeypatch)
+    run_batch(BatchRequest(scripts=["s.json"], concurrency=4))
+    module, label, func, args = mgr.created[0]
+    assert func is tts_batch.synthesize
+    assert args == (None, "s.json", 4, False, None)  # the byte-identical legacy call
+    assert "· s.json" in label
+
+
+def test_run_batch_scripts_with_indices_rejected(workspace, monkeypatch):
+    from fastapi import HTTPException
+
+    from backend.api.tts import BatchRequest, run_batch
+
+    _stub_manager(monkeypatch)
+    with pytest.raises(HTTPException) as ei:
+        run_batch(BatchRequest(scripts=["s.json", "t.json"], indices=[0]))
+    assert ei.value.status_code == 400
+
+
+def test_run_batch_scripts_reject_all(workspace, monkeypatch):
+    from fastapi import HTTPException
+
+    from backend.api.tts import BatchRequest, run_batch
+
+    _stub_manager(monkeypatch)
+    with pytest.raises(HTTPException) as ei:
+        run_batch(BatchRequest(scripts=["__all__"]))
+    assert ei.value.status_code == 400

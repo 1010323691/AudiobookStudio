@@ -12,6 +12,10 @@ top-level imports are stdlib-only, so loading it never pulls in the ML stack.
 from __future__ import annotations
 
 import importlib.util
+import os
+import sys
+import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -578,6 +582,129 @@ def test_merge_frac_bands_contiguous():
 
 
 # --------------------------------------------------------------------------- #
+# design-batch — the 角色配音·克隆 stage (shared planning / generate / save path)
+# --------------------------------------------------------------------------- #
+
+def test_design_rows_run_solo_by_default_but_share_with_force_rows_cap():
+    tw = _load_worker()
+    rows = [_row(10) for _ in range(4)]  # four identical short design rows
+    gov = tw.VramGovernor(8, device="cuda", total_vram=8 * GB)
+    # Default (batch mode's design rows = book segments): one row per sub-batch...
+    remaining = rows
+    sizes = []
+    while remaining:
+        rows_b, remaining = tw.plan_next_sub_batch(
+            remaining, vtype="design", overhead=16, params=None, budget=None,
+            gov=gov, max_batch=8, max_batch_chars=12000)
+        sizes.append(len(rows_b))
+    assert sizes == [1, 1, 1, 1]
+    # ...design-batch forces the governor's cap: the candidates share a tensor sub-batch.
+    remaining = rows
+    sizes = []
+    while remaining:
+        rows_b, remaining = tw.plan_next_sub_batch(
+            remaining, vtype="design", overhead=16, params=None, budget=None,
+            gov=gov, max_batch=8, max_batch_chars=12000, force_rows_cap=gov.cap)
+        sizes.append(len(rows_b))
+    assert sizes == [4]
+
+
+def test_generate_rows_design_uses_per_row_instruct_and_do_sample_switch():
+    tw = _load_worker()
+
+    class _Model:
+        def __init__(self):
+            self.calls = []
+
+        def generate_voice_design(self, **kw):
+            self.calls.append(kw)
+            return [[1.0] * 8] * len(kw["text"]), 24000
+
+    model = _Model()
+    args = SimpleNamespace(language="chinese")
+    rows = [
+        {"index": 0, "text": "t0", "instruct": "", "vd": {"description": "deep voice"}},
+        {"index": 1, "text": "t1", "instruct": "", "vd": {"description": "bright voice"}},
+    ]
+    # Default (batch mode): no do_sample override — its design behaviour is unchanged.
+    results = tw._generate_rows(model, "design", rows, args, {}, None)
+    assert results == [(True, ([1.0] * 8, 24000))] * 2
+    kw = model.calls[0]
+    # Each row keeps its own description (a per-row instruct list, matching the
+    # token counting / VRAM estimate).
+    assert kw["instruct"] == ["deep voice", "bright voice"]
+    assert kw["text"] == ["t0", "t1"]
+    assert "do_sample" not in kw
+    # design-batch: sampling forced on (identical-input candidates stay distinct even on
+    # a checkpoint whose generate_config disables sampling).
+    tw._generate_rows(model, "design", rows, args, {}, None, force_do_sample=True)
+    assert model.calls[1].get("do_sample") is True
+
+
+def test_save_and_report_design_protocol_and_fault_tolerance(tmp_path, monkeypatch):
+    tw = _load_worker()
+
+    # The save path imports numpy/soundfile lazily — stub them (the lean 3.14 env has
+    # neither; the real .venv-tts has both).
+    class _Nd:  # the fake ndarray type: no real value is an instance of it
+        pass
+
+    class _Arr:
+        def __init__(self, x):
+            self.x = x
+            self.size = len(x)
+            self.ndim = 1
+
+        def __len__(self):
+            return self.size
+
+    def _np_array(x):
+        return x if isinstance(x, _Arr) else _Arr(x)  # idempotent, like the real one
+
+    fake_np = types.SimpleNamespace(array=_np_array, ndarray=_Nd)
+    written = []
+
+    class _FakeSF:
+        @staticmethod
+        def write(path, data, sr):
+            if path.endswith("bad.wav"):
+                raise RuntimeError("boom")
+            written.append((path, len(data), sr))
+            with open(path, "wb") as f:
+                f.write(b"RIFF" + bytes(100))
+
+    monkeypatch.setitem(sys.modules, "numpy", fake_np)
+    monkeypatch.setitem(sys.modules, "soundfile", _FakeSF)
+
+    out = tmp_path / "dv"
+    rows = [
+        {"index": 10, "out": str(out / "ok.wav")},
+        {"index": 11, "out": str(out / "empty.wav")},
+        {"index": 12, "out": str(out / "bad.wav")},
+        {"index": 13, "out": str(out / "lost.wav")},
+    ]
+    results = [
+        (True, ([1.0] * 8, 24000)),   # ok: WAV straight to the row's out path
+        (True, ([], 24000)),          # empty audio: recorded error, not an abort
+        (True, ([1.0] * 8, 24000)),   # save fault -> recorded error, run continues
+        (False, "生成失败"),            # generation fault: reported as-is
+    ]
+    reports = []
+    tw._save_and_report_design(rows, results, str(out), 4,
+                               lambda i, ok, p: reports.append((i, ok, p)), 12345)
+    assert reports == [
+        (10, True, (12345, os.path.abspath(str(out / "ok.wav")))),
+        (11, False, "模型返回空音频"),
+        (12, False, "boom"),
+        (13, False, "生成失败"),
+    ]
+    # Exactly the ok row produced a file (no MP3 encode in this mode).
+    assert written and written[0][0] == os.path.abspath(str(out / "ok.wav"))
+    assert (out / "ok.wav").exists()
+    assert not (out / "empty.wav").exists() and not (out / "bad.wav").exists()
+
+
+# --------------------------------------------------------------------------- #
 # The worker module loads in the lean backend (stdlib-only top level)
 # --------------------------------------------------------------------------- #
 
@@ -589,6 +716,7 @@ def test_worker_module_loads_without_torch():
                  "run_with_watchdog", "_clear_gpu_cache", "_talker_vram_params",
                  "_free_vram_budget", "_free_vram", "_total_vram", "_warmup",
                  "_synth_sub_batch", "plan_next_sub_batch", "plan_row_tokens",
+                 "_run_design_batch", "_save_and_report_design", "_generate_rows",
                  "_clone_input_overhead", "band_cap_for_chars", "VramGovernor",
                  "plan_merge_batches", "normalize_pause_ms", "boundary_gap_ms",
                  "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac"):

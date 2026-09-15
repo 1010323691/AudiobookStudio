@@ -26,7 +26,7 @@ AudiobookStudio 是一个 Web 应用，在一个地方完成中文有声书的�
 # 启动 API（macOS / Linux）
 python -m backend.main
 
-# 运行整个测试套件（394 个测试）—— 在项目根目录运行
+# 运行整个测试套件（442 个测试）—— 在项目根目录运行
 .venv/Scripts/python -m pytest backend/tests/ -v
 # 单个文件 / 单个测试
 .venv/Scripts/python -m pytest backend/tests/test_book.py -v
@@ -69,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File install_tts_env.ps1
 │   ├── core/                # 基础设施：paths / pathio / config / tasks / concurrency / logging_setup
 │   ├── engines/             # 真正的算法（见「流水线逻辑链」）
 │   ├── resources/           # 捆绑默认提示词：default_prompts.txt（解析）、default_mix_check_prompts.txt（混合检查）、default_check_prompts.txt（角色匹配检查）
-│   ├── tests/               # pytest 套件（394 个测试）
+│   ├── tests/               # pytest 套件（442 个测试）
 │   └── requirements.txt     # 精简依赖（fastapi / uvicorn / pydantic / python-multipart）
 ├── src/                     # Vue 3 前端（瘦客户端）
 │   ├── api/                 # 唯一 HTTP 客户端 client.ts + 每模块一个封装
@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File install_tts_env.ps1
 │   ├── components/          # DirPicker + components/ui/ 原子组件（shadcn-vue 风格）
 │   ├── composables/         # useAudioBus / useWorkspaceGate
 │   └── utils/               # fileops / format / log-follow
-├── tts-engine/tts_worker.py # TTS 工作进程（跑在 .venv-tts，一次性子进程；5 种 --mode）
+├── tts-engine/tts_worker.py # TTS 工作进程（跑在 .venv-tts，一次性子进程；6 种 --mode）
 ├── install_tts_env.ps1      # 重建 .venv-tts
 ├── start.bat                # 一键启动（后端 + npm dev + 开浏览器）
 ├── .venv/                   # 3.14 应用环境（gitignore）
@@ -95,11 +95,11 @@ powershell -ExecutionPolicy Bypass -File install_tts_env.ps1
 ├── 01_input/       # 原始上传 + 排版结果（<原stem>_排版<ext>）
 ├── 02_split_text/  # 分册（<base> 分册NN 第XXX章 ~ 第YYY章.txt [+ <base>.zip]）
 ├── 03_parsed_json/ # 解析 JSON（<stem>.json 基文件永不改写 [+ <stem>_checked.json 两检查共享产物]）
-├── 04_voice_profiles/  # voice_config.json + designed_voices/*.wav 试听
+├── 04_voice_profiles/  # voice_config.json + designed_voices/*_c{k}.wav 克隆候选试听
 ├── 05_audio_chunk/     # 每包一子目录 <源JSON stem>/：逐行 mp3 + manifest.json
 ├── 06_audio_merge/     # <包名>.mp3（编码失败兜底 <包名>.wav）
 ├── 07_output/          # 每源一子目录 <源stem>/：分集文件 + <base>.zip
-├── logs/           # app.log（轮转）+ tts_batch_*.log（合成排障镜像）
+├── logs/           # app.log（轮转）+ tts_batch_*.log / tts_clone_*.log（合成/克隆排障镜像）
 └── config/app.json # 当前工程独立配置
 ```
 
@@ -156,9 +156,9 @@ powershell -ExecutionPolicy Bypass -File install_tts_env.ps1
 | `mix_check.py` | 段落混合检查。`is_deletable_text`（纯标点删除，确定性、不经 LLM）、`build_roster`（全书角色花名册）、`parse_mix_map`（keep/split 判定解析）、`validate_split_parts`（四道校验门）、`group_retry_indices`（未过门条目的重试分组）、`rebuild_entries`（按原序重建重编号）、`mix_check_file`（Task worker：批内零判定即时重试 + 尾部一次重试）；批几何复用 `speaker_check` 配置 |
 | `speaker_check.py` | 角色匹配检查。`build_batch_window`（可选 `skip` 参数 = 混合检查的纯标点条目集，不标 target）、`parse_speaker_map`、`_pick_majority`、`check_file`（Task worker；输入已是 `_checked` 时**就地更新**，不二次加缀） |
 | `script_prompts.py` / `mix_check_prompts.py` / `check_prompts.py` / `persona_prompts.py` | 捆绑默认提示词（`load_default_prompts` / `load_default_mix_prompts` / `load_default_check_prompts` 在 **import 时**加载 `resources/*.txt`，分隔符不恰有一个 `---SEPARATOR---` 会 RuntimeError）；`PERSONA_SYSTEM_PROMPT`/`PERSONA_USER_PROMPT` |
-| `voices.py` | 角色配音两阶段。`prepare_foundations`（阶段 1，纯 LLM）、`make_clones`（阶段 2，纯 TTS）、`_design_preview`、`_fold_aliases`、`_ChildReg`（子进程注册表）、纯函数族（`extract_json_object`/`_select_target_bands`/`pick_ref_text`/`_sanitize`…） |
+| `voices.py` | 角色配音两阶段。`prepare_foundations`（阶段 1，纯 LLM）、`make_clones`（阶段 2，纯 TTS，(角色,k) 候选作业池 → 单一长驻 design-batch 子进程 + 看门狗缩批/隔离重启）、`_fold_aliases`、纯函数族（`extract_json_object`/`_select_target_bands`/`pick_ref_text`/`_sanitize`/`auto_candidate_count`（自动备选数对数分档）/`effective_candidates`/`_clone_have`/`_effective_line_counts`（别名台词归并）/`_canonical_of`…） |
 | `tts.py` | TTS 族**基础模块**（不再是"单条合成"）：`resolve_engine()`（`.venv-tts` 解释器 + worker 脚本；env 覆盖 `AUDIOTTS_PYTHON`/`AUDIOTTS_WORKER` 供测试桩用）、`run_worker()`（一次性子进程编排器：pump 线程、`[progress]`/其余行分流、协作取消/暂停、`log_file` 镜像、进程树 kill、temp 清理）、`WorkerWatchdogTimeout` |
-| `tts_batch.py` | 批量合成编排。`synthesize`（Task worker，含看门狗缩批/隔离重启循环）、`_build_cmd`、`_build_segments`、`package_for`、`load_manifest`/`build_manifest`（增量写）、`is_done`、`plan_to_synthesize`、`count_completion`、`clamp_concurrency`（[1,64]） |
+| `tts_batch.py` | 批量合成编排。`synthesize`（单文件入口，同签名薄封装 → `_synthesize_one`）、`synthesize_multi`（多文件 Task worker：逐文件顺序 + 单文件错误隔离 + `_ScaledHandle` 进度窗口）、`_synthesize_one`（两种运行形态共享的每文件主体，含看门狗缩批/隔离重启循环）、`_build_cmd`、`_build_segments`、`package_for`、`load_manifest`/`build_manifest`（增量写）、`is_done`、`plan_to_synthesize`、`count_completion`、`clamp_concurrency`（[1,64]） |
 | `merge.py` | 两阶段合并编排。`run`（Task worker）、`_find_manifest`、`collect_segments`、`_output_name`、`MERGE_BATCH_SIZE=100` |
 
 ## 流水线逻辑链（需求 → 代码 精确映射）
@@ -212,21 +212,23 @@ LLM 提示词约束（`default_check_prompts.txt`）：只判 target 条；**绝
 
 **阶段 1（纯 LLM）** `POST /api/tts/prepare-foundations {speakers?, new_only, overrides?, script?}` → `voices.prepare_foundations`（module `voices-foundation`）：`_load_script`（`__all__` → `resolve_parsed_json_all()` 逐文件拼接，单文件损坏仅 WARNING 跳过）→ 证据采样（`_select_target_bands`：≤24 句全进 front；否则 front 8 + back 8 + 中段均匀 8，每条带 `±4` 邻句窗口、目标行标 `★`）→ `ThreadPoolExecutor(max_concurrency)` 并行 `_llm_persona`（复用 LLM 传输；`temperature=0.3`、`max_tokens=1024`；提示词 `config.persona_prompts.*` 空则回退 `persona_prompts.py` 内置；`str.replace` 填 `{speaker}`/`{line_windows}` 防大括号炸裂）→ `extract_json_object`（手写括号配对扫描）→ `{description, ref_text(40-60字)}` → 全败 → `_fallback_persona`（固定描述 + `pick_ref_text`）→ `_fold_aliases`（归一化精确 → 子串 → Jaccard≥阈值，写 `alias_of`）→ **每完成一个角色就整体重写** `voice_config.json`（页面实时刷新）。本阶段**不启动任何 TTS 子进程**。
 
-**阶段 2（纯 TTS）** `POST /api/tts/make-clones {speakers?, new_only, concurrency?, script?}` → `voices.make_clones`（module `voices-clone`）：选有 foundation 且非 alias 的角色（`new_only` 排除已完成、含重试失败）→ 每角色 `_design_preview`：描述/参考文本写 **`00_temp/persona_*.desc/.txt`**（避免 Windows 命令行非 ASCII）→ `run_worker` 调 worker `--mode design`（`--design-model` 等）→ 产物 `04_voice_profiles/designed_voices/<_sanitize(speaker)>_<ns>.wav` → 成功：entry = `{type: clone, ref_audio(工作空间相对), ref_text, description, character_style, clone_status: done}`；失败：`{type: design, clone_status: failed}`（**单角色失败不中断整批**）。`concurrency` 缺省 1（**后端不读 `config.tts.parallel_workers`**——该字段由前端读入后作为 `req.concurrency` 传入）；N 个渲染子进程注册在 `_ChildReg`，取消时 `kill_all` 一次释放显存。
+**阶段 2（纯 TTS）** `POST /api/tts/make-clones {speakers?, new_only, concurrency?, script?, candidate_count?}` → `voices.make_clones`（module `voices-clone`）：选有 foundation 且非 alias 的角色 → 每角色目标候选数 = 固定 `candidate_count`（None=自动 / 2 / 4 / 6 / 8，请求校验）或 `auto_candidate_count(有效台词数)`（**绝对对数分档，无工程相对分母**——旁白可达主角 10 倍量级，相对比例必把主角压成 2~3 条；改按角色**自身**台词量级分档：`<20` 龙套=1，`20+`≥2，≈100→3、≈200→4、≈500→5、≈1000→6、≈2000→7、≈2300+→8，即 `int(-2.1 + 3·log10(台词数))` 钳 1..8）（**别名台词归并进 canonical**（`_effective_line_counts`，沿 `alias_of` 链 ≤8 跳防环）——`speakers`/`new_only` 过滤不移位，单角色重做与整批同预算）→ `new_only` 只重做「已有候选数 < 目标」的角色 → **每 (角色, k) 一个作业**（`jobs` 池；产物路径 `04_voice_profiles/designed_voices/<_sanitize(speaker)>_<ns>_c{k}.wav` 运行前定死——每角色一个 `time.time_ns()` ns 防 `_sanitize` 文件名碰撞，**跨重启稳定**）→ **断点采纳**：盘上已有候选（WAV ≥1024B，坏头守卫）直接采纳（seed 记 −1，不重渲染）；**全部已采纳 → 零作业短路**（结算 + 保存 + progress 1.0，不启动引擎）→ `base_seed = secrets.randbelow(2**31)` **整个运行只算一次**（跨重启稳定）→ `rows_cap = clamp_concurrency(concurrency or config.tts.batch_concurrency)`（缺省 4）→ **一个长驻 worker 子进程**（`run_worker` + `--mode design-batch`；模型只加载一次；候选行按 `VramGovernor` 组 tensor 子批——行按长度升序、长度分档 + 总字符上限 + 实测显存反馈，逐行 instruct；`base_seed + 子批序号` 播种，**同子批候选共享 seed 但仍互异**（各行独立采样），重跑互异靠 run 级 `base_seed`）→ 作业清单写 `00_temp/design_jobs_*.json`（绝对路径，用完删）→ `remaining` = 未排除、未 ok **且属未结算角色**的作业（看门狗重渲染不会在已结算 entry 下留孤儿文件；未结算角色的失败作业重启时重做）→ **角色级原子结算**：某角色全部候选作业落定才整体写一次 entry（在途角色保持运行前状态；**取消时未结算角色文件不动**）→ 成功（≥1 候选，按 k 排序重编号 1..m）：entry = `{type: clone, ref_audio(工作空间相对), candidates: [{id, ref_audio, seed}], selected_audio_id: None, ref_text, description, character_style, clone_status: done}`；全失败：`{type: design, candidates: [], selected_audio_id: None, clone_status: failed}` 但**顶层 `ref_audio` 保留**（最后已知良好的音频仍可试听；**单角色失败不中断整批**）。**不变量：顶层 `ref_audio` ≡ 当前生效候选**（已选 = 选中项，未选 = 第 1 条）——worker batch 只读顶层 `ref_audio`/`ref_text`，状态推断与路径迁移也都只认它 → 保持同步则 worker / tts_batch / merge / pathio **零改动**。**看门狗重启循环**（退出码 124，与音频合成同形）：`rows_cap>1` → 缩批一半重启；`rows_cap==1` → 对 `[watchdog]` 行里的 (角色,k) 行记罚，**两次超时 → 隔离**（不再渲染，记 `超时（已隔离）`，其余继续）；`attempt>8` → RuntimeError（已完成进度已保住，提示调小「批内行数」）。进度由 worker 的 `[progress]` 行驱动（`(offset+done)/total`，`--done-offset` = 已落定作业数 → **重启后不回跳**；后端只在终末发「完成」）。取消：`run_worker` 主循环每 0.15s `handle.check()` + finally 杀**进程树**（Windows `taskkill /F /T`），已生成 WAV 留盘成孤儿（与旧实现一致）。排障：全量 stdout/stderr 镜像 `workspace/logs/tts_clone_<ts>.log`（每 attempt 一个 `=== attempt ===` 段）。`concurrency` 缺省 `tts.batch_concurrency=4`（前端读作 Voices 页「批内行数（上限）」初值后作为 `req.concurrency` 传入）。
 
-**只读** `GET /api/tts/voices?script=`（409 守卫豁免，无工作空间降级空）：读脚本（`__all__` 折叠整书：按 speaker 名去重、累加台词数、保首见顺序）+ `voice_config.json`（`migrate_entries_in` 惰性迁移 `ref_audio`）→ 每角色 `{name, line_count, status(ready|pending), foundation_status, clone_status, type, alias_of, description, preview}`。`ready` = 有 `alias_of` 或 `_voice_usable`（clone 需 `ref_audio`；design 需非空 `description`；custom 恒真）。`preview` 是**相对 `04_voice_profiles/`** 的路径，前端经 `GET /api/files/download/04_voice_profiles/{name}` 播放（`MiniAudioPlayer`）。
-`voice_config.json` 条目字段：`type`（foundation/clone/design/custom）、`description`、`ref_text`、`ref_audio`（工作空间相对）、`alias_of`、`foundation_status`/`clone_status`（done|failed）、`character_style`。
-测试：`test_voices.py`（JSON 抽取/别名解析/采样带/状态推断/子进程注册表）。完成后 `project.recordVoices` → 「前往音频合成」。
+**只读** `GET /api/tts/voices?script=`（409 守卫豁免，无工作空间降级空）：读脚本（`__all__` 折叠整书：按 speaker 名去重、累加台词数、保首见顺序）+ `voice_config.json`（`migrate_entries_in` 惰性迁移 `ref_audio`）→ 每角色 `{name, line_count, status(ready|pending), foundation_status, clone_status, type, alias_of, description, preview, candidates: [{id, preview, seed}], selected_audio_id}`。列表按 `line_count` **降序**（稳定——同数保持首见顺序；无脚本时计数全 0 = voice_config 键序不变），主角恒在列表顶部。`ready` = 有 `alias_of` 或 `_voice_usable`（clone 需 `ref_audio`；design 需非空 `description`；custom 恒真）。`preview` 是**相对 `04_voice_profiles/`** 的路径，前端经 `GET /api/files/download/04_voice_profiles/{name}` 播放（`MiniAudioPlayer`）；`candidates` 经 `V.effective_candidates` 派生（旧格式单候选合成 1 项、无克隆 `[]`），`selected_audio_id` = 用户选择（`null` = 默认第 1 条）。
+`PUT /api/tts/voices/select {speaker, audio_id?}`（**同步写，非任务**）：记录某角色的克隆候选选择——`selected_audio_id` 与**顶层 `ref_audio`（生效参考）一次文件重写同步更新**，后续音频合成恒用选中条；`audio_id` 空/None = 清除选择回默认第 1 条。守卫链：工作空间 409 → **voices-foundation/voices-clone 任务在途 409**（两阶段都整体重写 `voice_config.json`，防并发写互踩）→ 文件/角色缺失 404 → 无候选或 `audio_id` 非法 400。试听走既有 `GET /api/files/download/04_voice_profiles/{name}`（零新路由）。前端「选择音色」弹层（页内 `fixed inset-0 z-50` overlay）：候选行 = radio + `MiniAudioPlayer`（`useAudioBus` 全局单播）+ 生效项「当前」Badge；候选 <2 的角色（自动模式龙套、旧格式单候选）按钮禁用。
+`voice_config.json` 条目字段：`type`（foundation/clone/design/custom）、`description`、`ref_text`、`ref_audio`（工作空间相对，**≡ 生效候选**）、`candidates`（`[{id, ref_audio, seed}]`，写入即工作空间相对）、`selected_audio_id`（`null` = 默认第 1 条）、`alias_of`、`foundation_status`/`clone_status`（done|failed）、`character_style`。
+测试：`test_voices.py`（JSON 抽取/别名解析/采样带/状态推断/**自动备选数分档/候选簿记/别名台词归并**/**make_clones 全 e2e**（fake-worker 真子进程经真 `run_worker`：固定/自动计数、部分失败重编号、全失败保留旧 ref_audio、取消角色级原子、new_only 差额、**进度单调（worker 驱动、重启不回跳）**、看门狗缩批重启（二轮 `--concurrency` 减半）、size-1 两次超时隔离毒行、8 次上限 RuntimeError、断点采纳零作业短路（seed=−1、不启动引擎）、批内多行共享 seed（候选仍互异））/select 端点（选择/清除/400/404/409 工作空间/409 任务在途）/list_voices（候选字段 + 列表台词数降序））。完成后 `project.recordVoices` → 「前往音频合成」。
 
 ### 阶段 5 · 音频合成（BatchTTS.vue `/batch`）
 
-`POST /api/tts/batch {indices?, script?, concurrency?, seed?, force_all?}` → `tts_batch.synthesize`（module `tts-batch`）；**`script == "__all__"` → 400**（"全部"只用于角色配音）。`GET /api/tts/batch-status?script=` → `{total, completed, remaining}`（completed = manifest 里 `ok` 且**文件仍在磁盘**的段；增量写 manifest 所以运行中刷新真实）。
-`synthesize` 链：`resolve_parsed_json` + `_load_script`（缺/坏/空 → RuntimeError）→ 读 `voice_config.json`（**缺失仅 WARNING**；先 `migrate_entries_in` 迁移再 spawn，worker 按 `--workspace` 解析相对 `ref_audio`）→ `out_dir = 05_audio_chunk/<包名>`（`package_for` = 源 JSON stem 剥 `_checked`，兜底 `"batch"`）→ `_build_segments`（`index` = 全脚本行位置；`speaker` 取 `entry.speaker or entry.type`；跳空文本；带 `instruct`/`pause_after`）→ `load_manifest` + `plan_to_synthesize`（显式 indices 交集 > `force_all` 全量 > 默认 **resume** 只合未完成的）→ **零段短路**（重写完整 manifest、progress 1.0、**不启动引擎**省模型加载）→ 段表写 `00_temp/batch_segments_*.json`（绝对路径，用完删）→ `run_worker`（`--mode batch`，`--concurrency` 钳 [1,64] 缺省 `config.tts.batch_concurrency=4`，`--seed` 缺省 `batch_seed=-1` 随机，`--workspace`，三个模型 id，`--ffmpeg`）→ **看门狗重启循环**：`WorkerWatchdogTimeout`（退出码 124）→ workers>1 则 `workers//2` 缩批重启；workers==1 则对 `[watchdog]` 行解析出的段记罚（**两次超时 → 隔离**：`excluded` + manifest `ok:false reason="超时（已隔离）"`）；累计 8 次未愈 → RuntimeError（已完成进度已保住）→ 收尾：最终 manifest、统计；**`completed==0` → RuntimeError**（任务 FAILED，"本次 N 段全部合成失败"）。
+`POST /api/tts/batch {indices?, script?, scripts?, concurrency?, seed?, force_all?}` → module `tts-batch`；**`script`/`scripts` 含 `"__all__"` → 400**（"全部"只用于角色配音）；`indices` 且多文件 → 400。分发：0/1 文件 → `tts_batch.synthesize`（旧单文件路径，行为逐字节不变）；**>1 文件 → `tts_batch.synthesize_multi`**（一个任务内逐文件顺序合成）。`GET /api/tts/batch-status?script=` → `{total, completed, remaining}`（单文件 / 缺省最近）；`GET /api/tts/batch-status?scripts=…`（重复参数，多文件）→ `{files: [{name, total, completed, remaining, complete, speakers, ready, missing}]}`（按请求顺序；`complete` = total>0 且 completed==total = 行的【已合成】；ready/missing 与角色配音页同一规则（`alias_of` 或 `_voice_usable`）；completed = manifest 里 `ok` 且**文件仍在磁盘**的段；增量写 manifest 所以运行中刷新真实）。
+`_synthesize_one` 链（`synthesize` / `synthesize_multi` 共享的每文件主体）：`resolve_parsed_json` + `_load_script`（缺/坏/空 → RuntimeError）→ 读 `voice_config.json`（**缺失仅 WARNING**；先 `migrate_entries_in` 迁移再 spawn，worker 按 `--workspace` 解析相对 `ref_audio`）→ `out_dir = 05_audio_chunk/<包名>`（`package_for` = 源 JSON stem 剥 `_checked`，兜底 `"batch"`）→ `_build_segments`（`index` = 全脚本行位置；`speaker` 取 `entry.speaker or entry.type`；跳空文本；带 `instruct`/`pause_after`）→ `load_manifest` + `plan_to_synthesize`（显式 indices 交集 > `force_all` 全量 > 默认 **resume** 只合未完成的）→ **零段短路**（重写完整 manifest、progress 1.0、**不启动引擎**省模型加载）→ 段表写 `00_temp/batch_segments_*.json`（绝对路径，用完删）→ `run_worker`（`--mode batch`，`--concurrency` 钳 [1,64] 缺省 `config.tts.batch_concurrency=4`，`--seed` 缺省 `batch_seed=-1` 随机，`--workspace`，三个模型 id，`--ffmpeg`）→ **看门狗重启循环**：`WorkerWatchdogTimeout`（退出码 124）→ workers>1 则 `workers//2` 缩批重启；workers==1 则对 `[watchdog]` 行解析出的段记罚（**两次超时 → 隔离**：`excluded` + manifest `ok:false reason="超时（已隔离）"`）；累计 8 次未愈 → RuntimeError（已完成进度已保住）→ 收尾：最终 manifest、统计；**`completed==0` → RuntimeError**（任务 FAILED，"本次 N 段全部合成失败"）。
+`synthesize_multi` 链（多文件，待合成卡的多选）：逐文件循环：`handle.check()` **最先**（文件间取消/暂停点；`TaskCancelled` **先于**通用异常捕获直接上抛——取消是任务级结局，绝不变成「该文件失败，继续跑」，否则任务会以 SUCCEEDED 结束，违反任务隔离不变量 #7）→ `_ScaledHandle` 代理把本文件进度映射进窗口 `[i/N, (i+1)/N]`（总体单调不回跳；步骤标签带**文件名前缀**防上一文件的「完成」滞留）→ 日志 `文件 i/N：<name>` → `_synthesize_one`（上面整条链；每文件一个一次性 `.venv-tts` 子进程、模型逐文件加载一次；**全部完成的文件走零段短路 → 根本不启动引擎**）→ 通用异常 → ERROR 日志 + 该文件零值条目 `error: str(exc)`（**单文件失败隔离**，其余文件继续——与角色配音「单角色失败不中断整批」同原则）→ 聚合结果 `{total: Σ, completed: Σ, failed: 各文件失败段展平并加 `script` 字段, files: [{script, total, completed, failed: 计数, output_dir, manifest_path, done_count, all_count, error: str|null}]}`（`files` 顺序 = 请求顺序）；失败判定：`completed==0` 且**没有任何文件** `total>0 或 error` → RuntimeError（任务 FAILED）——全空脚本 / 全部已完成 = 正常成功（每文件的零段短路语义）。代价：每文件一个子进程、模型逐文件加载一次（已完成文件零代价；前端卡片描述与页面文案注明）。
 worker（`tts-engine/tts_worker.py --mode batch`）：按段所需 type **只加载用到的模型**（custom→`model` / clone→`base_model` / design→`design_model`；`Qwen3TTSModel.from_pretrained`，优先 HF 本地缓存；cuda→bf16+device_map；import 噪音吞进 devnull）；无配置的角色 → 段级 error「缺少角色声音配置（X）——请先在「角色声音」页生成」（**不中断整批**）；clone 组每 speaker 建一次 `voice_clone_prompt`；组内行**按长度升序**；**惰性子批规划**每轮 `plan_next_sub_batch`（`plan_row_tokens` = 字符×1.2+overhead 估 token；`VramGovernor` 纯算术反馈环按实测显存压力**减半**/宽松**增长** `vram_scale` 重标定；`LENGTH_BANDS` 长度分档 cap；单批总字符 ≤ `--max-batch-chars`(12000)；超长行独批；长度比 ≤5 防混批；**每行必入恰好一个批**）；子批超时预算 `sub_batch_timeout_seconds`（cpu `600+4·chars`∈[600,10800]；clone `120+0.7·chars`∈[300,3600]；gpu `60+0.4·chars`∈[180,1500]）+ 心跳（10s 起每 20s）→ 超时先 flush `[watchdog]` 行再 `os._exit(124)`（进程+CUDA 上下文同死）；非超时故障 → size-1 也崩则 `os._exit(124)` 交后端隔离，否则 `observe_fault` 缩容 + 清显存 + **对半递归重试**；`seed>=0` 时每子批 `torch.manual_seed(seed + 子批序号)`（可复现）。
 产物：`05_audio_chunk/<包>/<index+1 零填充>.mp3`（soundfile WAV → pydub/libmp3lame；<1024B 视为坏头删）+ **`manifest.json`**（list `[{index, speaker, text, pause_after, path(工作空间相对), ok, reason}]`，**每见一条 `[segment]` 行就增量重写**——取消不丢已完成工作；加载时惰性迁移旧绝对 path）。
 worker 退出码：`0` = 成功（**个别段失败也 0**，段级失败走 `[segment] i error <reason>` 行）/ `1` = 通用失败 / `2` = setup 错误（stderr `TTS_WORKER_ERROR:`）/ `124` = 看门狗。
 排障：全量 stdout/stderr 镜像 `workspace/logs/tts_batch_<ts>.log`（`[out]`/`[err]` + `=== attempt started/ended rc=N ===`）——任务日志是 SSE-only 的，此文件是失败运行的磁盘证据。
-测试：`test_tts_batch.py`（钳制/看门狗缩批/隔离/resume/增量 manifest/相对路径/零启动）、`test_tts_worker.py`（规划/显存/governor/超时预算）。
+测试：`test_tts_batch.py`（钳制/看门狗缩批/隔离/resume/增量 manifest/相对路径/零启动/**多文件**（`synthesize_multi`：已完成文件短路不启动引擎、全完成零子进程、零段文件成功、失败段带 `script` 标签、进度按文件窗口单调、单文件致命错误隔离、全文件失败 → RuntimeError、文件间取消 → `TaskCancelled` 穿透且已完成文件 manifest 保留）/**batch-status 多文件**（计数/complete/ready/missing、缺失名零字典、`__all__` 400、无工作空间降级）/**run_batch 分发**（多 → `synthesize_multi` + 「N 个文件」标签、单 → 旧路径逐字节不变、`indices`+多 → 400））、`test_tts_worker.py`（规划/显存/governor/超时预算）。
 
 ### 阶段 6 · 音频合并（Merge.vue `/merge`）
 
@@ -258,7 +260,7 @@ worker（`_run_merge`）：**Stage 1** 每批 pydub `combine_audio_with_pauses`�
 
 `resolve_engine()` → `(python, worker)`：`PROJECT_ROOT/.venv-tts/{Scripts/python.exe | bin/python}` + `tts-engine/tts_worker.py`（env 覆盖 `AUDIOTTS_PYTHON`/`AUDIOTTS_WORKER`，测试桩用）；缺失 → 可操作的 RuntimeError（"请先运行 install_tts_env.ps1…"）。
 `run_worker(cmd, handle, on_line, *, temp_files, fail_prefix, watchdog_code, log_file)`：`Popen(cwd=PROJECT_ROOT, env={PYTHONUTF8=1, PYTHONIOENCODING=utf-8})` → 双 daemon reader 线程泵 stdout/stderr 进队列 → 主循环 0.15s：`handle.check()`（协作取消/暂停）→ 抽干队列：`[progress] frac label` → `handle.progress`；其余 stdout → `on_line`（stage 解析 `[result]`/`[segment]`/`[watchdog]`）；stderr → WARNING 级日志 + `stderr_tail(40)` → `log_file` 时全量镜像 → 进程退出且双 EOF 后收工 → **finally**：存活则 `_kill_worker_tree`（Windows `taskkill /F /T /PID`，POSIX 普通 kill）→ wait → 关管道 → 删 `temp_files` → 非零退出：`RuntimeError(f"{fail_prefix}失败（退出码 N）：{stderr尾500}")`，**恰为 `watchdog_code` 时改抛 `WorkerWatchdogTimeout`**（供 batch 缩批重启）。
-worker（`tts-engine/tts_worker.py`，1986 行）5 种 `--mode`：`custom` / `design` / `clone`（前三者**不被后端调用**——后端只用 design（角色配音·克隆）、batch、merge；保留供手动/历史）、`batch`、`merge`。stdout 协议行：`[progress] <frac> <label>`、`[result] <abs path>`（恰好一次 = 最终文件）、`[segment] <i> ok|error <…>`、`[watchdog] timeout batch=<label> indices=[…] elapsed=<s>`（先 flush 再 `os._exit(124)`）。stderr 错误前缀 `TTS_WORKER_ERROR:`。模型常量 `DEFAULT_MODEL/BASE_MODEL/DESIGN_MODEL` = Qwen3-TTS-12Hz-1.7B-{CustomVoice,Base,VoiceDesign}；`DEFAULT_SPEAKER="serena"`、`DEFAULT_LANGUAGE="chinese"`。
+worker（`tts-engine/tts_worker.py`）6 种 `--mode`：`custom` / `design` / `clone`（前三者**不被后端调用**——后端只用 design-batch（角色配音·克隆）、batch、merge；前三者保留供手动/历史）、`design-batch`、`batch`、`merge`。stdout 协议行：`[progress] <frac> <label>`（所有 mode 驱动任务进度）、`[result] <abs path>`（恰好一次 = 最终文件；merge/单条 mode）、`[segment] <i> ok|error <…>`（batch）、`[design] <i> ok <seed> <abs path>` / `[design] <i> error <reason>`（design-batch）、`[watchdog] timeout batch=<label> indices=[…] elapsed=<s>`（先 flush 再 `os._exit(124)`）。stderr 错误前缀 `TTS_WORKER_ERROR:`。模型常量 `DEFAULT_MODEL/BASE_MODEL/DESIGN_MODEL` = Qwen3-TTS-12Hz-1.7B-{CustomVoice,Base,VoiceDesign}；`DEFAULT_SPEAKER="serena"`、`DEFAULT_LANGUAGE="chinese"`。
 
 ## 配置项速查（`<workspace>/config/app.json`；根 `app.json` 为只读模板）
 
@@ -273,8 +275,8 @@ worker（`tts-engine/tts_worker.py`，1986 行）5 种 `--mode`：`custom` / `de
 | `tts.model` / `base_model` / `design_model` | Qwen3-TTS-12Hz-1.7B-{CustomVoice,Base,VoiceDesign} | batch `--model/--base-model/--design-model`（空 → worker 同名默认） |
 | `tts.speaker` / `language` / `device` | `serena` / `chinese` / `auto` | worker 缺省（auto\|cuda\|cpu\|mps） |
 | `tts.pause_between_speakers_ms` / `pause_same_speaker_ms` | `500` / `250` | merge `--pause-ms/--same-same-ms`（0 → 回退该默认） |
-| `tts.parallel_workers` | `1` | **仅前端读**（Voices 页 make-clones 的 concurrency 初值）；后端引擎不读 |
-| `tts.batch_concurrency` | `4` | 合成「批内段数」上限（请求 `concurrency` 缺省时用；钳 [1,64]；与 parallel_workers 是两种并行） |
+| `tts.parallel_workers` | `1` | **遗留**（无读取方，仅为旧配置 round-trip 保留） |
+| `tts.batch_concurrency` | `4` | 音频合成与角色配音·克隆共用的「批内行数」上限（请求 `concurrency` 缺省时用；钳 [1,64]） |
 | `tts.batch_seed` | `-1` | 合成可复现 seed（`seed + 子批序号` 播种；-1 = 随机） |
 | `tts.api_base/api_key/voice/concurrency` | 空/1 | **遗留** API 字段，本地引擎不读（保证旧配置 round-trip） |
 | `llm.base_url` / `api_key` | `http://localhost:11434/v1` / `"local"` | OpenAI 兼容端点（默认本机 Ollama）；远程 API 需真 key |
@@ -296,12 +298,12 @@ worker（`tts-engine/tts_worker.py`，1986 行）5 种 `--mode`：`custom` / `de
 
 - **`src/api/client.ts` 是唯一 HTTP 客户端**：`API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8642'`（绝对源直连，CORS 后端全开）；fetch + JSON（响应先取 text 再试解析）；`!res.ok` 抛 `ApiError`。SSE 不在 client 里：`api/tasks.ts::streamTask` 用**原生 `EventSource`** 连 `/api/tasks/{id}/stream`（后端帧全是裸 `data:` 行 → 统一 `onmessage`，按 JSON `type` 分发；`final`/`CLOSED` 关闭并回调；断开自动重连）。唯一例外：`uploadFile` 走 FormData。
 - **路由 = hash history**（静态托管下可工作），全挂持久 `MainLayout`（侧边栏固定 + `keep-alive`）：`/dashboard` 开始 · `/text` 排版 · `/book` 分册 · `/script` 解析 · `/voices` 角色配音 · `/batch` 合成 · `/merge` 合并 · `/audio` 分集 · `/settings` 设置（`/` → redirect dashboard）。
-- **stores**（Pinia setup 风格）：`app`（`backendUp` 状态灯，3s 轮询 health）；`project`（流水线交接：`textOutput/bookOutputs/activeScript/voiceResult/batchResult/mergeResult/audioOutputs` + `record*` 动作 + computed `bookInput/scriptInput/audioInput`——「前往下一步」按钮的数据源；`activeScript` 被角色配音与音频合成**共享**）；`settings`（`config` 全量 + `load/save/applyTheme`）；`task`（**应用级单例**：`refresh()` 全量对齐 + 对每个非终态任务开 SSE 流；`applyEvent` 按 type 分发（日志超 1000 条裁最旧、`llm_stream` 客户端 128KB 上限与后端对齐）；`control`/`stopAll`；store 创建时即 `refresh()`）。
+- **stores**（Pinia setup 风格）：`app`（`backendUp` 状态灯，3s 轮询 health）；`project`（流水线交接：`textOutput/bookOutputs/activeScript/voiceResult/batchResult/mergeResult/audioOutputs` + `record*` 动作 + computed `bookInput/scriptInput/audioInput`——「前往下一步」按钮的数据源；`activeScript` 被角色配音与音频合成**共享**（合成页的多选是**本地**状态，仅把**首个选中**文件同步到这里——`lastSynced` 守卫防多选被自身同步坍缩；外部页面改它则选择坍缩为该文件））；`settings`（`config` 全量 + `load/save/applyTheme`）；`task`（**应用级单例**：`refresh()` 全量对齐 + 对每个非终态任务开 SSE 流；`applyEvent` 按 type 分发（日志超 1000 条裁最旧、`llm_stream` 客户端 128KB 上限与后端对齐）；`control`/`stopAll`；store 创建时即 `refresh()`）。
 - **文件选择 = 隐藏 `<input type=file>` → `uploadFile` → 绝对路径**（`utils/fileops.pickFile`）；目录/文件浏览用 `DirPicker`（扫 `GET /api/files/list/{目录名}`，支持 default/`__all__` 行、pick-dirs、后缀过滤，`@scanned` 回传绝对路径）；下载 = 导航 `GET /api/files/download/{目录名}/{文件名}`。
 - **组件**：`LiveLogPanel`（进度条 + 当前步骤 + 分级着色日志 + 自动跟随 + actions 插槽放取消钮）、`LiveStreamPanel`（原始 LLM 流回看）、`MiniAudioPlayer`（`useAudioBus` 全局单例保证同屏只播一个试听）、`WorkspaceGateAlert`、`Toaster`。`utils/log-follow.useLogAutoFollow`：仅当用户本就在近底（≤48px）时才自动滚底——翻看历史不被拽回。
-- 页面任务展示惯例：解析页每文件每阶段一行（解析/混合检查/角色匹配检查三阶段共用同一行状态机 `kind: 'parse' | 'mix' | 'check'`，running 文案分别为 解析中 / 混合检查中 / 检查中；状态 Badge + 进度 + `LiveLogPanel` + 完成后 `LiveStreamPanel` 可回看；顶部 3 指标卡 = 并发数 / 吞吐量 Σ`llm_cps_10s` / 处理速度 Σ`llm_chars`÷Σ`llm_secs`，**纯 SSE 驱动无定时器**）；文件行徽章：「已混合」= 任务存储里存在该文件成功的 mix-check 任务（内存态信号，仅当前后端运行内有效——磁盘共享 `_checked` 无法区分「仅混合」与「混合+匹配」，后端重启后该徽章消失）；「已处理」= 磁盘存在 `_checked.json` 产物（两检查阶段共享的持久兜底）——精确状态看实时任务行；角色配音/合成/合并页各自 `LiveLogPanel`（角色配音 watch 任务 progress 变化即重拉角色表）；分集页用行内 Alert（`task.current` + 进度条 + 取消）；合成的「已合成/总段落」用 `batchStatus` **3s 轮询**（读增量 manifest 真实计数，不走 SSE）。
+- 页面任务展示惯例：解析页每文件每阶段一行（解析/混合检查/角色匹配检查三阶段共用同一行状态机 `kind: 'parse' | 'mix' | 'check'`，running 文案分别为 解析中 / 混合检查中 / 检查中；状态 Badge + 进度 + `LiveLogPanel` + 完成后 `LiveStreamPanel` 可回看；顶部 3 指标卡 = 并发数 / 吞吐量 Σ`llm_cps_10s` / 处理速度 Σ`llm_chars`÷Σ`llm_secs`，**纯 SSE 驱动无定时器**）；文件行徽章：「已混合」= 任务存储里存在该文件成功的 mix-check 任务（内存态信号，仅当前后端运行内有效——磁盘共享 `_checked` 无法区分「仅混合」与「混合+匹配」，后端重启后该徽章消失）；「已处理」= 磁盘存在 `_checked.json` 产物（两检查阶段共享的持久兜底）——精确状态看实时任务行；角色配音/合成/合并页各自 `LiveLogPanel`（角色配音 watch 任务 progress 变化即重拉角色表）；分集页用行内 Alert（`task.current` + 进度条 + 取消）；合成页每行「已合成/总段落 · 角色 · 已就绪声音」用 `batchStatusFiles` **3s 轮询**（读增量 manifest 真实计数，不走 SSE；文件全部完成瞬间行上出现【已合成】徽章；轮询只在运行中任务非终态时进行）。本页是 keep-alive 缓存页：**`onUnmounted` 在导航时不触发**，行刷新与轮询定时器都挂在 `onActivated`/`onDeactivated` 上（隐藏时定时器停发、不产生请求；重新进入时刷新行并在任务仍在跑时恢复轮询）。
 
-## 测试（394 个，`backend/tests/`）
+## 测试（442 个，`backend/tests/`）
 
 | 文件 | 固化的行为 |
 |---|---|
@@ -313,10 +315,10 @@ worker（`tts-engine/tts_worker.py`，1986 行）5 种 `--mode`：`custom` / `de
 | `test_mix_check.py` | 混合检查：纯标点判定（删/留）、判定解析（results 对象/裸 list/下标键/垃圾→keep/非 target 丢弃/单目标回退）、四道门（逐字拼回通过/乱序丢添拒绝/花名册白名单/同主体拒绝）、**重试**（批内即时：垃圾响应/调用异常/两次皆败放弃 · 尾部：分组规则纯函数/挽回/改判 keep 放弃/仍失败放弃/远距双失败双调用/提示带门原因）、重建重编号（顺序/instruct 空/原文件不动）、窗口 skip、**三类输入 e2e**（旁白+单角色 / 多角色 / 单主体）、同主体拆分拒绝（重试改判 keep）、拼接不符保留（重试再败）、**全可删批零 LLM 调用**、**取消不写文件**、多批钉死调用数、空模型名 fail-fast、**跨阶段接力**（mix 写 `_checked` → 匹配检查就地更新，无 `_checked_checked`、基文件不动）、resolver（基文件恒取/新鲜/过期回退） |
 | `test_speaker_check.py` | 检查：窗口构建/边界 clamp、speaker 解析（多形态/垃圾→None）、多数投票（平票/孤票→None）、无分歧 1 次调用、2:1 一次重试、1:1:1 升级、**只有 speaker 变**、重试失败不中止、多批推进、**取消不写文件**、空模型名 fail-fast |
 | `test_llm_rate_window.py` | 吞吐量 10 秒窗：样本数/零跨度防除零、真实均值、年轻任务部分跨度、累计单调、样本逐出、SSE 事件 |
-| `test_voices.py` | 角色配音纯函数：JSON 对象抽取、说话人名归一化（CJK 保留）、Jaccard、采样带/窗口、`pick_ref_text`/fallback、`_sanitize`、foundation/clone 状态推断、`_ChildReg` kill 语义 |
-| `test_tts_batch.py` | 合成编排：段构建/`_voice_usable`、concurrency 钳制（含 0 与负值）、看门狗缩批重启成功、workers=1 两次超时隔离（manifest 记 ok:false）、8 次上限、运行日志镜像、resume/force_all/显式 indices、**增量写 manifest + 工作空间相对路径**、零段不启动引擎、`batch-status` |
-| `test_tts_worker.py` | worker 纯函数（importlib 加载，无 torch）：子批规划（行必入恰一批/长度分档/字符上限/超长独批/比值拆批）、显存估算、`band_cap_for_chars` 钉死值、`VramGovernor`（减半/增长/floor/故障/标定）、超时预算（cpu/clone/gpu 曲线）、看门狗、合并纯函数（批覆盖/`boundary_gap`==单遍/进度带单调）、**顶层 stdlib-only + 旧调度器已删除**的模块约束 |
-| `test_pathio.py` | 路径模型：相对/绝对/外部资源、`..` 越界拒绝、工程搬家两级恢复、幂等迁移、`migrate_entries_in` list/dict |
+| `test_voices.py` | 角色配音：JSON 对象抽取、说话人名归一化（CJK 保留）、Jaccard、采样带/窗口、`pick_ref_text`/fallback、`_sanitize`、foundation/clone 状态推断、**自动备选数对数分档**（龙套<20=1/量级锚点 100→3·200→4·500→5·1000→6·2000→7·2300+→8/单调有界/真实规模 e2e：旁白 2 万条不压主角）、**候选簿记**（新格式清洗/旧格式合成 1/无克隆空）、**别名台词归并**（链防环/出域丢弃）、**make_clones 全 e2e**（fake-worker 真子进程经真 `run_worker`：固定/自动计数、部分失败重编号、全失败保留旧 ref_audio、取消角色级原子、new_only 差额、进度单调（worker 驱动、重启不回跳）、看门狗缩批重启、size-1 两次超时隔离、8 次上限、断点采纳零作业短路、批内共享 seed）、select 端点（选择/清除/400/404/409 工作空间/409 任务在途）、list_voices（候选字段 + 列表台词数降序） |
+| `test_tts_batch.py` | 合成编排：段构建/`_voice_usable`、concurrency 钳制（含 0 与负值）、看门狗缩批重启成功、workers=1 两次超时隔离（manifest 记 ok:false）、8 次上限、运行日志镜像、resume/force_all/显式 indices、**增量写 manifest + 工作空间相对路径**、零段不启动引擎、`batch-status`、**多文件**（已完成文件短路零引擎/全完成零子进程/零段文件成功/失败段带 script 标签/进度按文件窗口单调/单文件致命错误隔离/全失败 RuntimeError/文件间取消穿透且 manifest 保留）、**batch-status 多文件**（计数/complete/ready/missing/零字典/`__all__` 400/无工作空间降级）、**run_batch 分发**（多→`synthesize_multi`/单→旧路径/`indices`+多 400/`__all__` 400） |
+| `test_tts_worker.py` | worker 纯函数（importlib 加载，无 torch）：子批规划（行必入恰一批/长度分档/字符上限/超长独批/比值拆批/design 行缺省独行、`force_rows_cap` 才共享）、显存估算、`band_cap_for_chars` 钉死值、`VramGovernor`（减半/增长/floor/故障/标定）、超时预算（cpu/clone/gpu 曲线）、看门狗、design-batch 纯函数（`_generate_rows` 逐行 instruct + `force_do_sample` 透传、`_save_and_report_design` 协议行 + 逐行容错）、合并纯函数（批覆盖/`boundary_gap`==单遍/进度带单调）、**顶层 stdlib-only + 旧调度器已删除**的模块约束 |
+| `test_pathio.py` | 路径模型：相对/绝对/外部资源、`..` 越界拒绝、工程搬家两级恢复、幂等迁移、`migrate_entries_in` list/dict；voice_config 含 candidates 时只迁顶层 `ref_audio`（嵌套候选相对路径不动） |
 | `test_paths.py` | Layout 惰性/ensure、指针解析（相对→项目根）、`resolve_parsed_json(_all)`（`_checked` 升级/`__all__`/mtime 序/遗留名兜底） |
 | `test_config.py` | 配置 round-trip、两文件模型（根只写指针/工作空间独立/不覆盖已有）、TTS 字段缺省（三模型 id、500/250、parallel_workers=1 ≠ batch_concurrency=4）、遗留字段保留 |
 | `test_concurrency.py` | 闸门：clamp≥1、增/减上限、acquire/release 配平、唤醒等待者 |
@@ -325,12 +327,21 @@ worker（`tts-engine/tts_worker.py`，1986 行）5 种 `--mode`：`custom` / `de
 
 > 以下均为**有意的设计**而非缺陷——改动时别"顺手修正"；真正可修的陈旧文案（误导日志 / 测试 docstring / README 测试数）已清理。
 
-- worker 的 `--mode custom/clone` **不被后端任何端点调用**（主链路只用 `design`（角色配音·克隆）、`batch`、`merge`）——保留供手动/历史用途；改 worker 时别误以为它们有调用方。
-- `config.tts.parallel_workers` **后端不读**（只被前端 `Voices.vue` 读作 make-clones 并发初值）；合成用的「批内段数」是另一个字段 `tts.batch_concurrency`。两者是两种不同的并行（并行子进程 vs GPU 张量批），文档/注释里别混。
+- worker 的 `--mode custom/design/clone` **不被后端任何端点调用**（主链路只用 `design-batch`（角色配音·克隆）、`batch`、`merge`）——保留供手动/历史用途；改 worker 时别误以为它们有调用方。
+- `config.tts.parallel_workers` 是**遗留字段（无读取方）**——前端初值改读 `tts.batch_concurrency`（音频合成与角色配音·克隆共用的批内行数上限，单进程 GPU 张量批）；仅为旧配置 round-trip 保留，文档/注释里别再当它生效。
 - 音频分集页参数的「自动保存」发生在**前端**（fire-and-forget `PUT /api/config`）；后端只按「请求字段 or 配置缺省」取值，自己从不写配置。
 - `merge` 的 `m4b=True` 目前只是 WARNING（输出 MP3）——M4B 是后续阶段。
 - `config.py` 的读取**永不失败**：文件缺失/损坏/类型不符 → 静默降级（工作空间配置 → 根模板 → 代码默认）；`_load_config_file` 吞掉一切解析异常。写入才是严格路径。
-- 角色配音页的「全部文件」（`__all__`）是**该页局部**选择，不写入共享的 `project.activeScript`；音频合成页的 DirPicker 才绑定 `activeScript`（且拒绝 `__all__`）。
+- 角色配音页的「全部文件」（`__all__`）是**该页局部**选择，不写入共享的 `project.activeScript`；音频合成页的多选同样是**局部状态**（`selected` map，键 = 文件名），只在**用户交互**时把**首个选中**文件同步到 `activeScript`（`lastSynced` 守卫防自身同步坍缩多选；角色配音页改它 → 本缓存页选择坍缩为该文件），且拒绝 `__all__`。别把整个多选写进 `activeScript`（单值字段会碾掉多选）。
 - `GET /api/files/list/{module}` 的 `module` 参数是**磁盘目录名**（`02_split_text` 等），不是 Layout 属性名。
 - 段落混合检查**覆盖**既有 `_checked`（自基文件重建）：若用户先跑角色匹配检查、再跑混合检查，匹配结果会被重建冲掉——任务日志 WARNING 提示，随后重跑角色匹配检查即恢复；正确顺序 = 解析 → 混合检查 → 匹配检查。
 - 下游 `_checked_variant`（`resolve_parsed_json` 链）**无 mtime 守卫**：`_checked` 存在即优先于基文件（重解析后陈旧 `_checked` 仍会被角色配音/音频合成读到）——仅 `check-files` 路由的 resolver 有 mtime 守卫；重跑段落混合检查（自新基文件重建 `_checked`）即恢复一致。
+- worker 的 `--seed` 现为 **batch / design / design-batch 三处共用**：design / design-batch 按 `base_seed + 子批序号` 播种（**同子批多候选共享一个 seed**——复现条件 = 同输入 + 同 seed + 同批布局；design-batch 另加固 `do_sample=True`，防个别 checkpoint 关采样致候选逐字节相同；断点采纳的候选 seed 记 −1）；batch 为 `seed + 子批序号`。别当 batch 专属。
+- **角色配音·克隆的任务进度由 worker 的 `[progress]` 行驱动**（后端运行中不发进度，只在终末发「完成」）；worker 经 `--done-offset`/`--total` 参数上报 `(offset+done)/total`，**看门狗重启后进度不回跳**——别重新引入后端侧的进度驱动。
+- 旧的每作业子进程编排 `_design_preview` / `_ChildReg` **已删除**（唯一调用方 make_clones；阶段 2 现为单一长驻 design-batch 子进程）——别把「每候选一个子进程」的形态恢复回来。
+- **自动备选数 = 角色自身台词的绝对对数分档**（`auto_candidate_count(台词数)`，无工程相对分母）：旁白可达主角 10 倍量级，任何"相对全脚本最大值"的比例都会把主角压成 2~3 条——别改回 ratio，也别把分档改回"随工程规模缩放"；锚点（100→3 / 200→4 / 500→5 / 1000→6 / 2000→7 / 2300+→8）与真实规模 e2e（`test_make_clones_auto_counts_follow_ladder`：旁白 2 万条 → 8 且不压主角）钉死该行为。
+- **多候选升级后首次 new_only 重渲染**：旧单候选角色 `have=1 < 目标≥2` → 首次「批量制作（仅新增）」会把它们全部重渲染为多候选（特性升级路径，且收敛：重渲染后 have=目标，之后只碰真新角色）；自动模式龙套（目标=1）恒跳过。
+- **切换备选数 = 整组差额重渲染**：重跑整体替换候选组，**旧候选文件留盘成孤儿**——`04_voice_profiles/designed_voices/` 随时间累积，页面只列当前候选；「绝不删除」约定下勿顺手清理。
+- `selected_audio_id` 在**重渲染后重置为 None**（旧选择对新候选组无意义）；候选 <2 的角色（自动模式龙套、旧格式单候选）「选择音色」按钮**禁用**——均为有意行为。
+- `migrate_entries_in` **非递归**：dict 形态只迁每 entry 顶层 `ref_audio`，嵌套 `candidates[].ref_audio` 不动（候选写入时即工作空间相对，永不需迁移）。
+- **路由函数的裸 `list` 参数 ≠ 查询参数**（FastAPI 0.141 行为）：`scripts: list[str] | None = None`（不带 `Query()`）会被当成 **JSON 请求体**——URL 里的 `?scripts=…` 被静默忽略（端点落回单文件分支，前端待合成行全 0）；必须写 `Annotated[list[str] | None, Query()] = None`（Annotated 保住普通默认值 `None`，测试才能继续直调函数——测试套件全部直调、不走 HTTP 层，这类参数绑定 bug 测试抓不到，改路由签名后用真实 HTTP 探测验证）。

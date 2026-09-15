@@ -5,7 +5,7 @@ import type {
   PrepareFoundationsOptions,
   MakeClonesOptions,
   BatchRunOptions,
-  BatchStatus,
+  BatchStatusFiles,
 } from '@/types'
 
 /** Report whether TTS is implemented (ready vs. engine-not-installed). */
@@ -30,6 +30,7 @@ export function makeClones(opts: MakeClonesOptions = {}): Promise<{ task_id: str
     new_only: opts.new_only ?? false,
     concurrency: opts.concurrency ?? null,
     script: opts.script ?? null,
+    candidate_count: opts.candidate_count ?? null,
   })
 }
 
@@ -39,26 +40,44 @@ export function listVoices(script?: string): Promise<VoicesListResult> {
   return http.get<VoicesListResult>(`/api/tts/voices${q}`)
 }
 
-/** 音频合成：start a batch TTS Task (all lines, or the given line indices; for a script).
- *  ``force_all`` re-synthesizes every segment; otherwise the run resumes (skips the done).
- *  ``concurrency`` is the *manual per-batch cap* (批内段数上限); ``seed`` (>=0) makes a run
- *  reproducible (omitted → the persisted config default; -1 → random). */
+/** 角色配音：记录用户对某角色克隆候选的选择（单选一个为最终音色；audioId 为 null =
+ *  清除选择，回默认第一条）。同步写（非任务）：选中的候选成为生效的克隆参考。 */
+export function selectVoice(speaker: string, audioId: string | null): Promise<{
+  ok: boolean
+  speaker: string
+  selected_audio_id: string | null
+  ref_audio: string
+}> {
+  return http.put<{ ok: boolean; speaker: string; selected_audio_id: string | null; ref_audio: string }>(
+    '/api/tts/voices/select', { speaker, audio_id: audioId },
+  )
+}
+
+/** 音频合成：start a batch TTS Task (all lines, or the given line indices; for a script —
+ *  or a whole selection of scripts, the 待合成 card's multi-select: one task synthesizes
+ *  the files one by one, each in its own package). ``force_all`` re-synthesizes every
+ *  segment; otherwise the run resumes (skips the done). ``concurrency`` is the *manual
+ *  per-batch cap* (批内段数上限); ``seed`` (>=0) makes a run reproducible (omitted → the
+ *  persisted config default; -1 → random). */
 export function runBatch(opts: BatchRunOptions = {}): Promise<{ task_id: string }> {
   return http.post<{ task_id: string }>('/api/tts/batch', {
     indices: opts.indices ?? null,
     script: opts.script ?? null,
+    scripts: opts.scripts ?? null,
     concurrency: opts.concurrency ?? null,
     seed: opts.seed ?? null,
     force_all: opts.force_all ?? false,
   })
 }
 
-/** 音频合成进度：the chosen script's 【已合成 / 总段落】(completed / total / remaining).
- *  Reads the package manifest (written incrementally as synthesis proceeds), so polling it
- *  while a run streams gives a live, real count. */
-export function batchStatus(script?: string): Promise<BatchStatus> {
-  const q = script ? `?script=${encodeURIComponent(script)}` : ''
-  return http.get<BatchStatus>(`/api/tts/batch-status${q}`)
+/** 音频合成进度（每文件）：each file's 【已合成 / 总段落】· 角色 · 已就绪声音, plus the
+ *  【已合成】 flag when a file's segments are all done. Reads the package manifests (written
+ *  incrementally as synthesis proceeds), so polling while a run streams gives live, real
+ *  per-row counts. FastAPI's ``list[str]`` query param = one repeated ``scripts=`` per file. */
+export function batchStatusFiles(scripts: string[]): Promise<BatchStatusFiles> {
+  const q = new URLSearchParams()
+  for (const s of scripts) q.append('scripts', s)
+  return http.get<BatchStatusFiles>(`/api/tts/batch-status?${q.toString()}`)
 }
 
 /** 音频合并：start a merge Task for one package (MP3 now; M4B is a later phase).

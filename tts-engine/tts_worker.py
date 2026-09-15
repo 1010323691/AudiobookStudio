@@ -24,6 +24,10 @@ Modes (``--mode``)
                      segments are padded into native tensor batches; --concurrency is only the
                      per-batch CEILING — the real size follows the segment-length bands and a
                      measured VRAM governor that shrinks / grows it as the run goes
+  design-batch       all VoiceDesign candidates in a file, one subprocess, the design model
+                     loaded once; every candidate (short ref text + its own voice description)
+                     runs as a native tensor sub-batch like batch mode — the 角色配音·克隆
+                     engine; each settles through a [design] line, output is WAV per candidate
   merge              two-stage: per-segment files -> part WAVs (batches of
                      --merge-batch-size, staged in --tmp-dir) -> the final audiobook;
                      every stage reports live progress
@@ -34,6 +38,9 @@ Contract with the backend (all on STDOUT unless noted)
   - ``[result]   <absolute path>``    -> the primary file produced
   - ``[segment]  <index> ok <path>``  -> one batch segment succeeded
   - ``[segment]  <index> error <reason>`` -> one batch segment failed (batch continues)
+  - ``[design]   <index> ok <seed> <path>`` -> one design candidate rendered (design-batch;
+    index = the row's position in the jobs file; seed = that sub-batch's seed)
+  - ``[design]   <index> error <reason>`` -> one design candidate failed (run continues)
   - ``[watchdog] timeout batch=<n> indices=[...] elapsed=<s>`` -> a sub-batch produced no
     output within its budget; the process then exits 124 (the backend shrinks the batch and
     restarts a fresh subprocess)
@@ -1042,12 +1049,19 @@ def _run_design(args) -> int:
         log("VoiceDesign model ready.")
 
         progress(0.40, "Generating voice from description")
+        if args.seed >= 0:
+            import torch
+
+            torch.manual_seed(args.seed)
+        # do_sample=True guards against a checkpoint whose generate_config.json disables
+        # sampling (greedy decode would make every seeded candidate byte-identical).
         wavs, sr = model.generate_voice_design(
             text=sample_text,
             instruct=description,
             language=args.language,
             non_streaming_mode=True,
             max_new_tokens=2048,
+            **({"do_sample": True} if args.seed >= 0 else {}),
         )
         if not wavs:
             raise RuntimeError("VoiceDesign model returned no audio.")
@@ -1159,11 +1173,16 @@ def _effective_instruct(r, vtype):
     return ""  # clone: no instruct
 
 
-def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed):
+def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed, *, force_do_sample=False):
     """The GPU generate for a sub-batch (the model's list API). Returns ``[(ok, payload), ...]``
     in row order. Runs in the watchdog's daemon thread; it never saves files or emits protocol
     lines (that happens on the main thread after the watchdog returns, so the ``[segment]`` /
-    ``[progress]`` stream stays single-threaded and monotonic)."""
+    ``[progress]`` stream stays single-threaded and monotonic).
+
+    ``force_do_sample`` is design-batch-only: sampling is forced on so a checkpoint whose
+    generate_config disables it (greedy decode) cannot make identical-input candidates
+    byte-identical. Batch mode never sets it — its behaviour is unchanged.
+    """
     if batch_seed is not None:
         import torch
 
@@ -1181,21 +1200,24 @@ def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed):
         wavs, _sr = model.generate_voice_clone(
             text=texts, voice_clone_prompt=prompt,
             non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS)
-    else:  # design (a design sub-batch is always size 1, each with its own description)
-        description = _effective_instruct(rows[0], "design")
+    else:  # design: each row carries its own description (a per-row instruct list —
+        # batch mode's design sub-batches are size 1, where this is equivalent to the
+        # old scalar; design-batch packs several rows per call, one shared forward)
         wavs, _sr = model.generate_voice_design(
-            text=texts, instruct=description, language=args.language,
-            non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS)
+            text=texts, instruct=[_effective_instruct(r, "design") for r in rows],
+            language=args.language, non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS,
+            **({"do_sample": True} if force_do_sample else {}))
     if not wavs:
         return [(False, "模型未返回音频")] * len(rows)
     return [(True, (w, _sr)) for w in wavs]
 
 
-def _save_and_report(rows, results, out_dir, width, report) -> None:
+def _save_and_report(rows, results, out_dir, width, report, batch_seed=None) -> None:
     """Save each generated row (wav -> mp3) and emit its ``[segment]`` line + progress.
 
     Runs on the main (coordinator) thread after the watchdog returns. A per-row save / encode
     fault is a recorded error, never a run abort (matching the old per-segment tolerance).
+    ``batch_seed`` is unused here (the design-batch save variant records it per candidate).
     """
     import numpy as np
 
@@ -1236,8 +1258,47 @@ def _save_and_report(rows, results, out_dir, width, report) -> None:
             report(index, False, str(e))
 
 
+def _save_and_report_design(rows, results, out_dir, width, report, batch_seed) -> None:
+    """Save each generated design candidate straight to its row's ``out`` path (WAV — the clone
+    reference is consumed as WAV, no MP3 encode) and emit its ``[design]`` line + progress.
+
+    The design-batch counterpart of :func:`_save_and_report`; same single-threaded / fault-
+    tolerant contract (a per-row fault is a recorded error, never a run abort). ``report`` gets
+    ``(index, ok, payload)`` where payload is ``(batch_seed, abs_path)`` on success — the
+    sub-batch's seed, recorded per candidate (candidates in one sub-batch share it) — or the
+    reason string on failure. ``out_dir`` / ``width`` are unused (each row carries its own
+    output path) but kept so the save hook matches one signature.
+    """
+    import numpy as np
+
+    for r, (ok, payload) in zip(rows, results):
+        index = r["index"]
+        out = os.path.abspath(r["out"])
+        if not ok:
+            report(index, False, payload if isinstance(payload, str) else str(payload))
+            continue
+        wav, sr = payload
+        if not isinstance(wav, np.ndarray):
+            wav = np.array(wav)
+        if wav.size == 0:
+            report(index, False, "模型返回空音频")
+            continue
+        try:
+            parent = os.path.dirname(out)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            _save_wav(wav, sr, out)
+            report(index, True, (batch_seed, out))
+        except Exception as e:  # noqa: BLE001 — one bad row must not kill the batch
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+            report(index, False, str(e))
+
+
 def _synth_sub_batch(model, vtype, rows, *, args, clone_prompts, device, seed, sub_counter,
-                     out_dir, width, report, gov=None):
+                     out_dir, width, report, gov=None, save=None, force_do_sample=False):
     """Generate + save + report a sub-batch, under its watchdog, with in-process halving retry.
 
     ``sub_counter`` is a mutable ``[int]`` (a global sequence shared across every sub-batch, so a
@@ -1247,6 +1308,11 @@ def _synth_sub_batch(model, vtype, rows, *, args, clone_prompts, device, seed, s
     size-1 fault hands off to the backend (``os._exit(124)``) so the specific segment can be
     struck / isolated. Timeouts never retry in-process (a hang means the GPU context is suspect)
     — the watchdog already ``os._exit``'d.
+
+    ``save`` is the post-watchdog save/report hook (``(rows, results, out_dir, width, report,
+    batch_seed)``); it defaults to :func:`_save_and_report` (batch mode, wav -> mp3) — the
+    design-batch mode passes :func:`_save_and_report_design` (WAV straight to each row's out
+    path).
     """
     if model is None:
         for r in rows:
@@ -1260,7 +1326,8 @@ def _synth_sub_batch(model, vtype, rows, *, args, clone_prompts, device, seed, s
     total_chars = sum(r["chars"] for r in rows)
 
     def _gen():
-        return _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed)
+        return _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed,
+                              force_do_sample=force_do_sample)
 
     try:
         results = run_with_watchdog(
@@ -1279,24 +1346,30 @@ def _synth_sub_batch(model, vtype, rows, *, args, clone_prompts, device, seed, s
         mid = len(rows) // 2
         _synth_sub_batch(model, vtype, rows[:mid], args=args, clone_prompts=clone_prompts,
                          device=device, seed=seed, sub_counter=sub_counter,
-                         out_dir=out_dir, width=width, report=report, gov=gov)
+                         out_dir=out_dir, width=width, report=report, gov=gov, save=save,
+                         force_do_sample=force_do_sample)
         _synth_sub_batch(model, vtype, rows[mid:], args=args, clone_prompts=clone_prompts,
                          device=device, seed=seed, sub_counter=sub_counter,
-                         out_dir=out_dir, width=width, report=report, gov=gov)
+                         out_dir=out_dir, width=width, report=report, gov=gov, save=save,
+                         force_do_sample=force_do_sample)
         return
 
-    _save_and_report(rows, results, out_dir, width, report)
+    save_fn = save if save is not None else _save_and_report
+    save_fn(rows, results, out_dir, width, report, batch_seed)
 
 
 def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
-                        max_batch, max_batch_chars):
+                        max_batch, max_batch_chars, force_rows_cap=None):
     """One lazy planning round (pure): the next sub-batch + the rows left after it.
 
-    The round's row cap is the governor's current adaptive cap (1 for design rows — each
-    carries its own voice description); the length bands apply on top (a batch may never
-    exceed the band of its longest row), as do the char caps and the (trust-scaled) VRAM
-    estimate. The planner's first batch is always a prefix of the (ascending) rows, so the
-    remainder is well defined. Returns ``(batch_rows, remaining_rows)``.
+    The round's row cap is the governor's current adaptive cap (1 for design rows in batch
+    mode — there each design row is a book segment and runs solo); ``force_rows_cap``
+    overrides it — the design-batch mode passes the governor's cap so its candidates (each
+    with its own description) DO share a tensor sub-batch, which is the point of that mode.
+    The length bands apply on top (a batch may never exceed the band of its longest row),
+    as do the char caps and the (trust-scaled) VRAM estimate. The planner's first batch is
+    always a prefix of the (ascending) rows, so the remainder is well defined. Returns
+    ``(batch_rows, remaining_rows)``.
     """
     tokens = plan_row_tokens([r["text"] for r in remaining],
                              [_effective_instruct(r, vtype) for r in remaining], overhead)
@@ -1308,7 +1381,8 @@ def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
             # the static L^2 estimate, scaled by the governor's measured trust
             return (estimate_batch_vram(len(toks), _h, _k, toks, MAX_NEW_TOKENS)
                     <= _b * gov.vram_scale)
-    rows_cap = 1 if vtype == "design" else gov.cap
+    rows_cap = (force_rows_cap if force_rows_cap is not None
+                else (1 if vtype == "design" else gov.cap))
     batches = plan_sub_batches(
         [r["chars"] for r in remaining],
         max_batch=rows_cap,
@@ -1552,6 +1626,160 @@ def _run_batch(args) -> int:
     progress(1.0, f"完成（成功 {counts['completed']} / 失败 {counts['failed']} / 共 {total}）")
     log(f"批量合成结束：成功 {counts['completed']}，失败 {counts['failed']}，共 {total} 段。"
         f"输出目录：{out_dir}")
+    return 0
+
+
+def _run_design_batch(args) -> int:
+    """Render every VoiceDesign candidate in ``--segments-file``, one subprocess.
+
+    The 角色配音·克隆 stage's counterpart of ``_run_batch``: the VoiceDesign model is loaded
+    ONCE, then every candidate (short ref text + its own voice description) runs as native
+    tensor sub-batches — unlike batch mode's design rows (book segments, one per sub-batch),
+    candidates DO share a sub-batch (``force_rows_cap`` = the governor's cap), which is the
+    point of this mode. The per-batch size follows the length bands + the measured
+    VramGovernor; ``--concurrency`` is only the ceiling. Rows run ascending by length (early
+    progress + crash resilience); each row keeps its backend identity (``index`` = position in
+    the jobs file) so the ``[design]`` lines and the watchdog's ``indices=`` map back after
+    the sort.
+
+    Every candidate is seeded ``--seed + sub-batch#`` (rows in one sub-batch share the seed;
+    the backend records it per candidate — the same layout-conditioned reproducibility as
+    batch mode), and ``do_sample`` is forced on (a checkpoint whose generate_config disables
+    sampling would make identical-input candidates byte-identical). Output is WAV per
+    candidate (no MP3 encode) at the row's ``out`` path. Watchdog / in-process halving retry /
+    exit-124 hand-off are the same as batch mode.
+
+    Progress across backend watchdog restarts: the reported fraction starts at
+    ``--done-offset`` / ``--total`` (the candidates already settled) and climbs to 1.0 as this
+    attempt's rows settle — so a restart's model-load phase reports the settled level, not a
+    backward jump to zero (failed rows re-queued by the backend still count as unsettled).
+    """
+    import json as _json
+
+    if not args.segments_file or not args.out_dir:
+        print("TTS_WORKER_ERROR: design-batch mode needs --segments-file and --out-dir",
+              file=sys.stderr, flush=True)
+        return 2
+
+    _add_ffmpeg_to_path(args.ffmpeg)
+
+    try:
+        with open(args.segments_file, "r", encoding="utf-8") as f:
+            jobs = _json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"TTS_WORKER_ERROR: cannot read jobs file: {e}", file=sys.stderr, flush=True)
+        return 2
+    if not isinstance(jobs, list) or not jobs:
+        print("TTS_WORKER_ERROR: jobs file is empty or not a list", file=sys.stderr, flush=True)
+        return 2
+
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    total = max(1, int(getattr(args, "total", 0) or len(jobs)))
+    offset = max(0, min(int(getattr(args, "done_offset", 0)), total))
+    base = offset / total  # fraction settled before this attempt (the restart-safe floor)
+    done = 0  # rows settled so far in THIS attempt
+
+    def report_result(index, ok, payload):
+        """Emit the ``[design]`` line + progress (single-threaded, monotonic within attempt)."""
+        nonlocal done
+        done += 1
+        settled = offset + done
+        if ok:
+            seed, path = payload
+            print(f"[design] {index} ok {seed} {path}", flush=True)
+        else:
+            print(f"[design] {index} error {' '.join(str(payload).split())}", flush=True)
+        progress(base + done / len(jobs) * (1.0 - base), f"完成 {settled}/{total} 候选")
+
+    # Rows carry the backend's per-candidate identity (index = position in the jobs file) so
+    # the protocol lines map back after the ascending-by-length sort below.
+    rows = []
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        text = str(j.get("text") or "").strip()
+        description = str(j.get("description") or "").strip() or "A clear, natural speaking voice"
+        rows.append({"index": int(j.get("index", 0)), "sp": str(j.get("sp", "")),
+                     "k": int(j.get("k", 1)), "vd": {"description": description},
+                     "text": text, "instruct": "", "chars": len(text),
+                     "out": str(j.get("out", ""))})
+
+    progress(base, "解析输入")
+    # Unrenderable rows are immediate errors, never a generation input (mirrors batch mode).
+    gen_rows = []
+    for r in rows:
+        if r["text"] and r["out"]:
+            gen_rows.append(r)
+        else:
+            report_result(r["index"], False, "空文本/缺输出路径")
+    if not gen_rows:
+        progress(1.0, f"完成（共 {total} 候选，无可渲染）")
+        return 0
+
+    device = resolve_device(args.device)
+    log(f"device = {device} · {len(gen_rows)} 个候选待渲染")
+
+    progress(base, "加载 VoiceDesign 模型")
+    model = load_model(args.design_model, device)
+    log("VoiceDesign 模型就绪。")
+    _warmup(model, "design", args.language, device)
+
+    max_batch = max(1, min(64, int(args.concurrency)))
+    seed = int(args.seed)
+    max_batch_chars = max(1000, int(args.max_batch_chars))
+    log(f"批内行数上限 {max_batch}（仅上限；实际每批行数 = min(行长按分档, 动态调节, 显存估算, 字符上限)）")
+    if seed >= 0:
+        log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
+
+    gen_rows.sort(key=lambda r: r["chars"])  # short first: early progress + crash resilience
+
+    gov = VramGovernor(max_batch, device=device, total_vram=_total_vram(device))
+    params = _talker_vram_params(model)
+    # The sub-batch sequence CONTINUES across restarts (it starts at the done-offset: the
+    # rows settled earlier). A re-rendered row must never land on a seed an already-settled
+    # row holds — candidates of one character share identical inputs, so a repeated
+    # seed would reproduce a byte-identical duplicate candidate. The offset (>= the number
+    # of sub-batches any earlier attempt could have run) keeps every seed run-unique.
+    sub_counter = [offset]
+
+    remaining = gen_rows
+    while remaining:
+        budget = _free_vram_budget(device) if params is not None else None  # fresh per round
+        rows_b, remaining = plan_next_sub_batch(
+            remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
+            budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
+            force_rows_cap=gov.cap)
+        log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
+        free_before = _free_vram(device)
+        t0 = time.monotonic()
+        _synth_sub_batch(
+            model, "design", rows_b,
+            args=args, clone_prompts={}, device=device, seed=seed,
+            sub_counter=sub_counter, out_dir=out_dir, width=max(4, len(str(total))),
+            report=report_result, gov=gov, save=_save_and_report_design,
+            force_do_sample=True)
+        _clear_gpu_cache(device)
+        elapsed = time.monotonic() - t0
+        free_after = _free_vram(device)
+        static_est = 0
+        if params is not None:
+            static_est = estimate_batch_vram(
+                len(rows_b), params["heads"], params["kv_per_token"],
+                plan_row_tokens([r["text"] for r in rows_b],
+                                [_effective_instruct(r, "design") for r in rows_b],
+                                ROW_STRUCTURAL_OVERHEAD),
+                MAX_NEW_TOKENS)
+        action = gov.observe_success(
+            free_before=free_before, free_after=free_after, rows=len(rows_b),
+            chars=sum(r["chars"] for r in rows_b), elapsed=elapsed, static_est=static_est)
+        if action:
+            _what, _detail = gov.events[-1]
+            log(f"动态并发{action}（{_detail}）→ 批内上限 {gov.cap}")
+
+    progress(1.0, f"完成（共 {total} 候选）")
+    log(f"候选渲染结束：{offset + done}/{total} 候选已落定。输出目录：{out_dir}")
     return 0
 
 
@@ -1920,7 +2148,7 @@ def _run_merge(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Qwen3-TTS synthesis worker")
     ap.add_argument("--mode", default="custom",
-                    choices=["custom", "design", "clone", "batch", "merge"])
+                    choices=["custom", "design", "clone", "batch", "design-batch", "merge"])
     # shared
     ap.add_argument("--text", default="", help="text to synthesize (or use --text-file)")
     ap.add_argument("--text-file", default="",
@@ -1947,16 +2175,22 @@ def main() -> int:
     ap.add_argument("--ref-audio", default="", help="clone reference audio path")
     ap.add_argument("--ref-text", default="", help="clone reference transcript")
     # batch
-    ap.add_argument("--segments-file", default="", help="JSON list of segments (batch/merge)")
+    ap.add_argument("--segments-file", default="",
+                    help="JSON list of segments (batch / design-batch jobs)")
     ap.add_argument("--voice-config", default="", help="voice_config.json path (batch)")
-    ap.add_argument("--out-dir", default="", help="per-segment output dir (batch)")
+    ap.add_argument("--out-dir", default="", help="per-segment output dir (batch / design-batch)")
     ap.add_argument("--concurrency", type=int, default=4,
-                    help="per-batch CEILING: the max rows in one tensor batch (batch mode); the "
-                         "length bands + measured VRAM governor set the actual size (1 = sequential)")
+                    help="per-batch CEILING: the max rows in one tensor batch (batch / design-batch); "
+                         "the length bands + measured VRAM governor set the actual size (1 = sequential)")
     ap.add_argument("--max-batch-chars", type=int, default=12000,
-                    help="max total chars in one sub-batch (batch; guards an oversized prefill)")
+                    help="max total chars in one sub-batch (batch / design-batch; guards an oversized prefill)")
     ap.add_argument("--seed", type=int, default=-1,
-                    help="reproducible seed offset per sub-batch (batch; -1 = random)")
+                    help="reproducible seed offset per sub-batch (batch / design / design-batch; -1 = random)")
+    ap.add_argument("--done-offset", type=int, default=0,
+                    help="candidates already settled before this run (design-batch; keeps progress "
+                         "continuous across watchdog restarts)")
+    ap.add_argument("--total", type=int, default=0,
+                    help="global candidate total (design-batch; 0 = the jobs file length)")
     # merge
     ap.add_argument("--pause-ms", type=int, default=500, help="pause between different speakers")
     ap.add_argument("--same-same-ms", type=int, default=250, help="pause for same speaker")
@@ -1975,6 +2209,8 @@ def main() -> int:
         return _run_clone(args)
     if args.mode == "batch":
         return _run_batch(args)
+    if args.mode == "design-batch":
+        return _run_design_batch(args)
     if args.mode == "merge":
         return _run_merge(args)
 

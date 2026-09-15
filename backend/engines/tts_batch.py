@@ -26,6 +26,7 @@ from pathlib import Path
 from ..core import pathio
 from ..core.config import get_config
 from ..core.paths import get_layout, resolve_parsed_json
+from ..core.tasks import TaskCancelled
 from .tts import DEFAULT_LANGUAGE, DEFAULT_MODEL, WorkerWatchdogTimeout, resolve_engine, run_worker
 
 IMPLEMENTED = True
@@ -317,8 +318,12 @@ def _write_manifest_file(manifest_path, manifest) -> None:
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def synthesize(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
-    """Task worker: synthesize the script's lines (default = resume: only the not-yet-done).
+def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
+    """Task worker: synthesize ONE script's lines (default = resume: only the not-yet-done).
+
+    The shared per-file body of both run shapes: ``synthesize`` (single file, the legacy
+    API path / tests) and ``synthesize_multi`` (several files in one task, in order) call
+    this — with a progress-scaling :class:`_ScaledHandle` in the multi case.
 
     ``concurrency`` is only the *per-batch ceiling* (the most segments that may share one GPU
     tensor batch); the worker sets the actual size at runtime from the segment-length bands and
@@ -539,3 +544,123 @@ def synthesize(handle, indices=None, script=None, concurrency=None, force_all=Fa
         "done_count": done["completed"],
         "all_count": done["total"],
     }
+
+
+def synthesize(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
+    """Single-file entry (the legacy ``POST /api/tts/batch`` path and the tests): delegates
+    verbatim to :func:`_synthesize_one`. Signature kept identical so positional callers work."""
+    return _synthesize_one(handle, indices, script, concurrency, force_all, seed)
+
+
+class _ScaledHandle:
+    """One file's view of a multi-file task handle: progress scaled, everything else verbatim.
+
+    The task has a single progress bar; file *i* of *n* runs in the window
+    ``[i/n, (i+1)/n]`` (``base + frac·weight``), so the bar climbs monotonically across
+    files and can never dip below the start of the current file (even across the worker's
+    restart-on-watchdog progress reset). Non-empty progress labels are prefixed with the
+    file name so the step row always names the file being synthesized (a bare "完成" from
+    file *i* would otherwise linger while file *i*+1 starts). ``log`` / ``check`` (and the
+    LLM telemetry methods, unused on this path) forward to the parent untouched, so
+    cancel/pause semantics are identical to a single-file run.
+    """
+
+    def __init__(self, parent, base: float, weight: float, name: str):
+        self._parent = parent
+        self._base = base
+        self._weight = weight
+        self._name = name
+
+    def progress(self, frac: float, current: str = "") -> None:
+        label = f"{self._name} · {current}" if current else ""
+        self._parent.progress(self._base + float(frac) * self._weight, label)
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        self._parent.log(msg, level)
+
+    def check(self) -> None:
+        self._parent.check()
+
+    def llm_chunk(self, text: str) -> None:
+        self._parent.llm_chunk(text)
+
+    def llm_rate(self, chars: int, cps: float) -> None:
+        self._parent.llm_rate(chars, cps)
+
+    def llm_chars(self, chars: int, secs: float) -> None:
+        self._parent.llm_chars(chars, secs)
+
+
+def synthesize_multi(handle, scripts, concurrency=None, force_all=False, seed=None) -> dict:
+    """Task worker: synthesize several parsed JSON files in ONE task, sequentially.
+
+    Each file is one package (``05_audio_chunk/<stem>/``) synthesized by its own one-shot
+    engine subprocess — the model loads once per file, and a file that is already fully
+    done short-circuits without spawning the engine at all (no wasted model load). The run
+    is sequential: two engine processes would never run at once (they would fight over
+    GPU memory).
+
+    Per-file fatal errors (missing / corrupt / empty script, an engine run that produces
+    nothing) are *isolated*: logged, recorded on that file's result entry, and the run
+    continues with the next file — one bad file never sinks the batch (the same principle
+    as 角色配音's per-character failure isolation). The task fails only when nothing was
+    synthesized while something was actually attempted; an all-complete / all-empty
+    selection settles as a success (each such file took the zero-short-circuit).
+
+    Cancellation propagates: ``TaskCancelled`` is re-raised (NEVER swallowed by the
+    per-file error isolation), so a cancel mid-run settles as ``cancelled`` — whatever
+    finished in the earlier files is kept (each file's manifest is written incrementally).
+    """
+    if not scripts:
+        raise RuntimeError("没有可合成的文件——请先在「待合成」列表勾选解析 JSON。")
+    n = len(scripts)
+    per_file: list[dict] = []
+    failed_all: list[dict] = []
+    for i, name in enumerate(scripts):
+        handle.check()  # cancel / pause point before any work on file i
+        sub = _ScaledHandle(handle, i / n, 1.0 / n, name)
+        sub.log(f"文件 {i + 1}/{n}：{name}")
+        try:
+            res = _synthesize_one(sub, None, name, concurrency, force_all, seed)
+            for f in res["failed"]:
+                failed_all.append({**f, "script": name})
+            per_file.append({
+                "script": name,
+                "total": res["total"],
+                "completed": res["completed"],
+                "failed": len(res["failed"]),
+                "output_dir": res["output_dir"],
+                "manifest_path": res["manifest_path"],
+                "done_count": res["done_count"],
+                "all_count": res["all_count"],
+                "error": None,
+            })
+        except TaskCancelled:
+            raise  # cancel is a task-level outcome — never "file failed, keep going"
+        except Exception as e:  # noqa: BLE001 — one bad file is isolated, the batch continues
+            handle.log(f"文件 {name} 合成失败（跳过，继续其余文件）：{e}", "ERROR")
+            per_file.append({
+                "script": name, "total": 0, "completed": 0, "failed": 0,
+                "output_dir": "", "manifest_path": "", "done_count": 0, "all_count": 0,
+                "error": str(e),
+            })
+
+    result = {
+        "total": sum(r["total"] for r in per_file),
+        "completed": sum(r["completed"] for r in per_file),
+        "failed": failed_all,
+        "output_dir": "",  # multi-file: each file has its own package (see ``files``)
+        "manifest_path": "",
+        "done_count": sum(r["done_count"] for r in per_file),
+        "all_count": sum(r["all_count"] for r in per_file),
+        "files": per_file,
+    }
+    # Nothing synthesized while something WAS attempted (or a file errored) is a failure;
+    # an all-complete / all-empty selection succeeds — the legacy zero-short-circuit, per file.
+    attempted = [r for r in per_file if r["total"] > 0 or r["error"]]
+    if not attempted or result["completed"] > 0:
+        handle.progress(1.0, "完成")
+        return result
+    raise RuntimeError(
+        f"全部 {result['total']} 段合成失败（各文件原因见任务日志与结果 files 字段）。"
+    )

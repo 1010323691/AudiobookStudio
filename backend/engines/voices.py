@@ -13,11 +13,22 @@ across the book (front / middle / back), each carrying its ±window local contex
 ``voice_config.json`` as ``type: "foundation"``. No TTS runs in this phase.
 
 **Phase 2 — ``make_clones`` (TTS only, no LLM).** Reads back the persisted
-foundations and — in parallel, up to the caller's ``concurrency`` — renders each
-character's clone seed WAV via the worker's ``design`` mode, storing it as a **clone**
-reference (``type: clone, ref_audio, ref_text``). On a render failure it falls back to
-a **design** voice (``type: design``) so the character still gets a working voice.
-On cancel every in-flight TTS child process is killed so GPU memory is freed at once.
+foundations and renders every character's clone *candidate* seed WAVs in ONE
+long-lived ``.venv-tts`` subprocess (the worker's ``design-batch`` mode: the
+VoiceDesign model is loaded once, and the candidates run as native tensor
+sub-batches whose size a measured VRAM governor sets at runtime — the caller's
+``concurrency`` is only the per-batch *ceiling*). Each candidate is an independent,
+differently-seeded render (seeded by its sub-batch), so they can be auditioned and
+the best kept. The entry stores the candidate list (``candidates``) plus the
+user's pick (``selected_audio_id``); the top-level ``ref_audio`` always mirrors the
+*active* candidate (the selected one, or the first when none is picked) so the
+downstream 音频合成 stage needs no changes. A partial failure still yields a usable
+clone (the successful candidates); a total failure falls back to a **design** voice
+(``type: design``) and keeps the last-known ``ref_audio`` for previewing.
+A hung / OOM-killed child (the worker's watchdog, exit 124) is recovered by
+shrinking the per-batch cap and restarting a fresh subprocess that adopts the
+candidates already rendered on disk (recorded with seed ``-1``); on cancel the
+worker's process tree is killed so GPU memory is freed at once.
 
 The book's per-line synthesis remains the separate 音频合成 (``tts_batch``) stage, which
 consumes the finished ``voice_config.json``. A single character's foundation / clone can
@@ -31,18 +42,20 @@ aborts the whole run; only a *fatal* error (no script, no engine) raises.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
-import threading
+import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core import pathio
 from ..core.config import get_config
-from ..core.paths import ALL_PARSED_JSON, PROJECT_ROOT, get_layout, resolve_parsed_json, resolve_parsed_json_all
+from ..core.paths import ALL_PARSED_JSON, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from .persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT
-from .tts import _child_env, resolve_engine
+from .tts import WorkerWatchdogTimeout, resolve_engine, run_worker
+from .tts_batch import _parse_watchdog_indices, clamp_concurrency
 
 IMPLEMENTED = True
 
@@ -278,106 +291,6 @@ def _llm_persona(handle, llm, system, user_template, speaker, script, bands):
     return "", ""
 
 
-def _design_preview(handle, description: str, ref_text: str, out_wav, reg=None) -> str:
-    """Render a per-character clone-seed WAV via the worker's ``design`` mode.
-
-    Spawns the isolated TTS env (``resolve_engine`` raises a clear error if it is not
-    installed) and pumps its stdout into the task. ``reg`` (an optional :class:`_ChildReg`)
-    registers the live child process so a cancel can kill it; when omitted the child runs
-    to completion (the original, non-parallel behaviour). Returns the produced file path;
-    raises on failure so the caller can fall back to a ``design`` voice.
-    """
-    import subprocess
-
-    python, worker = resolve_engine()
-    cfg = get_config()
-    t = cfg.tts
-    out_wav = out_wav if isinstance(out_wav, str) else str(out_wav)
-    layout = get_layout()
-    layout.voice_profiles.mkdir(parents=True, exist_ok=True)
-
-    # Long / non-ASCII description + sample go through UTF-8 files (robust on Windows).
-    tmp = layout.temp
-    desc_file = tmp / f"persona_{uuid.uuid4().hex[:10]}.desc"
-    text_file = tmp / f"persona_{uuid.uuid4().hex[:10]}.txt"
-    desc_file.write_text(description, encoding="utf-8")
-    text_file.write_text(ref_text, encoding="utf-8")
-
-    cmd = [
-        str(python), str(worker),
-        "--mode", "design",
-        "--description-file", str(desc_file),
-        "--text-file", str(text_file),
-        "--out", out_wav,
-        "--design-model", t.design_model or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-        "--language", t.language or "chinese",
-        "--device", t.device or "auto",
-    ]
-    if cfg.ffmpeg.ffmpeg_path:
-        cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
-
-    handle.log("  正在用 VoiceDesign 模型渲染预览…")
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                cwd=str(PROJECT_ROOT), env=_child_env())
-    except FileNotFoundError:
-        # Popen failed — the child never ran, so clean up the input files, then re-raise.
-        for p in (desc_file, text_file):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
-        raise RuntimeError(f"无法启动 TTS 引擎：{python}")
-
-    if reg is not None:
-        reg.add(proc)  # register the live child so a cancel can kill it (frees GPU memory)
-
-    # Read the child to completion, forwarding its lines as logs. The input files must
-    # outlive the child (it reads them only after a slow torch import), so they are
-    # removed *after* communicate() returns — never right after Popen (that raced ahead
-    # of the child and caused a FileNotFoundError in _run_design).
-    produced = ""
-    try:
-        out, err = proc.communicate(timeout=None)
-    except Exception as e:  # noqa: BLE001
-        proc.kill()
-        raise RuntimeError(f"TTS 引擎异常：{e}")
-    finally:
-        if reg is not None:
-            reg.remove(proc)
-        for p in (desc_file, text_file):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
-    for line in out.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("[result]"):
-            produced = line[len("[result]"):].strip()
-        elif line.startswith("[progress]"):
-            parts = line.split(None, 2)
-            try:
-                frac = float(parts[1])
-            except (ValueError, IndexError):
-                frac = 0.0
-            handle.progress(min(frac, 1.0), parts[2] if len(parts) > 2 else "渲染预览")
-        else:
-            handle.log(line)
-    for line in err.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if line:
-            handle.log(line, "WARNING")
-
-    if proc.returncode != 0:
-        tail = " | ".join(err.decode("utf-8", "replace").splitlines())[-300:]
-        raise RuntimeError(f"预览生成失败（退出码 {proc.returncode}）" + (f"：{tail}" if tail else ""))
-    if not produced or not os.path.exists(produced):
-        raise RuntimeError("引擎报告成功，但未找到预览文件。")
-    return produced
-
-
 # ---------------------------------------------------------------------------
 # Shared preparation helpers (used by both phase workers)
 # ---------------------------------------------------------------------------
@@ -503,34 +416,98 @@ def _clone_done(entry) -> bool:
     return bool(entry) and entry.get("type") == "clone" and bool(entry.get("ref_audio"))
 
 
-class _ChildReg:
-    """Thread-safe registry of live TTS child processes, so a cancel can kill them all.
+def auto_candidate_count(lines: int) -> int:
+    """Candidate count in AUTO mode — absolute log-scale bands, no project ratio.
 
-    Phase 2 runs N design-renders in parallel (each its own model-loading subprocess);
-    on cancel the coordinator calls :meth:`kill_all` so in-flight children (each holding a
-    loaded model in GPU memory) are torn down immediately instead of running to completion.
+    Budgeting relative to the script's largest line count fails on real books: the
+    旁白 routinely carries 10×+ the leads' lines and would flatten every lead to the
+    two-candidate floor. Each character is budgeted by its OWN line count on a log
+    scale (≈ +3 candidates per order of magnitude, saturating at 8):
+
+    - ``lines < 20`` (cameo / 龙套) → 1 (auto-used; the UI disables manual selection)
+    - 20+ → at least 2, then ``int(-2.1 + 3·log10(lines))`` clamped at 8:
+      ~100 lines → 3, ~200 → 4, ~500 → 5, ~1000 → 6, ~2000 → 7, ~2300+ → 8
+    - always clamped to 1..8
     """
+    if lines < 20:
+        return 1
+    return max(2, min(8, int(-2.1 + 3.0 * math.log10(lines) + 1e-9)))
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._procs: set = set()
 
-    def add(self, proc) -> None:
-        with self._lock:
-            self._procs.add(proc)
+def _canonical_of(sp, voice_config) -> str:
+    """Follow an entry's ``alias_of`` chain to the canonical character name.
 
-    def remove(self, proc) -> None:
-        with self._lock:
-            self._procs.discard(proc)
+    Mirrors the worker's ``_resolve_alias`` (8-hop cycle guard) so the auto-mode line
+    counts agree with the voice actually used at synthesis time.
+    """
+    name = sp
+    seen = set()
+    for _ in range(8):
+        if name in seen:
+            break
+        seen.add(name)
+        entry = voice_config.get(name) or {}
+        alias = entry.get("alias_of") or entry.get("alias")
+        if not isinstance(alias, str) or not alias.strip() or alias == name:
+            break
+        name = alias
+    return name
 
-    def kill_all(self) -> None:
-        with self._lock:
-            procs = list(self._procs)
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:  # noqa: BLE001
-                pass
+
+def _effective_line_counts(order, samples, voice_config) -> dict:
+    """Per-character line counts with alias labels folded into their canonical character.
+
+    Alias lines are spoken by the canonical's voice, so they count toward its candidate
+    budget; each label's lines land directly on its final canonical (no double counting
+    through intermediate hops). Labels whose canonical is outside the loaded scope are
+    dropped (that voice is not rendered in this run).
+    """
+    counts = {sp: len(samples.get(sp, [])) for sp in order}
+    for sp in order:
+        canon = _canonical_of(sp, voice_config)
+        if canon != sp and canon in counts:
+            counts[canon] += counts[sp]
+    return counts
+
+
+def _seed_of(value, default: int = -1) -> int:
+    """Best-effort int coercion for a stored seed (display/record only)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def effective_candidates(entry) -> list:
+    """The character's usable clone candidates as ``[{id, ref_audio, seed}, ...]``.
+
+    New-format entries keep their ``candidates`` list (items lacking an ``id`` /
+    ``ref_audio`` are skipped); legacy entries (no ``candidates`` key) that already hold
+    a usable clone are synthesised as a single candidate so the UI stays coherent;
+    anything else yields ``[]``. Shared by the /voices listing and the select endpoint
+    so the two views can never disagree.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    raw = entry.get("candidates")
+    if isinstance(raw, list) and raw:
+        out = []
+        for c in raw:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or "").strip()
+            ref = c.get("ref_audio")
+            if not cid or not isinstance(ref, str) or not ref.strip():
+                continue
+            out.append({"id": cid, "ref_audio": ref.strip(), "seed": _seed_of(c.get("seed"))})
+        return out
+    if _clone_done(entry):
+        return [{"id": "1", "ref_audio": entry["ref_audio"], "seed": _seed_of(entry.get("seed"))}]
+    return []
+
+
+def _clone_have(entry) -> int:
+    """How many usable clone candidates an entry already holds (the new_only gate)."""
+    return len(effective_candidates(entry))
 
 
 # ---------------------------------------------------------------------------
@@ -687,26 +664,42 @@ def prepare_foundations(handle, speakers=None, new_only=False, overrides=None, s
     }
 
 
-def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_name=None) -> dict:
-    """Phase 2 (TTS only): render each foundation-bearing character's clone seed WAV.
+def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_name=None,
+                candidate_count: int | None = None) -> dict:
+    """Phase 2 (TTS only): render each foundation-bearing character's clone candidates.
 
     First arg is the :class:`TaskHandle`. Reads back the foundations persisted by Phase 1
     and, for every in-scope non-alias character that has a foundation, renders its clone
-    seed WAV via the worker's ``design`` mode and stores it as the clone reference
-    (``type: clone, ref_audio``). On a render failure it falls back to a ``design`` voice.
+    *candidate* seed WAVs — all candidates in ONE long-lived ``.venv-tts`` subprocess
+    (the worker's ``design-batch`` mode: the VoiceDesign model loads once, the candidates
+    run as native tensor sub-batches, each candidate seeded by its sub-batch) — stored as
+    the entry's ``candidates`` list. The entry's top-level ``ref_audio`` always mirrors
+    the active candidate (the first one until the user picks another via the select
+    endpoint), so downstream synthesis is unaffected. A partial failure still yields a
+    usable clone; a total failure falls back to a ``design`` voice and keeps the
+    last-known ``ref_audio``.
 
-    ``concurrency`` is the number of TTS subprocesses to run in parallel (each loads the
-    model once — GPU memory scales with it); ``new_only`` limits the run to characters
-    not yet holding a usable clone; ``speakers`` restricts to an allowlist (single-character
-    remake). On cancel every in-flight TTS child is killed so GPU memory frees at once.
-    **No LLM is used.**
+    ``candidate_count`` is the fixed per-character candidate count (None = auto: the
+    :func:`auto_candidate_count` ladder — absolute log-scale bands on each character's
+    own line count, so the 旁白's 10×+ line count can't demote the leads); ``concurrency`` is the *per-batch ceiling* — the most
+    candidates that may share one tensor batch (omitted → ``config.tts.batch_concurrency``;
+    clamped to [1, 64]; the worker sets the actual size at runtime from the length bands
+    and a measured VRAM governor); ``new_only`` limits the run to characters whose
+    candidate count falls short of this run's target; ``speakers`` restricts to an
+    allowlist (single-character remake). A hung / OOM-killed child (worker watchdog,
+    exit 124) is not fatal: the run shrinks the ceiling (halving, floor 1) and restarts
+    a fresh subprocess that adopts the candidates already rendered on disk (seed -1);
+    at ceiling 1 a repeat timeout strikes the in-flight candidate, two strikes isolate
+    it as a recorded failure. On cancel the worker's process tree is killed so GPU
+    memory frees at once. **No LLM is used.**
     """
     script = _load_script(handle, script_name)
     samples, order = _collect_samples(script)
     handle.log(f"检测到 {len(order)} 个角色：{'、'.join(order)}")
 
     vc_path, voice_config = _load_voice_config(handle)
-    ws = get_layout().workspace
+    layout = get_layout()
+    ws = layout.workspace
 
     # Characters eligible for a clone: in-scope, non-alias, already carrying a foundation.
     def _is_alias(sp):
@@ -716,8 +709,19 @@ def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_
     no_foundation = [s for s in order if not _has_foundation(voice_config.get(s)) and not _is_alias(s)]
     if no_foundation:
         handle.log(f"提示：{len(no_foundation)} 个角色尚无语音推理基础，本次跳过——请先运行阶段 1。", "WARNING")
+    # Per-character candidate target: the fixed count, or the AUTO ladder — absolute
+    # log-scale bands on each character's own line count (alias lines folded into the
+    # canonical voice). No project-wide denominator: a 20k-line 旁白 must not demote a
+    # 2k-line lead (the old lines/max-lines ratio did exactly that). The new_only /
+    # speakers filters below can't shift the budget, so a single-character remake lands
+    # on the same budget as a full run.
+    eff = _effective_line_counts(order, samples, voice_config)
+
+    def _target(sp):
+        return candidate_count if candidate_count else auto_candidate_count(eff.get(sp, 0))
+
     if new_only:
-        selected = [s for s in selected if not _clone_done(voice_config.get(s))]
+        selected = [s for s in selected if _clone_have(voice_config.get(s)) < _target(s)]
     if speakers:
         allow = {s for s in speakers if s}
         selected = [s for s in selected if s in allow]
@@ -729,96 +733,303 @@ def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_
                 "results": []}
 
     n = len(selected)
-    workers = max(1, int(concurrency or 1))
-    handle.log(f"本次为 {n} 个角色制作克隆音频（TTS 并发 {workers}，请确保已关闭 LLM 以释放显存）。")
+    total = sum(_target(sp) for sp in selected)
 
-    results = []
-    ok = failed = done = 0
-    reg = _ChildReg()
+    cfg = get_config()
+    t = cfg.tts
+    # 批内行数上限（仅上限）: the request's value, else the persisted default
+    # (config.tts.batch_concurrency); clamped to [1, 64] so a stray value can't spawn a
+    # degenerate / unbounded cap (the worker sets the actual per-batch size at runtime).
+    rows_cap = clamp_concurrency(concurrency if concurrency else t.batch_concurrency)
+    mode = "自动" if not candidate_count else f"固定 {candidate_count}"
+    handle.log(f"本次为 {n} 个角色制作 {total} 段候选克隆音频（批内行数上限 {rows_cap}，备选数{mode}；"
+               f"请确保已关闭 LLM 以释放显存）。")
+    handle.log(f"备选计划：{'、'.join(f'{sp}={_target(sp)}' for sp in selected)}（{mode}）")
 
-    def render_one(sp):
-        # Pure: render the clone seed and return the result. The coordinator applies it to
-        # the shared ``voice_config`` and persists; workers only *read* it (description/ref_text).
-        handle.log(f"[{sp}] 开始制作克隆音频（VoiceDesign / TTS 渲染）…")
+    # One namespace per character (keeps two characters' _sanitize names from colliding)
+    # and one random seed base per run — candidate k sits in the sub-batch seeded
+    # base + 子批序号 (rows of one sub-batch share the seed), so candidates differ from
+    # each other and repeat runs differ from each other. The namespace is stable across
+    # this run's watchdog restarts, which is what makes breakpoint adoption possible.
+    ns_map = {sp: time.time_ns() for sp in selected}
+    base_seed = secrets.randbelow(2 ** 31)
+
+    # One job per (character, candidate k): the character's short ref text + its voice
+    # description, rendered to a per-candidate WAV. description / ref_text are read once
+    # per character (the two phases are mutually exclusive, so the entry can't change
+    # mid-run).
+    jobs = []
+    for sp in selected:
         entry = voice_config.get(sp, {})
         description = (entry.get("description") or "").strip()
         ref_text = (entry.get("ref_text") or "").strip()
         if not ref_text:
             ref_text = pick_ref_text([t for _i, t in samples.get(sp, [])]) \
                 or f"{sp} speaks in a clear, natural voice."
-        out_wav = str(get_layout().voice_profiles / "designed_voices" /
-                      f"{_sanitize(sp)}_{time.time_ns()}.wav")
-        try:
-            produced = _design_preview(handle, description, ref_text, out_wav, reg=reg)
-            return {"speaker": sp, "ok": True, "type": "clone", "preview": produced,
-                    "description": description, "ref_text": ref_text, "clone_status": "done"}
-        except Exception as e:  # noqa: BLE001 — this character falls back; the run continues
-            return {"speaker": sp, "ok": False, "type": "design", "preview": "", "reason": str(e),
-                    "description": description, "ref_text": ref_text, "clone_status": "failed"}
+        for k in range(1, _target(sp) + 1):
+            jobs.append({"sp": sp, "k": k, "description": description, "ref_text": ref_text,
+                         "out": str(layout.voice_profiles / "designed_voices" /
+                                    f"{_sanitize(sp)}_{ns_map[sp]}_c{k}.wav")})
+
+    results = []
+    ok = failed = 0
+    job_results: dict = {}   # (sp, k) -> result (this run)
+    pending: dict = {sp: {} for sp in selected}  # sp -> {k: result}; a character settles when full
+    settled: set = set()
 
     def persist():
-        # Single-threaded incremental persist: each finished character is written back the
-        # moment it completes, so the 角色配音 list (status / preview) refreshes in real time.
+        # Single-writer persist: the whole file is written the moment a character's full
+        # candidate set settles, so the 角色配音 list (status / preview / candidates)
+        # refreshes in real time.
         vc_path.parent.mkdir(parents=True, exist_ok=True)
         vc_path.write_bytes(json.dumps(voice_config, indent=2, ensure_ascii=False).encode("utf-8"))
 
-    ex = ThreadPoolExecutor(max_workers=workers)
-    futs = {ex.submit(render_one, sp): sp for sp in selected}
-    cancelled = False
-    try:
-        handle.progress(0.02, "启动 TTS（并行）")
-        for fut in as_completed(futs):
-            sp = futs[fut]
-            try:
-                r = fut.result()
-            except Exception as e:  # noqa: BLE001
-                handle.log(f"  {sp} 制作克隆失败：{e}", "ERROR")
-                r = {"speaker": sp, "ok": False, "type": "design", "preview": "", "reason": str(e),
-                     "description": "", "ref_text": "", "clone_status": "failed"}
-            # Apply the pure worker's result on the single coordinator thread, then persist.
-            entry = voice_config.get(sp, {})
-            if r["ok"]:
-                entry.update({
-                    "type": "clone",
-                    # workspace-relative (the worker resolves it against --workspace) so the
-                    # config survives the workspace folder moving; an out-of-workspace file
-                    # would keep its absolute path
-                    "ref_audio": pathio.to_workspace_relative(r["preview"], ws) or r["preview"],
-                    "ref_text": r["ref_text"],
-                    "description": r["description"],
-                    "character_style": r["description"],
-                    "clone_status": "done",
-                    "seed": entry.get("seed", -1),
-                })
-            else:
-                entry.update({"type": "design", "description": r["description"],
-                              "ref_text": r["ref_text"], "clone_status": "failed"})
+    def _settle(sp):
+        # All of this character's candidates have settled: apply them as ONE unit on the
+        # single task thread (characters still in flight keep their pre-run entry).
+        nonlocal ok, failed
+        num = f"[{len(settled) + 1}/{n}]"
+        entry = voice_config.get(sp, {})
+        good = sorted((r for r in pending[sp].values() if r["ok"]), key=lambda r: r["k"])
+        if good:
+            cands = [{"id": str(i),
+                      "ref_audio": pathio.to_workspace_relative(r["preview"], ws) or r["preview"],
+                      "seed": r["seed"]}
+                     for i, r in enumerate(good, 1)]
+            # The top-level ref_audio mirrors the ACTIVE candidate (the first one until
+            # the user picks another): workspace-relative (the worker resolves it against
+            # the job's absolute out path) so the config survives the workspace folder
+            # moving; an out-of-workspace file would keep its absolute path.
+            entry.update({
+                "type": "clone",
+                "ref_audio": cands[0]["ref_audio"],
+                "candidates": cands,
+                # A re-render replaces the whole set, so any earlier pick is void.
+                "selected_audio_id": None,
+                "ref_text": good[0]["ref_text"],
+                "description": good[0]["description"],
+                "character_style": good[0]["description"],
+                "clone_status": "done",
+                "seed": entry.get("seed", -1),
+            })
             voice_config[sp] = entry
             persist()
-            item = {"speaker": r["speaker"], "ok": r["ok"], "type": r["type"], "preview": r["preview"]}
-            if r.get("reason"):
-                item["reason"] = r["reason"]
-            results.append(item)
-            done += 1
-            if r["ok"]:
-                ok += 1
-                handle.log(f"  ✓ [{done}/{n}] {sp} 克隆音频就绪。")
-            else:
-                failed += 1
-                handle.log(f"  ✗ [{done}/{n}] {sp} 克隆生成失败（{r.get('reason', '')}），改用 design 兜底。", "ERROR")
-            handle.progress(0.02 + 0.98 * (done / (n or 1)), f"[{done}/{n}] 克隆音频：{sp}")
-            handle.check()  # cooperative cancel between completions -> kill_all in finally
-    except BaseException:
-        cancelled = True
-        raise
-    finally:
-        if cancelled:
-            reg.kill_all()  # tear down in-flight TTS children (frees GPU memory at once)
-            ex.shutdown(wait=False, cancel_futures=True)
+            results.append({"speaker": sp, "ok": True, "type": "clone",
+                            "preview": good[0]["preview"], "candidates": len(good)})
+            ok += 1
+            handle.log(f"  ✓ {num} {sp} 候选克隆音频就绪（{len(good)}/{_target(sp)}）。")
         else:
-            ex.shutdown(wait=True)
+            # Total failure: fall back to a design voice, clear the (absent)
+            # candidates, and keep the last-known ref_audio so the old take stays
+            # audible in the preview column.
+            entry.update({"type": "design", "candidates": [], "selected_audio_id": None,
+                          "clone_status": "failed"})
+            voice_config[sp] = entry
+            persist()
+            first_reason = next((r["reason"] for r in pending[sp].values() if not r["ok"]), "")
+            results.append({"speaker": sp, "ok": False, "type": "design", "preview": "",
+                            "candidates": 0, "reason": first_reason})
+            failed += 1
+            handle.log(f"  ✗ {num} {sp} 候选全部生成失败（{first_reason}），改用 design 兜底。", "ERROR")
+        settled.add(sp)
 
-    # Final persist also covers the early-cancel / no-completion case.
+    # Breakpoint adoption: a candidate WAV already on disk (rendered by an earlier
+    # attempt of THIS run, before a watchdog restart) counts as done — its seed is
+    # recorded as -1 (the sub-batch seed is unrecoverable) — instead of re-rendering.
+    for job in jobs:
+        p = job["out"]
+        if os.path.exists(p) and os.path.getsize(p) >= 1024:
+            r = {"sp": job["sp"], "k": job["k"], "ok": True, "type": "clone",
+                 "preview": p, "seed": -1, "description": job["description"],
+                 "ref_text": job["ref_text"], "clone_status": "done"}
+            job_results[(job["sp"], job["k"])] = r
+            pending[job["sp"]][job["k"]] = r
+    if job_results:
+        handle.log(f"断点采纳：{len(job_results)} 个候选已在盘上（本次运行先前产物，不重渲染）")
+    # Characters whose whole set is already adopted settle now (before the engine runs).
+    for sp in selected:
+        if sp not in settled and len(pending[sp]) >= _target(sp):
+            _settle(sp)
+
+    to_render = [j for j in jobs if (j["sp"], j["k"]) not in job_results]
+    if not to_render:
+        # Everything was adopted (a complete prior attempt): settle and stop without
+        # spawning the engine (no wasted model load).
+        persist()
+        handle.log(f"克隆音频制作完成：成功 {ok} / 失败 {failed} / 共 {n} 个角色（全部断点采纳，未启动引擎）。")
+        handle.progress(1.0, "完成")
+        return {
+            "count": n,
+            "ok": ok,
+            "failed": failed,
+            "speakers": order,
+            "voice_config_path": str(vc_path),
+            "output_dir": str(get_layout().voice_profiles / "designed_voices"),
+            "results": results,
+        }
+
+    # One subprocess per attempt: a fresh ``design-batch`` run (the model loads once per
+    # attempt) whose candidates settle through [design] lines; a watchdog restart adopts
+    # whatever already landed on disk.
+    job_file = layout.temp / f"design_jobs_{uuid.uuid4().hex[:12]}.json"
+    out_dir = layout.voice_profiles / "designed_voices"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    python, worker = resolve_engine()
+    handle.log(f"引擎：.venv-tts（一次性子进程，模型只加载一次）· 批内上限 {rows_cap} 行")
+    # A persistent per-run transcript: the task log is SSE-only and vanishes with the
+    # session, so every line the engine emits is also mirrored to this file (one per run,
+    # appended per restart attempt) — a run that dies mid-batch leaves its exact
+    # batch / watchdog / error trail on disk for diagnosis.
+    run_log = layout.logs / f"tts_clone_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    handle.log(f"运行日志（排障用，含每次重启的完整引擎输出）：{run_log}")
+
+    by_pos: dict = {}         # this attempt's row position -> job (rebuilt every attempt)
+    in_flight: set = set()    # row indices the current child was generating ([watchdog] line)
+    excluded: set = set()     # (sp, k) isolated after two strikes
+    struck: dict = {}
+
+    def _handle_design(line: str) -> None:
+        # ``[design] <index> ok <seed> <path>`` / ``[design] <index> error <reason>`` —
+        # index is the row's position in this attempt's jobs file.
+        parts = line[len("[design]"):].split(None, 3)
+        if len(parts) < 3:
+            handle.log(line, "WARNING")
+            return
+        try:
+            index = int(parts[0])
+        except ValueError:
+            handle.log(line, "WARNING")
+            return
+        job = by_pos.get(index)
+        if job is None:
+            handle.log(line, "WARNING")
+            return
+        sp, k = job["sp"], job["k"]
+        if parts[1] == "ok":
+            if len(parts) < 4:
+                handle.log(line, "WARNING")
+                return
+            seed = _seed_of(parts[2])
+            r = {"sp": sp, "k": k, "ok": True, "type": "clone", "preview": parts[3],
+                 "seed": seed, "description": job["description"], "ref_text": job["ref_text"],
+                 "clone_status": "done"}
+            handle.log(f"  [{sp}] 候选 {k} 就绪（seed {seed}）")
+        else:
+            r = {"sp": sp, "k": k, "ok": False, "type": "design", "preview": "",
+                 "reason": parts[2], "seed": -1, "description": job["description"],
+                 "ref_text": job["ref_text"], "clone_status": "failed"}
+            handle.log(f"  [{sp}] 候选 {k} 渲染失败（{parts[2]}）", "ERROR")
+        job_results[(sp, k)] = r
+        pending[sp][k] = r
+        if sp not in settled and len(pending[sp]) >= _target(sp):
+            _settle(sp)
+
+    def on_line(line: str) -> None:
+        if line.startswith("[design]"):
+            _handle_design(line)
+        elif line.startswith("[watchdog]"):
+            # The child names the sub-batch that hung before it exits 124: remember the
+            # in-flight row indices so a strike at ceiling 1 targets the right candidate(s).
+            in_flight.update(_parse_watchdog_indices(line))
+            handle.log(line, "WARNING")
+        else:
+            handle.log(line)
+
+    # -- the watchdog / restart loop ----------------------------------------------
+    # A hung or OOM-killed child (exit 124) is not a fatal task failure: shrink the
+    # per-batch ceiling and restart a fresh subprocess (adoption skips the already-rendered,
+    # a re-run covers the not-yet-settled), down to ceiling 1, where a repeat timeout
+    # strikes the in-flight candidate; two strikes isolate it as a recorded failure (the
+    # run continues without it). Candidates of an already-settled character are never
+    # re-run (its entry is final) — that keeps re-renders from orphaning the file on disk.
+    MAX_ATTEMPTS = 8
+    attempt = 0
+    while True:
+        if attempt > MAX_ATTEMPTS:
+            raise RuntimeError(
+                f"角色克隆引擎反复超时（{MAX_ATTEMPTS} 次缩批重试后仍未完成）——已完成进度已保住，"
+                f"请调小「批内行数」后重试。"
+            )
+        remaining = [j for j in to_render
+                     if (j["sp"], j["k"]) not in excluded
+                     and j["sp"] not in settled
+                     and not (job_results.get((j["sp"], j["k"])) or {}).get("ok")]
+        if not remaining:
+            break
+        by_pos = {i: j for i, j in enumerate(remaining)}
+        # The jobs file rows carry their in-file position as ``index`` (the protocol lines
+        # and the watchdog's indices= both key on it).
+        rows = [{"index": i, "sp": j["sp"], "k": j["k"], "text": j["ref_text"],
+                 "description": j["description"], "out": j["out"]}
+                for i, j in enumerate(remaining)]
+        job_file.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        # offset = candidates settled (ok or isolated) before this attempt — the worker's
+        # progress floor, so a restart reports the settled level, never dips back to zero.
+        offset = total - len(remaining)
+        cmd = [
+            str(python), str(worker),
+            "--mode", "design-batch",
+            "--segments-file", str(job_file),
+            "--out-dir", str(out_dir),
+            "--concurrency", str(rows_cap),
+            "--seed", str(base_seed),
+            "--done-offset", str(offset),
+            "--total", str(total),
+            "--language", t.language or "chinese",
+            "--device", t.device or "auto",
+        ]
+        if t.design_model:
+            cmd += ["--design-model", t.design_model]
+        if cfg.ffmpeg.ffmpeg_path:
+            cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
+
+        in_flight.clear()  # a fresh child starts with an empty in-flight set
+        try:
+            run_worker(cmd, handle, on_line, temp_files=(job_file,),
+                       fail_prefix="角色克隆引擎", watchdog_code=124, log_file=run_log)
+            break  # a clean exit (0)
+        except WorkerWatchdogTimeout:
+            attempt += 1
+            if rows_cap > 1:
+                rows_cap = max(1, rows_cap // 2)
+                handle.log(f"看门狗触发（批内行超时）→ 批内上限缩到 {rows_cap} 行，重启引擎", "WARNING")
+                continue
+            # rows_cap == 1: strike the in-flight candidates; two strikes isolate a poison
+            # candidate (its character settles without it).
+            newly = []
+            for i in list(in_flight):
+                job = by_pos.get(i)
+                if job is None:
+                    continue
+                sk = (job["sp"], job["k"])
+                struck[sk] = struck.get(sk, 0) + 1
+                if struck[sk] >= 2:
+                    excluded.add(sk)
+                    r = {"sp": job["sp"], "k": job["k"], "ok": False, "type": "design",
+                         "preview": "", "reason": "超时（已隔离）", "seed": -1,
+                         "description": job["description"], "ref_text": job["ref_text"],
+                         "clone_status": "failed"}
+                    job_results[sk] = r
+                    pending[job["sp"]][job["k"]] = r
+                    newly.append(sk)
+            if newly:
+                names = "、".join(f"{sp} 候选 {k}" for sp, k in sorted(newly))
+                handle.log(f"{names} 连续两次超时 → 隔离为失败，其余候选继续", "WARNING")
+                for sp, _k in newly:
+                    if sp not in settled and len(pending[sp]) >= _target(sp):
+                        _settle(sp)
+            else:
+                handle.log("看门狗触发（单候选超时，首次记罚）→ 重启引擎重试", "WARNING")
+            continue
+
+    # Safety net: settle any character whose set never completed (e.g. the engine exited
+    # before reporting every row) — the same per-character accounting as the [design] path.
+    for sp in selected:
+        if sp not in settled and pending[sp]:
+            _settle(sp)
+
+    # Belt-and-braces re-write after the normal loop (each settlement already persisted).
     persist()
     handle.log(f"voice_config 已保存：{vc_path}")
 

@@ -78,3 +78,10 @@ Before outputting JSON, verify:
 - No source narration or dialogue was omitted or rewritten.
 - Character names are unchanged.
 - Output is valid JSON and contains only the JSON array.
+---SEPARATOR---
+{context}
+
+Remember: if another character in the scene would hear the words, it is CHARACTER dialogue. Everything else is NARRATOR. Preserve the author's original wording, person, and tense exactly.
+
+SOURCE TEXT:
+{chunk}
