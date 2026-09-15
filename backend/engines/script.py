@@ -15,19 +15,22 @@ per-chunk progress and logs over SSE and honours cooperative cancel between chun
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
 
 from pathlib import Path
 
-from ..core.config import GenerationConfig, LLMConfig, PromptsConfig
+from ..core.config import GenerationConfig, LLMConfig, PromptsConfig, SpeakerCheckConfig
 from ..core.concurrency import gate
 from ..core.paths import get_layout
 from ..core.tasks import TaskCancelled
 from .book import decode_buffer
 from .script_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from .text import is_chapter_title
 
 IMPLEMENTED = True
 
@@ -222,12 +225,39 @@ def fix_mojibake(text):
 
     return text
 
+def _evict_trailing_title(chunk: str) -> tuple:
+    """若章标题行落在 chunk 尾部 100 字内 → 切到标题行之前，标题移交下一 chunk 开头。
+
+    标题留在 chunk 尾部有两害：本 chunk 的模型看到标题却看不到它统领的章节正文
+    （判定漂移）；输出 JSON 被截断时，尾部条目恰是最先丢失的（标题随 chunk 一起消失）。
+    移到下一 chunk 开头则与章节正文同段——上下文完整，也远离截断风险。
+
+    返回 (去掉标题的 chunk, 标题行)；尾部无标题、或切掉标题会让 chunk 变空
+    （chunk 本身就是一个标题）时返回 (chunk, "")。
+    """
+    if not chunk or "\n" not in chunk:
+        return chunk, ""
+    head, last_line = chunk.rsplit("\n", 1)
+    if not is_chapter_title(last_line) or len(chunk) - len(last_line) > 100:
+        return chunk, ""
+    body = head.rstrip()
+    if not body:
+        return chunk, ""
+    return body, last_line
+
+
 def split_into_chunks(text, max_size=3000):
-    """Split text into chunks at paragraph/sentence boundaries."""
+    """Split text into chunks at paragraph/sentence boundaries.
+
+    章标题防丢：若标题行落在即将关闭的 chunk 尾部 100 字内，边界移到标题行之前——
+    标题被放到下一 chunk 的开头（与它所统领的章节正文同段），防止标题孤悬在失败 /
+    截断 chunk 的尾部而丢失。
+    """
     paragraphs = re.split(r'\n\s*\n', text)
 
     chunks = []
     current_chunk = ""
+    carry = ""  # 上一 chunk 尾部切出的标题行，将放到本 chunk 开头
 
     for para in paragraphs:
         para = para.strip()
@@ -236,25 +266,47 @@ def split_into_chunks(text, max_size=3000):
 
         if len(current_chunk) + len(para) + 2 > max_size:
             if current_chunk:
-                chunks.append(current_chunk.strip())
+                body, title = _evict_trailing_title(current_chunk.strip())
+                if body:
+                    chunks.append(body)
+                carry = title
                 current_chunk = ""
 
             if len(para) > max_size:
+                if carry:
+                    current_chunk = carry
+                    carry = ""
                 sentences = re.split(r'(?<=[.!?])\s+', para)
                 for sentence in sentences:
                     if len(current_chunk) + len(sentence) + 1 > max_size:
                         if current_chunk:
-                            chunks.append(current_chunk.strip())
+                            body, title = _evict_trailing_title(current_chunk.strip())
+                            if body:
+                                chunks.append(body)
+                            carry = title
                         current_chunk = sentence
+                        if carry:
+                            current_chunk = carry + " " + current_chunk
+                            carry = ""
                     else:
                         current_chunk += " " + sentence if current_chunk else sentence
             else:
-                current_chunk = para
+                current_chunk = (carry + "\n\n" + para) if carry else para
+                carry = ""
         else:
+            if not current_chunk and carry:
+                current_chunk = carry
+                carry = ""
             current_chunk += "\n\n" + para if current_chunk else para
 
     if current_chunk:
-        chunks.append(current_chunk.strip())
+        body, title = _evict_trailing_title(current_chunk.strip())
+        if body:
+            chunks.append(body)
+        if title:
+            chunks.append(title)  # 书末标题：无下一 chunk 可去，独立成尾 chunk
+    if carry:
+        chunks.append(carry)  # 标题被切出但已无后续文本——独立成 chunk，绝不丢
 
     return chunks
 
@@ -476,6 +528,86 @@ def _llm_chat_completion_stream(base_url, api_key, model, messages,
 
 
 # ---------------------------------------------------------------------------
+# 逐 chunk 忠实性校验 + 恢复（LLM 输出事后验证）
+# ---------------------------------------------------------------------------
+
+# 引语段抽取：六组常用引号对（弯双 / 弯单 / 六角 / 双六角 / 直双 / 直单）。
+# 手写引号字符不可靠，一律 \uXXXX 转义（同 mix_check 的既有教训）。
+_FIDELITY_QUOTE_PATTERNS = (
+    re.compile("\\u201c([^\\u201c\\u201d]+)\\u201d"),   # “…” 弯双引号
+    re.compile("\\u2018([^\\u2018\\u2019]+)\\u2019"),   # ‘…’ 弯单引号
+    re.compile("\\u300c([^\\u300c\\u300d]+)\\u300d"),   # 「…」 六角引号
+    re.compile("\\u300e([^\\u300e\\u300f]+)\\u300f"),   # 『…』 双六角引号
+    re.compile('"([^"]+)"'),                             # "…" 直双引号
+    re.compile("'([^']+)'"),                              # '…' 直单引号
+)
+
+
+def _skeleton(text: str) -> str:
+    """词字符骨架：只留字母/数字/CJK（``str.isalnum`` 对汉字为真），去掉空白/标点/引号。
+
+    忠实性校验比较的是骨架：对模型常见的引号增删、语气标签剥离、标点规范化
+    天然免疫（不误报），而丢行、丢段、改写都会改变骨架（必被抓住）。
+    """
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def check_chunk_fidelity(chunk: str, entries) -> list:
+    """逐 chunk 忠实性校验：源 chunk 中所有 ≥4 个词字符的引语段，其骨架必须能在
+    输出条目 text 的拼接骨架中找到。返回缺失的引语段骨架列表（空 = 通过）。
+
+    用引语段而非全文字数作忠实性信号：引号/标签的机械增删不触发误报，而整块
+    截断（JSON 尾部被截）与零星丢行都必然触发。
+    """
+    if not chunk:
+        return []
+    out = _skeleton("".join(
+        e.get("text") for e in entries if isinstance(e.get("text"), str)
+    ))
+    missing = []
+    seen = set()
+    for pat in _FIDELITY_QUOTE_PATTERNS:
+        for m in pat.finditer(chunk):
+            sk = _skeleton(m.group(1))
+            if len(sk) < 4 or sk in seen:
+                continue
+            seen.add(sk)
+            if sk not in out:
+                missing.append(sk)
+    return missing
+
+
+def split_chunk_balanced(chunk: str) -> tuple:
+    """把 chunk 在尽量靠近中点的安全边界（段落边界 > 换行 > 句末标点）切成两半。
+
+    绝不拦腰切断文字；找不到任何边界时返回 ``(chunk, "")``（调用方保留整块）。
+    """
+    mid = len(chunk) // 2
+
+    def cut(cands):
+        # 优先中点±1/4 区间内的边界；没有则取全 chunk 范围内最靠近中点者。
+        for lo, hi in ((len(chunk) // 4, (3 * len(chunk)) // 4), (1, len(chunk) - 1)):
+            for c in sorted(cands, key=lambda c: abs(c - mid)):
+                if not (lo <= c < hi):
+                    continue
+                left, right = chunk[:c].strip(), chunk[c:].strip()
+                if left and right:
+                    return left, right
+        return None
+
+    cands = {
+        "para": [m.end() for m in re.finditer(r"\n\s*\n", chunk)],
+        "nl": [m.end() for m in re.finditer(r"\n", chunk)],
+        "sent": [m.end() for m in re.finditer(r"(?<=[。！？!?…])", chunk)],
+    }
+    for key in ("para", "nl", "sent"):
+        result = cut([c for c in cands[key] if 0 < c < len(chunk)])
+        if result:
+            return result
+    return chunk, ""
+
+
+# ---------------------------------------------------------------------------
 # Per-chunk orchestration + the Task worker.
 # ---------------------------------------------------------------------------
 
@@ -483,7 +615,7 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
                   previous_entries=None, max_retries=2,
                   system_prompt=None, user_prompt_template=None,
                   max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0,
-                  presence_penalty=0.0, banned_tokens=None):
+                  presence_penalty=0.0, banned_tokens=None, recover=True):
     """Process one text chunk via the LLM and return its JSON script entries.
 
     Faithful port of the source ``process_chunk``: build the cross-chunk context
@@ -491,6 +623,16 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
     via ``.format(context=..., chunk=...)`` (the system prompt is used verbatim),
     then call the LLM up to ``max_retries + 1`` times, cleaning / repairing / salvaging
     the JSON each attempt. Progress is logged through the Task ``handle``.
+
+    Fidelity recovery (appended to the port) is a deliberately short two-step ladder:
+    a parseable reply is verified against the source — every quoted passage of the
+    chunk (≥4 word chars, ``check_chunk_fidelity``) must be present in the output
+    texts, so a truncated / drift-damaged reply that JSON repair would have silently
+    accepted is caught. On failure: (1) ONE re-run with ``max_tokens`` temporarily
+    doubled (truncation is the common root cause); (2) if still unfaithful, split the
+    chunk in half at a safe boundary (``split_chunk_balanced``) and re-run both halves
+    once (``recover=False`` — the halves get no further escalation, so the ladder
+    can't run away). What can't be recovered is kept as-is (never silently dropped).
     """
     sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
@@ -525,7 +667,14 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
         {"role": "user", "content": user_prompt},
     ]
 
-    for attempt in range(max_retries + 1):
+    def _attempt(temp: float, mt=None):
+        """一次 LLM 调用 + JSON 清理/修复/抢救 → (entries 或 None, 原始响应文本)。
+
+        ``mt`` = 本次调用的 max_tokens 覆盖值（缺省用配置值）——恢复阶梯第 1 步
+        （翻倍 max_tokens 重跑）用它。调用失败 / 响应不可解析 → ``(None, …)`` 交
+        调用方重试；``TaskCancelled`` 恒上抛（取消不重试）。
+        """
+        mt = mt or max_tokens
         try:
             if llm.stream:
                 # Stream the completion so the 「流式反馈」 panel shows the model's raw
@@ -533,8 +682,8 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
                 # response, so the JSON handling below is unchanged.
                 text, finish_reason, usage = _llm_chat_completion_stream(
                     llm.base_url, llm.api_key, model_name, messages,
-                    temperature=temperature, top_p=top_p,
-                    presence_penalty=presence_penalty, max_tokens=max_tokens,
+                    temperature=temp, top_p=top_p,
+                    presence_penalty=presence_penalty, max_tokens=mt,
                     top_k=top_k, min_p=min_p, banned_tokens=banned_tokens,
                     handle=handle,
                 )
@@ -543,58 +692,938 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
                 # non-streaming call (the stream panel then stays empty).
                 text, finish_reason, usage = _llm_chat_completion(
                     llm.base_url, llm.api_key, model_name, messages,
-                    temperature=temperature, top_p=top_p,
-                    presence_penalty=presence_penalty, max_tokens=max_tokens,
+                    temperature=temp, top_p=top_p,
+                    presence_penalty=presence_penalty, max_tokens=mt,
                     top_k=top_k, min_p=min_p, banned_tokens=banned_tokens,
                 )
             pt = usage.get("prompt_tokens", "?") if usage else "?"
             ct = usage.get("completion_tokens", "?") if usage else "?"
-            handle.log(f"chunk {chunk_num}/{total_chunks} attempt {attempt + 1}: "
-                       f"finish_reason={finish_reason} | tokens prompt={pt} completion={ct}")
+            handle.log(f"chunk {chunk_num}/{total_chunks}: finish_reason={finish_reason} | "
+                       f"tokens prompt={pt} completion={ct}")
             if finish_reason == "length":
                 handle.log(f"WARNING: 响应被截断（达到 max_tokens={max_tokens}），可增大 max_tokens。", "WARNING")
         except TaskCancelled:
             raise  # a cancel raised mid-stream must propagate, not be retried
         except Exception as e:  # noqa: BLE001 — a failed call retries, then gives up
-            handle.log(f"调用 LLM API 出错（attempt {attempt + 1}）：{e}", "ERROR")
-            if attempt < max_retries:
-                continue
-            return []
+            handle.log(f"调用 LLM API 出错：{e}", "ERROR")
+            return None, ""
 
         # Clean and extract JSON from the response.
         json_text = clean_json_string(text)
-
         if not json_text:
-            handle.log(f"chunk {chunk_num} 响应中未找到 JSON 数组（attempt {attempt + 1}）", "WARNING")
-            if attempt < max_retries:
-                handle.log("Retrying...")
-                continue
+            handle.log(f"chunk {chunk_num} 响应中未找到 JSON 数组", "WARNING")
             handle.log(f"Response preview: {text[:300]}...", "WARNING")
-            return []
+            return None, text
 
         # Try to parse, with repair attempts.
         entries = repair_json_array(json_text, log=lambda m: handle.log(m, "WARNING"))
+        if entries:
+            return entries, text
 
-        if entries and len(entries) > 0:
-            if attempt > 0:
-                handle.log(f"  Succeeded on retry {attempt + 1}")
-            return entries
-
-        handle.log(f"chunk {chunk_num} 响应无法解析为 JSON（attempt {attempt + 1}）", "WARNING")
+        handle.log(f"chunk {chunk_num} 响应无法解析为 JSON", "WARNING")
         handle.log(f"JSON preview: {json_text[:300]}...", "WARNING")
-        if attempt < max_retries:
-            handle.log("Retrying (same sampling parameters)...")
 
         # Last resort: extract individual valid entries with regex.
-        salvaged_entries = salvage_json_entries(json_text)
-        if salvaged_entries:
-            handle.log(f"正则抢救出 {len(salvaged_entries)} 条 entries（来自畸形响应）")
-            return salvaged_entries
+        salvaged = salvage_json_entries(json_text)
+        if salvaged:
+            handle.log(f"正则抢救出 {len(salvaged)} 条 entries（来自畸形响应）")
+            return salvaged, text
+        return None, text
 
-    return []
+    entries = None
+    for attempt in range(max_retries + 1):
+        handle.check()  # cooperative cancel / pause point between attempts
+        entries, _raw = _attempt(temperature)
+        if entries:
+            if attempt > 0:
+                handle.log(f"  Succeeded on retry {attempt + 1}")
+            break
+        if attempt < max_retries:
+            handle.log("Retrying...")
+
+    if not entries:
+        return []
+
+    # -- Fidelity check + recovery (two-step ladder) ------------------------------
+    # A parseable reply is NOT automatically faithful: a truncated JSON (repair
+    # "salvages" the head and silently drops the tail) or a drifting model (skips a
+    # line) both parse cleanly. Verify the source's quoted passages against the
+    # output, then escalate in exactly two steps: double max_tokens and re-run once;
+    # if that is still unfaithful, split in half and re-run both halves once.
+    if not recover:
+        # 对半切出来的半段：只跑这一次，残余缺失记日志，不再升级（阶梯到头）。
+        missing = check_chunk_fidelity(chunk, entries)
+        if missing:
+            handle.log(f"chunk {chunk_num}（半段）仍缺失 {len(missing)} 处引语段，"
+                       f"保留现有 {len(entries)} 条", "WARNING")
+        return entries
+
+    missing = check_chunk_fidelity(chunk, entries)
+    if not missing:
+        return entries
+
+    # Step 1: output was likely cut off at max_tokens — double the budget, run once.
+    handle.log(
+        f"chunk {chunk_num}/{total_chunks} 忠实性校验缺失 {len(missing)} 处引语段"
+        f"（如 “{missing[0][:10]}…”） → max_tokens 临时翻倍"
+        f"（{max_tokens} → {max_tokens * 2}）再跑一次",
+        "WARNING",
+    )
+    handle.check()
+    bigger, _raw = _attempt(temperature, max_tokens * 2)
+    if bigger:
+        missing2 = check_chunk_fidelity(chunk, bigger)
+        if not missing2:
+            handle.log(f"chunk {chunk_num} 翻倍 max_tokens 后忠实性校验通过")
+            return bigger
+        if len(bigger) > len(entries):
+            # 仍缺失，但内容更全 → 以翻倍结果为准（缺失清单同步更新）
+            entries, missing = bigger, missing2
+
+    # Step 2: still missing — split in half at a safe boundary, re-run both halves once.
+    left, right = split_chunk_balanced(chunk)
+    if left and right and len(left) < len(chunk) and len(right) < len(chunk):
+        handle.log(
+            f"chunk {chunk_num} 翻倍后仍缺失 {len(missing)} 处 → 对半切开"
+            f"（{len(left)} + {len(right)} 字）各再跑一次",
+            "WARNING",
+        )
+        left_entries = process_chunk(
+            handle, llm, model_name, left, chunk_num, total_chunks,
+            previous_entries=previous_entries,
+            max_retries=max_retries,
+            system_prompt=sys_prompt, user_prompt_template=usr_template,
+            max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+            top_k=top_k, min_p=min_p, presence_penalty=presence_penalty,
+            banned_tokens=banned_tokens, recover=False,
+        )
+        right_prev = (list(previous_entries) + left_entries) if previous_entries else left_entries
+        right_entries = process_chunk(
+            handle, llm, model_name, right, chunk_num, total_chunks,
+            previous_entries=right_prev or None,
+            max_retries=max_retries,
+            system_prompt=sys_prompt, user_prompt_template=usr_template,
+            max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+            top_k=top_k, min_p=min_p, presence_penalty=presence_penalty,
+            banned_tokens=banned_tokens, recover=False,
+        )
+        return left_entries + right_entries
+
+    handle.log(f"chunk {chunk_num} 缺失内容无法恢复，保留现有 {len(entries)} 条", "WARNING")
+    return entries
 
 
-def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generation: GenerationConfig) -> dict:
+def merge_adjacent_narrator(entries, title_test, max_len=100):
+    """机械合并相邻 NARRATOR 条目（解析后的确定性后处理，不经 LLM）。
+
+    相邻两条同讲者条目会让 TTS 多插一次同人停顿（``pause_same_speaker_ms``）和一个
+    段边界；把连续旁白合成一条，内容不变（text = 两条 text 直接拼接，instruct 取前条）。
+    只合并 NARRATOR：角色台词可能是被拆开的同一句，合并会拉长单行并改变韵律。
+
+    章标题守卫：标题行的**前后两侧**都不合并——章节边界处的停顿（上章旁白尾 → 标题 →
+    新章旁白头）正是可听的章节分界，合并会把两章粘在一起。合并出的条目不可能构成新
+    标题（两个非标题拼接不会 ≤40 字且整体匹配标题式），故链式合并只需对新并入的条做
+    标题判定。
+
+    合并后长度须 < ``max_len``（缺省 100 字——100 字行的 TTS 超时预算已相当宽裕；
+    紧上限让合并行保持短小：单行失败代价小、节奏更细，也顺带杜绝无界链式合并造出
+    渲染不完的行）。返回 ``(新条目列表, 合并的对数)``；输入列表不被改动。
+    """
+    out = []
+    merged = 0
+    pending = None  # 运行中的合并条目，与后续每条重新比对（链式合并）
+    i, n = 0, len(entries)
+    while i < n:
+        if pending is None:
+            e = dict(entries[i])  # shallow copy — the input stays pristine
+            is_merged = False
+        else:
+            e, pending, is_merged = pending, None, True
+        nxt = entries[i + 1] if i + 1 < n else None
+        # 合并出的条目不可能构成新标题（两个非标题拼接不会 ≤40 字且整体匹配标题式），
+        # 故已合并的 e 免做标题判定；新并入的 nxt 恒判（守卫标题前后两侧）。
+        e_is_title = False if is_merged else title_test(e.get("text") or "")
+        if (
+            nxt is not None
+            and (e.get("speaker") or "") == "NARRATOR"
+            and (nxt.get("speaker") or "") == "NARRATOR"
+            and (nxt.get("text") or "")
+            and not (e_is_title or title_test(nxt.get("text") or ""))
+            and len((e.get("text") or "") + (nxt.get("text") or "")) < max_len
+        ):
+            e["text"] = (e.get("text") or "") + (nxt.get("text") or "")
+            pending = e  # the merged entry is re-examined against the next entry (chain)
+            merged += 1
+            i += 1  # nxt was absorbed into the pending entry
+        else:
+            out.append(e)
+            i += 1
+    if pending is not None:
+        out.append(pending)  # defensive: the loop always consumes a pending entry
+    return out, merged
+
+
+# ---------------------------------------------------------------------------
+# 断句失败校验（解析后的条目级重判）
+#
+# 信号：条目 text 被外层双引号（弯 “ ” 或直 " "——任意形式）整体包裹，且引号跨度内
+# 出现「…道」语气标签（说道 / 问道 / 答道 / 冷笑道 / xx道 等）后紧跟冒号——标签被包进
+# 了台词里，说明断句没把内层台词拆出去。冒号是硬性条件：知道 / 难道 / 道理 / 道路
+# 的「道」后无冒号，绝不触发。这种「标签在引号内」的形态对下游段落混合检查不可见
+# （混合检查视其为单主体 → keep），故必须在解析阶段就地重跑校验。
+# ---------------------------------------------------------------------------
+
+_SAYING_TAG_RE = re.compile("(?:^|[\\u4e00-\\u9fffA-Za-z])道\\s*[:：]")
+# 外层双引号对（弯双 + 直双——「任意形式」的引号对均被接受）。引号字符一律 \uXXXX
+# 转义（同 mix_check / 忠实性校验的既有教训：手写引号字符不可靠）；此处是普通字符串
+# 比较（startswith / rfind）而非正则，故用单反斜杠让 Python 解码出真实引号字符。
+_OUTER_DQUOTE_PAIRS = (("\u201c", "\u201d"), ("\u0022", "\u0022"))
+# 引号内**开头**的「…道：」标签——重判提示词允许模型整段丢弃的纯语气标签（解析提示词
+# 编辑 (e)）；只剥开头这一处：中段「…道：」可能是别的混合形态（交给段落混合检查），
+# 且按位置剥可避免把「知道：」这类真词误当标签剥掉。
+_LEADING_SAYING_TAG_RE = re.compile("[\\u4e00-\\u9fffA-Za-z]+道\\s*[:：]")
+
+
+def is_suspicious_entry_text(text: str) -> bool:
+    """Whether an entry's text looks like a failed sentence split: the text is wrapped
+    in an outer double-quote pair (curly or straight) and the quoted span holds a
+    "…道：" speech tag (说道 / 问道 / xx道 …) — the tag was wrapped into the utterance
+    instead of the inner line being split out into its own entry."""
+    t = (text or "").strip()
+    for open_q, close_q in _OUTER_DQUOTE_PAIRS:
+        if t.startswith(open_q):
+            # Widest span (the LAST matching closing quote): nested same-form quotes
+            # ( “又道：“…”” ) close at the very end, so a mid-span tag is still seen.
+            end = t.rfind(close_q)
+            if end > len(open_q):
+                return bool(_SAYING_TAG_RE.search(t[len(open_q):end]))
+    return False
+
+
+def suspicious_entry_indices(entries: list) -> list[int]:
+    """Absolute indices of the entries whose text is a suspected sentence-split failure."""
+    return [
+        i for i, e in enumerate(entries)
+        if isinstance(e, dict) and is_suspicious_entry_text(e.get("text"))
+    ]
+
+
+def _strip_leading_saying_tag(text: str) -> str:
+    """The entry text with its leading "…道：" tag (inside the outer wrap) removed —
+    the pure speech tag the parse prompt's edit (e) lets the model drop. Text without
+    a leading tag is returned unchanged."""
+    t = (text or "").strip()
+    for open_q, _close in _OUTER_DQUOTE_PAIRS:
+        if t.startswith(open_q):
+            body = t[len(open_q):]
+            m = _LEADING_SAYING_TAG_RE.match(body)
+            if m:
+                return t[: len(open_q)] + body[m.end():]
+    return t
+
+
+def _parse_entries_reply(text: str):
+    """Parse a re-parse reply into entries — the same clean/repair/salvage ladder the
+    chunk parse uses; ``None`` when nothing parseable survives."""
+    if not text:
+        return None
+    json_text = clean_json_string(text)
+    if not json_text:
+        return None
+    entries = repair_json_array(json_text)
+    return entries if entries else salvage_json_entries(json_text)
+
+
+def _reparse_vote(parts, entry: dict, roster: frozenset):
+    """Gate one re-parse reply for a flagged entry and reduce it to its vote value.
+
+    A reply votes only if it is well-formed and faithful to the original entry text:
+    the parts' concatenated word-character skeleton (``_skeleton``) must equal the
+    original's skeleton either WITH the leading "…道：" tag intact (tag kept, e.g. as a
+    NARRATOR part) or WITH the tag dropped (the parse prompt's edit (e) — pure speech
+    tags are omitted). The skeleton is immune to the prompt-permitted formatting edits
+    (quote / colon / seam-punctuation changes) while any added, dropped, or reordered
+    word character is caught. Part speakers must be ``NARRATOR`` or in the file-wide
+    roster (no invented names); a multi-part answer needs ≥2 distinct speakers (the mix
+    check's same-subject gate — same-character parts would be one entry per the parse
+    prompt). Returns the vote value (a hashable ``(speaker, skeleton)`` sequence) or
+    ``None`` (the reply contributes no vote — the entry is never changed on a guess).
+    """
+    if not parts or not all(isinstance(p, dict) for p in parts):
+        return None
+    texts = []
+    speakers = []
+    for p in parts:
+        sp = (p.get("speaker") or "").strip()
+        tx = p.get("text")
+        if not sp or sp not in roster:
+            return None
+        if not isinstance(tx, str) or not _skeleton(tx):
+            return None
+        texts.append(tx)
+        speakers.append(sp)
+    if len(parts) > 1 and len(set(speakers)) < 2:
+        return None
+    joined = _skeleton("".join(texts))
+    orig = entry.get("text") or ""
+    allowed = {_skeleton(orig), _skeleton(_strip_leading_saying_tag(orig))}
+    if joined not in allowed:
+        return None
+    return tuple((p["speaker"].strip(), _skeleton(p["text"])) for p in parts)
+
+
+def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, context,
+                     roster) -> list | None:
+    """Re-run the parse LLM on one flagged entry and resolve the re-derivation by
+    majority vote — the 角色匹配检查 consensus rule: one first call plus two retries
+    (three total), early-stopping the instant a strict majority is decided, and one
+    further (4th) call only when the three still disagree (never guess).
+
+    The entry text goes in the parse prompt's ``{chunk}`` slot and the pre-built
+    context window in ``{context}``, so the model re-derives the entries exactly as the
+    original parse did — same prompts, same transport (``_llm_call`` streams to the UI
+    panel). Each reply is gated by :func:`_reparse_vote`; a failed call, an
+    unparseable reply, or a gate failure contributes no vote. Returns the winning
+    re-derived entries (the raw reply dicts), or ``None`` when no consensus forms —
+    the caller then keeps the entry unchanged.
+    """
+    # Local imports: speaker_check imports this module at top level (cycle).
+    from .speaker_check import _llm_call, _pick_majority
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user",
+         "content": usr_template.format(context=context, chunk=entry.get("text") or "")},
+    ]
+    votes: list = []
+    parts_by_sig: dict = {}
+
+    def one_vote(attempt: int) -> None:
+        handle.check()  # cooperative cancel / pause between validation calls
+        handle.llm_rate(0, 0.0)  # reset the 吞吐 gauge for this call
+        try:
+            reply = _llm_call(llm, generation, messages, handle)
+        except TaskCancelled:
+            raise  # a cancel raised mid-stream must propagate, not be swallowed
+        except Exception as e:  # noqa: BLE001 — a failed call contributes no vote
+            handle.log(f"  断句校验第 {attempt} 次调用失败，本轮无票：{e}", "WARNING")
+            return
+        parts = _parse_entries_reply(reply)
+        if not parts:
+            handle.log(f"  断句校验第 {attempt} 次响应无法解析为条目数组，本轮无票", "WARNING")
+            return
+        sig = _reparse_vote(parts, entry, roster)
+        if sig is None:
+            handle.log(
+                f"  断句校验第 {attempt} 次结果未通过忠实性校验"
+                f"（文字无法拼回原文 / 角色不在花名册），本轮无票",
+                "WARNING",
+            )
+            return
+        votes.append(sig)
+        parts_by_sig.setdefault(sig, parts)
+
+    for attempt in range(1, 4):  # 基础一次 + 重试两次 = 合计 3 次
+        one_vote(attempt)
+        if _pick_majority(votes) is not None:
+            break  # 多数已决（2:0 / 2:1）——剩余调用无法翻盘，省掉
+    if _pick_majority(votes) is None:
+        # 没决出来（1:1:1 或有效票不足）→ 再跑第四次
+        handle.log("  断句校验 3 次无共识 → 再跑第 4 次")
+        handle.check()
+        one_vote(4)
+    winner = _pick_majority(votes)
+    if winner is None:
+        handle.log("  断句校验 4 次仍无共识，条目保持原样", "WARNING")
+        return None
+    return parts_by_sig[winner]
+
+
+def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, entries,
+                             context_window=4) -> tuple:
+    """Post-parse sentence-split validation (runs in ``generate_file`` BEFORE the
+    mechanical NARRATOR merge, so split-off narration parts merge with their
+    neighbours as usual).
+
+    Scans ``entries`` for wrapped utterances carrying a "…道：" tag inside
+    (:func:`suspicious_entry_indices`); each is re-run through the parse LLM with a
+    ±n context window (``build_batch_window``) and resolved by majority vote
+    (:func:`revalidate_entry`). A win replaces the entry with its re-derived entries —
+    a one-entry win is a clean rewrite (the wrap / tag stripped out), a multi-entry win
+    a re-split. Every context window and the roster are built from the PRISTINE entry
+    list up front, and wins are applied in DESCENDING index order, so one split never
+    shifts an index a later window was built from. Cancel propagates; nothing is
+    applied after a cancel (the file is written only after this step returns).
+
+    Returns ``(entries, flagged, fixed)`` — the updated list (the original list object
+    when nothing was applied), the count of flagged entries, the count rewritten.
+    """
+    # Local imports: mix_check / speaker_check both import this module (cycle).
+    from .mix_check import build_roster
+    from .speaker_check import build_batch_window
+
+    flagged = suspicious_entry_indices(entries)
+    if not flagged:
+        # 零命中也留一行日志：静默退出会被用户误读成「这个阶段没跑/不在链路里」
+        handle.log("断句校验：0 条疑似断句失败条目（无重判，零 LLM 调用）")
+        return entries, 0, 0
+
+    n = max(0, int(context_window))
+    roster = frozenset({"NARRATOR", *build_roster(entries)})
+    # All windows + context strings up front — from the pristine list.
+    contexts = {}
+    for i in flagged:
+        window = build_batch_window(entries, i, 1, n)
+        lines = [
+            "(Re-check of one entry: the SOURCE TEXT below is a single entry's stored "
+            "text that likely failed sentence splitting. Re-derive its entries exactly "
+            "as if it were source text.)",
+        ]
+        if roster:
+            lines.append("Characters in this book: " + ", ".join(sorted(roster - {"NARRATOR"})))
+        before = [it for it in window if it["index"] < i]
+        after = [it for it in window if it["index"] > i]
+        if before:
+            lines.append("Entries immediately before it (context only — never re-emit them):")
+            lines.extend(json.dumps(it, ensure_ascii=False) for it in before)
+        if after:
+            lines.append("Entries immediately after it (context only — never re-emit them):")
+            lines.extend(json.dumps(it, ensure_ascii=False) for it in after)
+        contexts[i] = "\n".join(lines)
+
+    handle.log(
+        f"检测到 {len(flagged)} 条疑似断句失败条目（台词引号内含「…道：」标签），"
+        f"逐条带上下文窗口（±{n} 条）重跑校验…"
+    )
+    handle.progress(1.0, f"断句校验 {len(flagged)} 条")
+
+    updated = None
+    fixed = 0
+    # Descending index order: applying a split never shifts the index an EARLIER
+    # entry's (already built) window refers to.
+    for seq, i in enumerate(sorted(flagged, reverse=True), 1):
+        handle.check()
+        handle.progress(1.0, f"断句校验 {seq}/{len(flagged)}")
+        snippet = (entries[i].get("text") or "").replace("\n", " ")
+        handle.log(f"条目 {i + 1}（疑似断句失败）：{snippet[:60]}{'…' if len(snippet) > 60 else ''}")
+        parts = revalidate_entry(handle, llm, generation, sys_prompt, usr_template,
+                                 entries[i], contexts[i], roster)
+        if parts is None:
+            continue  # 无共识 / 校验未过 → 条目保持原样
+        if updated is None:
+            updated = list(entries)  # the input list stays pristine until something applies
+        updated[i:i + 1] = [
+            {
+                "speaker": (p.get("speaker") or "").strip(),
+                "text": p.get("text") or "",
+                "instruct": p.get("instruct") or "",
+            }
+            for p in parts
+        ]
+        fixed += 1
+        if len(parts) > 1:
+            speakers = "、".join(dict.fromkeys(
+                (p.get("speaker") or "").strip() for p in parts))
+            handle.log(f"条目 {i + 1} 校验通过：拆分为 {len(parts)} 条（{speakers}）")
+        else:
+            handle.log(f"条目 {i + 1} 校验通过：重写为单条（剥离包裹引号 / 语气标签）")
+    return (updated if updated is not None else entries), len(flagged), fixed
+
+
+# ---------------------------------------------------------------------------
+# 归属抽样（解析后的条目级 speaker 抽查）
+#
+# 所有 chunk 解析完后，按 ``generation.spot_check_rate``（0 = 关闭）从**全部**条目
+# 抽一小部分重判 speaker（NARRATOR 也在池内——「对白藏在旁白里」是真实错误方向，
+# 检查提示词本就支持双向改判），高置信改判就地生效、随基文件写出。预算分两个
+# **不相交**的桶：~1/3 纯随机（全条目均匀——整书错误率的无偏「仪表」，唯一可据以
+# 判断「采样率能不能降」的读数）+ ~2/3 风险加权（按命中风险特征数 3→2→1→0 级联
+# 抽取，tier 内均匀随机；tier 0 = 未抽中剩余，预算恒用满）。风险特征（代码可判）：
+# ① 无显式归属标签——条目自身及紧邻前一条（仅当其为 NARRATOR）里没有
+#    「2~3 字 CJK 人名 + 说/道/问/喊/答」或「他/她 + 五动词」；「道」前一字符为
+#    知/难 时是 知道/难道 而非标签（形态守卫，不是词表黑名单）；
+# ② 极短条目 len(text.strip()) ≤ 10（「嗯」/「好」式单行应答）；
+# ③ 多角色场景——±10 条窗口内 ≥4 个不同非 NARRATOR 说话人。
+# 重判完全镜像 check_file 的批内协议（首判 → 分歧条目动态多数投票：票 =
+# [原值, 首判] + 至多 3 次同窗口重试，逐条一出严格多数即停，3 次后仍无共识 →
+# 保留原值）；只允许 speaker 变化 + 台词确定性去外层引号。每本的纯随机桶读数
+# 记入任务日志 + ``<workspace>/config/spot_check_history.json``——采样率永不自动
+# 降，由用户在设置页按读数手动决定。
+# ---------------------------------------------------------------------------
+
+_SPOT_HISTORY_LOCK = threading.RLock()
+SPOT_CHECK_HISTORY_NAME = "spot_check_history.json"
+SPOT_CHECK_HISTORY_CAP = 50  # 历史保留最近 N 本（更早的丢弃）
+SPOT_CHECK_SHORT_MAX = 10  # 特征②：极短台词（strip 后 ≤ 该字数）
+SPOT_CHECK_MULTI_MIN = 4  # 特征③：窗口内不同非 NARRATOR 说话人 ≥ 该数
+SPOT_CHECK_MULTI_WINDOW = 10  # 特征③：以条目为中心的 ±N 条窗口
+_SAY_VERBS = "说道问答喊"  # 五归属动词（普通字符串，Python 直接解码）
+_NONSPEAK_BEFORE_DAO = "知难"  # 「道」前一字符属此集 → 知道/难道，不是标签（形态守卫）
+# 「2~3 字 CJK 人名 + 动词」归属标签（人名组贪婪，见 _tag_in 的 知/难 形态守卫）。
+# 正则里的 \uXXXX 一律双反斜杠（既有约定）；五动词用已解码的普通字符串拼入。
+_NAME_TAG_RE = re.compile("(?P<name>[\\u4e00-\\u9fff]{2,3})(?P<verb>[" + _SAY_VERBS + "])")
+# 「他/她 + 动词」归属标签（他/她 是 CJK，按既有约定直接写）。
+_PRONOUN_TAG_RE = re.compile("[他她][" + _SAY_VERBS + "]")
+
+
+def _tag_in(text: str) -> bool:
+    """Whether ``text`` carries an explicit attribution tag: a 2~3-char CJK name
+    + 说/道/问/喊/答, or 他/她 + one of the five verbs.
+
+    知道 / 难道 morphological guard (NOT a word-list blacklist): the name group is
+    greedy, so in 林某知道 the regex swallows 知 into the name (name=林某知,
+    verb=道) — the guard therefore inspects the char immediately BEFORE the 道,
+    i.e. the name group's last char: in {知, 难} the hit is 知道/难道, skip it.
+    """
+    if not text:
+        return False
+    if _PRONOUN_TAG_RE.search(text):
+        return True
+    for m in _NAME_TAG_RE.finditer(text):
+        name, verb = m.group("name"), m.group("verb")
+        if verb == "道" and name[-1] in _NONSPEAK_BEFORE_DAO:
+            continue  # 知道 / 难道 —— not a tag
+        return True
+    return False
+
+
+def _has_attribution_tag(text: str, prev_text: str | None = None) -> bool:
+    """Whether the entry text — or (a NARRATOR) preceding entry it follows — holds
+    an explicit attribution tag (the tag may sit in the line before the dialogue)."""
+    if _tag_in(text or ""):
+        return True
+    return bool(prev_text) and _tag_in(prev_text)
+
+
+def _risk_tier(entry: dict, entries: list, i: int) -> int:
+    """Count (0~3) of the risk features the ``i``-th entry of ``entries`` hits."""
+    tier = 0
+    text = entry.get("text") or ""
+    # ① 无显式归属标签：标签可能落在紧邻的前一条旁白里（「林某说」在台词行之前）；
+    #    前一条是角色台词时不算标签（那是台词本身）。
+    prev_text = (
+        entries[i - 1].get("text")
+        if i > 0 and entries[i - 1].get("speaker") == "NARRATOR"
+        else None
+    )
+    if not _has_attribution_tag(text, prev_text):
+        tier += 1
+    # ② 极短条目
+    if len(text.strip()) <= SPOT_CHECK_SHORT_MAX:
+        tier += 1
+    # ③ 多角色场景：±N 条窗口（含自身、边界 clamp）内 ≥M 个不同非 NARRATOR 说话人
+    lo = max(0, i - SPOT_CHECK_MULTI_WINDOW)
+    hi = min(len(entries), i + SPOT_CHECK_MULTI_WINDOW + 1)
+    speakers = {(entries[j].get("speaker") or "") for j in range(lo, hi)}
+    if len(speakers - {"", "NARRATOR"}) >= SPOT_CHECK_MULTI_MIN:
+        tier += 1
+    return tier
+
+
+def spot_budget(n_total: int, rate: float) -> tuple[int, int]:
+    """The two disjoint sampling buckets ``(n_random, n_risk)``.
+
+    rate ≤ 0 or no entries → (0, 0) (spotting off). Otherwise the total budget is
+    ``max(1, round(rate·N))`` capped at N — a live rate always samples ≥1 entry so
+    even a tiny book yields a gauge reading — of which 1/3 is the pure-random
+    bucket (the unbiased error-rate gauge) and the rest the risk bucket.
+    """
+    if rate <= 0 or n_total <= 0:
+        return 0, 0
+    n_targets = min(n_total, max(1, round(rate * n_total)))
+    n_random = round(n_targets / 3)
+    return n_random, n_targets - n_random
+
+
+def select_spot_targets(entries: list, n_random: int, n_risk: int,
+                        rng: random.Random) -> tuple[list[int], list[int]]:
+    """The two buckets' target indices (disjoint, each sorted ascending).
+
+    The pure-random bucket is drawn FIRST with ``rng.sample`` uniformly over ALL
+    entries (the gauge must stay uncontaminated by the risk weighting); the risk
+    bucket then cascades over the REMAINDER — tiers 3→2→1→0 in descending order,
+    ``rng.shuffle`` within a tier (uniform), and tier 0 (feature-free entries) tops
+    the budget up so it is always fully used.
+    """
+    n = len(entries)
+    n_random = min(n_random, n)
+    random_targets = sorted(rng.sample(range(n), n_random)) if n_random else []
+    taken = set(random_targets)
+    tiers: dict[int, list[int]] = {3: [], 2: [], 1: [], 0: []}
+    for i in range(n):
+        if i in taken:
+            continue
+        tiers[_risk_tier(entries[i], entries, i)].append(i)
+    risk: list[int] = []
+    for tier in (3, 2, 1, 0):
+        pool = tiers[tier]
+        if pool:
+            rng.shuffle(pool)
+        while pool and len(risk) < n_risk:
+            risk.append(pool.pop())
+    return random_targets, sorted(risk)
+
+
+def _spot_history_path() -> Path | None:
+    """``<workspace>/config/spot_check_history.json`` (None with no workspace).
+
+    Deliberately in ``config/`` — never ``03_parsed_json/``: that directory is globbed
+    wholesale as parsed scripts by ``resolve_parsed_json_all``, and a stray JSON there
+    would corrupt the 全部文件 aggregate. ``config/`` is invisible to the file-list API.
+    """
+    config = get_layout().config
+    if config is None:
+        return None
+    return config / SPOT_CHECK_HISTORY_NAME
+
+
+def _load_spot_history(handle=None) -> list:
+    """The per-book readings (``[]`` when absent or corrupt — a stats read failure
+    must never sink the parse task)."""
+    path = _spot_history_path()
+    if path is None or not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_bytes().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        if handle is not None:
+            handle.log("归属抽样历史文件损坏，按空历史处理", "WARNING")
+        return []
+    runs = data.get("runs") if isinstance(data, dict) else None
+    return runs if isinstance(runs, list) else []
+
+
+def _append_spot_history(handle, file_stem: str, stats: dict) -> None:
+    """Append one book's pure-random-bucket reading: locked read-modify-write, keep
+    the last ``SPOT_CHECK_HISTORY_CAP`` runs, ``write_bytes`` full rewrite.
+
+    Any exception degrades to a WARNING — a stats-write failure must never turn the
+    parse task into a failure (the base file is the primary artifact).
+    """
+    try:
+        path = _spot_history_path()
+        if path is None:
+            return
+        with _SPOT_HISTORY_LOCK:
+            runs = _load_spot_history()
+            runs.append({
+                "file": file_stem,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "rate": stats["rate"],
+                "random": {
+                    "n": stats["random_n"],
+                    "errors": stats["random_errors"],
+                    "rate": stats["random_rate"],
+                },
+                "risk": {"n": stats["risk_n"], "errors": stats["risk_errors"]},
+            })
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(json.dumps(
+                {"runs": runs[-SPOT_CHECK_HISTORY_CAP:]},
+                ensure_ascii=False, indent=2,
+            ).encode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        handle.log(f"归属抽样历史写入失败（不影响解析结果）：{e}", "WARNING")
+
+
+def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
+                        check: SpeakerCheckConfig | None, entries: list, rate: float,
+                        rng: "random.Random" | None = None) -> tuple:
+    """Post-parse speaker spot audit (runs in ``generate_file`` after
+    ``validate_sentence_splits`` and BEFORE the mechanical NARRATOR merge — a
+    re-judgment may turn a NARRATOR entry into a character entry, and the merge must
+    see the corrected speaker).
+
+    Samples ``rate`` of ALL entries into two disjoint buckets (1/3 pure random = the
+    unbiased error-rate gauge; 2/3 risk-weighted, feature-count cascade) and re-judges
+    them through the 角色匹配检查 prompt and the exact ``check_file`` batch protocol
+    (first pass → dynamic majority vote per discrepant entry, ≤3 same-window retries,
+    strict majority or keep original; only ``speaker`` may change, plus the
+    deterministic outer-quote strip of a character line). Fixes are applied in memory
+    on shallow copies — the parse task then bakes them into ITS OWN base file (the
+    检查阶段-never-rewrite-the-base invariant constrains the two standalone check
+    stages, not the parse task, which owns the file it is writing).
+
+    ``check is None`` / rate ≤ 0 / empty list → the list unchanged with zeroed stats.
+    ``rng`` (tests) injects a seeded ``random.Random``; ``None`` → a fresh one per run
+    (no cross-book correlation). Cancel propagates and nothing is applied.
+
+    Returns ``(entries, stats)`` — the updated list (the original list object when
+    nothing was applied) and ``{checked, fixed, rate, random_n, random_errors,
+    random_rate, risk_n, risk_errors}`` (risk_* feed the history file only).
+    """
+    stats = {
+        "checked": 0, "fixed": 0, "rate": float(rate or 0),
+        "random_n": 0, "random_errors": 0, "random_rate": None,
+        "risk_n": 0, "risk_errors": 0,
+    }
+    if check is None or rate <= 0 or not entries:
+        return entries, stats
+
+    # Local imports: speaker_check / mix_check both import this module (cycle).
+    from . import check_prompts
+    from .mix_check import build_roster, group_retry_indices
+    from .speaker_check import (
+        _batch_user_prompt,
+        _llm_call,
+        _pick_majority,
+        build_batch_window,
+        parse_speaker_map_full,
+        strip_outer_quotes,
+    )
+    n_random, n_risk = spot_budget(len(entries), float(rate))
+    if n_random + n_risk == 0:
+        return entries, stats
+
+    if rng is None:
+        rng = random.Random()
+    random_targets, risk_targets = select_spot_targets(entries, n_random, n_risk, rng)
+    random_set = set(random_targets)
+    risk_set = set(risk_targets)
+    all_targets = sorted(random_targets + risk_targets)
+
+    n = max(0, int(check.context_window or 0))
+    batch = max(1, int(check.batch_size or 0))
+    original = entries  # every window (first pass + all re-runs) is built from ORIGINAL
+    result = [dict(e) for e in original]
+    roster = build_roster(original)
+    sys_prompt = check.system_prompt or check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
+    usr_template = check.user_prompt or check_prompts.DEFAULT_CHECK_USER_PROMPT
+
+    # Groups pre-built ONCE outside the loop: each group of close-together targets is
+    # one LLM call (the mix retry grouping rule), non-targets inside the span ride
+    # along as unflagged context — wider coverage than the nominal rate, cheaper.
+    groups = group_retry_indices(all_targets, n, batch)
+
+    stats["checked"] = len(all_targets)
+    stats["random_n"] = len(random_targets)
+    stats["risk_n"] = len(risk_targets)
+
+    handle.log(
+        f"归属抽样：{len(all_targets)} 条（纯随机 {len(random_targets)} + 风险加权 "
+        f"{len(risk_targets)}，共 {len(groups)} 组），复用角色匹配检查协议重判…"
+    )
+
+    fixed = 0
+    unwrapped = 0
+    random_errors = 0  # gauge: first-pass re-judgment ≠ original, per bucket
+    risk_errors = 0
+    proc_start = time.monotonic()
+    window_chars = 0
+
+    for seq, grp in enumerate(groups, 1):
+        handle.check()  # cooperative cancel / pause before the group
+        handle.progress(1.0, f"归属抽样 {seq}/{len(groups)} 组")
+        grp_set = set(grp)
+        start, size = grp[0], grp[-1] - grp[0] + 1
+        span = set(range(start, start + size))
+        skip = span - grp_set  # in-span non-targets → context, never re-judged
+        context = json.dumps(build_batch_window(original, start, size, n, skip=skip),
+                             ensure_ascii=False, indent=2)
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": _batch_user_prompt(usr_template, context, len(grp), n, roster)},
+        ]
+        handle.llm_rate(0, 0.0)  # reset the 吞吐 gauge for this call
+        handle.log(f"归属抽样第 {seq}/{len(groups)} 组（{len(grp)} 条目标）…")
+
+        # -- First pass: re-judge the whole group in one call -------------------
+        try:
+            full_map = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
+        except TaskCancelled:
+            raise  # a cancel raised mid-stream must propagate, not be swallowed
+        except Exception as e:  # noqa: BLE001 — unreadable first pass → keep originals
+            handle.log(f"  首批解析失败，本组保留原 speaker：{e}", "WARNING")
+            full_map = {}
+        first_map = {i: sp for i, (sp, _tx) in full_map.items()}
+        # The reply's optional "text" keys: applied only after strict validation below.
+        text_sigs: dict = {i: tx for i, (_sp, tx) in full_map.items() if tx}
+        window_chars += len(context)
+
+        # Gauge accounting: a first-pass re-judgment ≠ original is a detected error,
+        # whatever the vote later decides (the bucket's reading is the parse error rate).
+        for t in grp:
+            sp = first_map.get(t)
+            if sp is None or sp == original[t].get("speaker"):
+                continue
+            if t in random_set:
+                random_errors += 1
+            elif t in risk_set:
+                risk_errors += 1
+
+        discrepant = [
+            t for t in grp
+            if (sp := first_map.get(t)) is not None and sp != original[t].get("speaker")
+        ]
+
+        if discrepant:
+            # -- Disagreement → dynamic majority voting (the check_file protocol) --
+            handle.log(f"  检测到 {len(discrepant)} 条分歧，进入动态投票…")
+            # votes[t] = [原值, 首判, 重试1, (重试2), (重试3)]
+            votes: dict = {t: [original[t].get("speaker"), first_map[t]] for t in discrepant}
+
+            def retry_once(run: int, pending: list) -> list:
+                """Re-send this group's window (retry #run) and fold the new judgments
+                into the ``pending`` entries' votes; return the ones still without a
+                strict majority. Optional ``text`` keys fold into ``text_sigs`` (first
+                wins)."""
+                handle.check()
+                handle.llm_rate(0, 0.0)
+                try:
+                    full = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
+                except TaskCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 — a failed retry adds no votes
+                    handle.log(f"  重试第 {run} 次失败，无新票：{e}", "WARNING")
+                    full = {}
+                m = {i: sp for i, (sp, _tx) in full.items()}
+                for i, tx in full.items():
+                    if tx and i not in text_sigs:
+                        text_sigs[i] = tx
+                for t in pending:
+                    votes[t].append(m.get(t))  # a missing/failed entry contributes no vote
+                return [t for t in pending if _pick_majority(votes[t]) is None]
+
+            handle.log(f"  重试第 1 次（3 样本：原值 + 首判 + 重试结果）…")
+            still = retry_once(1, discrepant)
+            window_chars += len(context)
+            if still:
+                handle.log(f"  {len(still)} 条 1:1 无共识 → 重试第 2 次…")
+                still = retry_once(2, still)
+                window_chars += len(context)
+                if still:
+                    handle.log(f"  {len(still)} 条仍无共识 → 重试第 3 次（末次）…")
+                    still = retry_once(3, still)
+                    window_chars += len(context)
+                    if still:
+                        handle.log(f"  {len(still)} 条重试 3 次仍无共识，保留原 speaker")
+
+            # Apply: adopt the majority only if it beats the original; else keep original.
+            for t in discrepant:
+                winner = _pick_majority(votes[t])
+                orig_sp = original[t].get("speaker")
+                if winner is not None and winner != orig_sp:
+                    result[t]["speaker"] = winner  # only `speaker` changes
+                    fixed += 1
+                    handle.log(f"  条目 {t + 1}: {orig_sp} → {winner}")
+                # winner None (no consensus) or == original → the original is kept.
+        # (no disagreement → the group matches the originals; nothing to re-vote)
+
+        # The check prompt's optional "text" keys: the stored text unwrapped of its
+        # outer quotation marks. Applied only when the entry's FINAL speaker is a
+        # character and the reply matches the mechanically computed strip (the value
+        # written is the computed one — this stage can never rewrite text beyond the
+        # quote removal; instruct and every context neighbour stay untouched).
+        for t in grp:
+            sig = text_sigs.get(t)
+            if not sig or (result[t].get("speaker") or "") == "NARRATOR":
+                continue
+            expected = strip_outer_quotes(original[t].get("text") or "")
+            if not expected or sig != expected:
+                handle.log(
+                    f"  {t + 1}: 模型返回的 text 与「仅去外层引号」不符，忽略（text 保持原样）",
+                    "WARNING",
+                )
+                continue
+            if result[t].get("text") != expected:
+                result[t]["text"] = expected
+                unwrapped += 1
+                handle.log(f"  {t + 1}: 台词已去除外层引号")
+
+        handle.llm_chars(window_chars, time.monotonic() - proc_start)
+
+    stats["fixed"] = fixed
+    stats["random_errors"] = random_errors
+    stats["risk_errors"] = risk_errors
+    stats["random_rate"] = (random_errors / len(random_targets)) if random_targets else None
+    if fixed or unwrapped:
+        handle.log(
+            f"归属抽样完成：抽查 {stats['checked']} 条，更正 {fixed} 条 speaker"
+            + (f"、{unwrapped} 条台词去引号" if unwrapped else "")
+        )
+    return (result if (fixed or unwrapped) else entries), stats
+
+
+# ---------------------------------------------------------------------------
+# 纯归属标签条清理（确定性，零 LLM 成本）
+#
+# 信号：NARRATOR 条目整体就是一条纯归属标签（老道瞪眼怒道。/ 杜尘暗喜，急道。/
+# 史蒂夫解释道。）——无引号、无冒号，断句校验看不见；留在结果里会成 TTS 的独立旁白行
+# （多一次同人停顿 + 换人停顿），悬在它引入的台词之前/之后。删除是五条件合取：
+# NARRATOR + 无引号 + ≤10 字 + 末尾（去末尾标点后）为五归属动词 + 非章标题 + 紧邻对白条。
+# 知道/难道 的「道」与归属抽样同一形态守卫（道前一字符 ∈ 知难 → 不是标签）。
+# 位置在归属抽样**之前**：抽样重判可能把标签条翻成角色 speaker，本规则便不再适用
+# （且角色会用自己声音念第三人称标签）。
+# ---------------------------------------------------------------------------
+
+# 纯标签恒短；「叙述 + 标签」的混合条（…一字一顿地说道。）更长——阈值即两者的分界。
+PURE_SAY_TAG_MAX_LEN = 10
+# 标签动词之后的末尾标点（句末 / 冒号 / 省略 / 破折号）——全部剥掉后再看末字。
+_SAY_TAG_TRAIL_PUNCT = "。！？…：；、，～—-!??:;,.~"
+
+
+def _is_pure_saying_tag(entry, title_test) -> bool:
+    """Whether an entry is a standalone pure-attribution-tag line: a NARRATOR entry of ≤
+    PURE_SAY_TAG_MAX_LEN quote-free chars that, once trailing punctuation is stripped,
+    ends in one of the five attribution verbs and is not a chapter title. The 知道/难道
+    morphological guard applies to a final 道 (same guard as the spot-check tag
+    detection); ANY quote character disqualifies — a wrapped utterance is content, not
+    a tag, and dropping it would lose the line outright."""
+    if not isinstance(entry, dict) or entry.get("speaker") != "NARRATOR":
+        return False
+    t = (entry.get("text") or "").strip()
+    if not t or len(t) > PURE_SAY_TAG_MAX_LEN:
+        return False
+    from .mix_check import _QUOTE_CHARS  # 局部 import：与 spot 段同一循环依赖规避模式
+
+    if any(ch in _QUOTE_CHARS for ch in t):
+        return False
+    if title_test(t):
+        return False
+    core = t.rstrip(_SAY_TAG_TRAIL_PUNCT)
+    if not core:
+        return False
+    last = core[-1]
+    if last not in _SAY_VERBS:
+        return False
+    if last == "道" and len(core) >= 2 and core[-2] in _NONSPEAK_BEFORE_DAO:
+        return False  # 知道 / 难道 — ordinary narrative words, never tags
+    return True
+
+
+def delete_pure_saying_tags(entries, title_test) -> tuple:
+    """Deterministically drop standalone pure-attribution-tag entries (no LLM calls).
+
+    Deletion requires ALL of: NARRATOR, quote-free text of ≤ PURE_SAY_TAG_MAX_LEN
+    chars ending in 说/道/问/喊/答 after trailing punctuation is stripped (知道/难道
+    guarded), not a chapter title, and immediately preceded or followed by a
+    dialogue entry (non-empty speaker ≠ NARRATOR). Single pass, non-cascading —
+    adjacency is judged against the pre-deletion list, so a tag two entries away
+    from any line survives (deliberately conservative: code cannot tell a pure
+    tag from a short narration sentence that merely ends in a verb). Deletion can
+    never create a new NARRATOR/NARRATOR adjacency (one side is always a dialogue
+    entry), so the downstream merge is unaffected. Returns
+    ``(kept_entries, deleted_count, deleted_texts)``.
+    """
+    kept = []
+    deleted_texts = []
+    deleted = 0
+    n = len(entries)
+    for i, e in enumerate(entries):
+        if _is_pure_saying_tag(e, title_test):
+            prev_sp = entries[i - 1].get("speaker") if i > 0 else ""
+            next_sp = entries[i + 1].get("speaker") if i + 1 < n else ""
+            if (prev_sp and prev_sp != "NARRATOR") or (next_sp and next_sp != "NARRATOR"):
+                deleted += 1
+                deleted_texts.append((e.get("text") or "").strip())
+                continue
+        kept.append(e)
+    return kept, deleted, deleted_texts
+
+
+def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generation: GenerationConfig,
+                  check: SpeakerCheckConfig | None = None,
+                  rng: "random.Random" | None = None) -> dict:
     """Task worker: turn one ``02_split_text`` file into its ``{speaker, text, instruct}``
     JSON entries.
 
@@ -607,6 +1636,39 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     ``03_parsed_json/<source-stem>.json`` (one file per source, no scratch dir).
     ``llm`` / ``prompts`` / ``generation`` are the config section objects; empty
     ``prompts`` fall back to the bundled defaults.
+
+    After all chunks are parsed, entries whose stored text is wrapped in outer
+    double quotes that still contain a ``…道：`` speech tag inside are treated as
+    likely failed sentence splits and re-validated: each such entry is re-run
+    through the *same parse prompt* with the entry's text as the chunk plus a
+    ±``check.context_window`` entry context window. The re-derivations vote
+    (1 base call + up to 2 retries, majority wins; a 4th call only if the 3 calls
+    are still undecided) and a strict majority replaces the entry — a 1-part
+    consensus is a clean rewrite (outer wrap / leading tag stripped), a
+    multi-part one a split. No consensus keeps the entry unchanged (never
+    guess). ``check`` is the ``speaker_check`` config section (its
+    ``context_window`` is reused for the validation windows); ``None`` defaults
+    the window to 4.
+
+    Before the spot audit, standalone pure-attribution-tag entries are deleted
+    deterministically (no LLM calls): a NARRATOR entry of ≤10 chars, quote-free,
+    ending (after trailing punctuation is stripped) in one of the five attribution
+    verbs, not a chapter title, and immediately adjacent to a dialogue entry (e.g.
+    老道瞪眼怒道。 — the unwrapped form the split validator cannot see) — kept,
+    it would be read aloud as its own narration line with an extra pause.
+    Deletion is non-cascading (adjacency is judged on the pre-deletion list) and
+    can never create a new NARRATOR/NARRATOR adjacency, so the downstream merge
+    is unaffected.
+
+    After that, an attribution spot audit (``spot_check_speakers``,
+    ``generation.spot_check_rate`` — 0 disables) re-judges a small sample of ALL
+    entries (1/3 pure random = the unbiased whole-book error-rate gauge, 2/3
+    risk-weighted by feature-count cascade) through the 角色匹配检查 prompt and
+    ``check_file``'s batch protocol; high-confidence corrections are baked into the
+    base file this task writes. Each book's pure-random-bucket reading is logged and
+    appended to ``<workspace>/config/spot_check_history.json`` — the rate itself is
+    NEVER auto-reduced (the user decides manually from the settings page).
+    ``rng`` (tests) injects a seeded ``random.Random`` for deterministic sampling.
     """
     # Fail fast on a misconfigured model *before* taking a concurrency slot.
     if not (llm.model_name or "").strip():
@@ -676,10 +1738,65 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
         if not all_entries:
             raise RuntimeError("未生成任何脚本条目。")
 
+        # 断句失败校验（机械旁白合并之前——拆出的旁白段随后照常合并）：外层双引号
+        # 包裹、引号内含「…道：」标签的条目 = 疑似断句失败 → 带上下文窗口重跑解析
+        # LLM，多者胜投票（1+2 次，无共识再第 4 次），胜出者整体替换该条目。
+        all_entries, suspicious, suspicious_fixed = validate_sentence_splits(
+            handle, llm, generation, sys_prompt, usr_template, all_entries,
+            context_window=(int(check.context_window) if check is not None else 4),
+        )
+
+        # 纯归属标签清理（零 LLM 成本；在归属抽样之前——抽样重判可能把标签条改成角色
+        # speaker，使其逃过本规则，且角色会用本人声音念第三人称标签）：整条内容就是
+        # 语气标签（老道瞪眼怒道。——无引号，断句校验不可见）的短 NARRATOR 条，紧邻
+        # 台词条目时删除；标题守卫与机械合并同一 is_chapter_title；知道/难道 形态守卫。
+        all_entries, tags_deleted, deleted_tag_texts = delete_pure_saying_tags(
+            all_entries, is_chapter_title,
+        )
+        if tags_deleted:
+            handle.log(
+                f"纯归属标签清理：删除 {tags_deleted} 条独立短标签条（≤10 字 NARRATOR、"
+                f"末尾「说/道/问/喊/答」、邻接对白）"
+                + "、".join(f"「{t[:15]}」" for t in deleted_tag_texts[:3])
+            )
+        else:
+            # 零命中也留一行日志：与断句校验同一理由——静默退出会被误读成阶段缺失。
+            handle.log("纯归属标签清理：0 条独立短标签条（无删除，零 LLM 调用）")
+
+        # 归属抽样（机械旁白合并之前——重判可把 NARRATOR 条改成角色条，合并必须看到
+        # 改后 speaker）：按 spot_check_rate 从全部条目抽 1/3 纯随机（整书错误率仪表）
+        # + 2/3 风险加权（特征数级联），复用角色匹配检查的提示词与批内投票协议重判，
+        # 高置信改判在内存中生效、随本任务自己的基文件写出。
+        spot_rate = float(generation.spot_check_rate or 0)
+        all_entries, spot_stats = spot_check_speakers(
+            handle, llm, generation, check, all_entries, spot_rate, rng,
+        )
+
+        # 机械后处理：相邻旁白合并（确定性，不经 LLM；章标题两侧不合并）——去掉 TTS
+        # 会在相邻旁白之间多插的同人停顿与段边界。
+        all_entries, merged_pairs = merge_adjacent_narrator(all_entries, is_chapter_title)
+        if merged_pairs:
+            handle.log(f"机械合并 {merged_pairs} 对相邻旁白（章标题两侧不合并）")
+
         out_name = f"{src.stem}.json"
         out_path = get_layout().parsed_json / out_name
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(all_entries, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # 仪表读数：基文件落盘成功后才追加历史（解析结果是主产物，统计写失败绝不影响它）。
+        if spot_stats["random_n"] > 0:
+            _append_spot_history(handle, src.stem, spot_stats)
+        if spot_stats["checked"]:
+            rnd_rate = spot_stats["random_rate"]
+            rate_txt = (
+                f"{spot_stats['random_errors']}/{spot_stats['random_n']}"
+                + (f"（{rnd_rate:.1%}）" if rnd_rate is not None else "")
+            )
+            handle.log(
+                f"归属抽样读数：纯随机桶错误 {rate_txt}（无偏整书错误率估计；"
+                f"风险桶 {spot_stats['risk_errors']}/{spot_stats['risk_n']} 偏高风险、"
+                f"不用于判断能否降率）——连续几本 <1% 可考虑在设置页手动调低「归属抽样率」"
+            )
 
         speakers = sorted({(e.get("speaker") or "UNKNOWN") for e in all_entries})
         handle.progress(1.0, "完成")
@@ -689,7 +1806,19 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "output_path": str(out_path),
             "output_name": out_name,
             "count": len(all_entries),
+            "merged_narrator": merged_pairs,
+            "suspicious": suspicious,
+            "suspicious_fixed": suspicious_fixed,
+            # 纯归属标签清理：确定性删除的独立短标签条数（零 LLM 成本，恒执行）
+            "tags_deleted": tags_deleted,
             "speakers": speakers,
+            # 归属抽样（解析任务自有的基文件内修正，不违反「检查阶段不改写基文件」）
+            "spot_checked": spot_stats["checked"],
+            "spot_fixed": spot_stats["fixed"],
+            "spot_rate": spot_stats["rate"],
+            "spot_random_n": spot_stats["random_n"],
+            "spot_random_errors": spot_stats["random_errors"],
+            "spot_random_rate": spot_stats["random_rate"],
             # Original (decoded, stripped, mojibake-fixed) input length in chars — kept in
             # the result for reference. The live 处理速度 gauge uses the per-chunk llm_chars
             # instead (chars, never tokens).

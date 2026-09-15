@@ -107,6 +107,17 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
     ``handle.check()`` (the child is killed in ``finally``), mirror stderr into the
     task log at WARNING level, then clean up the child and any ``temp_files``.
 
+    Cancel is checked **per line** as the output drains (not only once per drain
+    cycle): on a loaded machine (AV scan / disk contention) each line's processing
+    is slow, so the queues can hold a large backlog while the worker runs at full
+    speed — a cancel clicked meanwhile must not wait for that backlog to drain
+    (minutes) before being seen; the per-line check bounds the cancel latency to a
+    single line's worth of processing. A pause halts the drain at the next line
+    likewise, and cancel still wins (``check()`` re-tests it every 0.1 s). The run
+    mirror (``log_file``) is block-buffered — a line-buffered mirror would pay one
+    OS write (plus the AV-scan tax) per line on the hot path — and flushes at the
+    attempt's end.
+
     * ``[progress] <frac> <label>`` stdout lines are reported via
       ``handle.progress`` here; every other non-empty stdout line is passed to
       ``on_line`` (decoded, stripped) for stage-specific parsing.
@@ -137,11 +148,17 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
     # ([out]), stderr line ([err]) and the attempt boundary markers are also appended there
     # (line-buffered, append mode) — each restart attempt appends its own section, so the
     # file is the forensic record of what the engine actually said before it died.
+    # Block-buffered (NOT line-buffered): the mirror sits on the hot path — every line the
+    # worker emits is written here while the main loop drains the queues. Line buffering made
+    # that one OS write (and one real-time-AV-scan hit) per line, which on a loaded machine
+    # stalled the loop that must stay responsive to cancel. The block flushes at the attempt's
+    # end (the close in finally); a hard backend kill loses at most the buffer — the same
+    # order of loss as the undrained queues already have.
     run_log = None
     if log_file is not None:
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True)
-            run_log = open(log_file, "a", encoding="utf-8", buffering=1)
+            run_log = open(log_file, "a", encoding="utf-8", buffering=64 * 1024)
             run_log.write(f"\n=== attempt started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             run_log.write("cmd: " + " ".join(str(c) for c in cmd) + "\n")
         except OSError:
@@ -169,6 +186,12 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
                     if raw is None:
                         out_done = True
                         break
+                    # Per-line cancel point: the drain runs until the queue is empty, and the
+                    # top-of-loop check below is only reached AFTER the whole backlog is gone —
+                    # on a loaded machine that can be minutes, which made a clicked cancel
+                    # look like "it never stops". Checking per line bounds the latency to one
+                    # line (a pause parked here likewise; cancel still wins the busy-wait).
+                    handle.check()
                     line = raw.decode("utf-8", "replace").strip()
                     if not line:
                         continue
@@ -191,6 +214,7 @@ def run_worker(cmd: list, handle, on_line, *, temp_files=(), fail_prefix: str = 
                     if raw is None:
                         err_done = True
                         break
+                    handle.check()  # per-line cancel point (same rationale as the stdout drain)
                     line = raw.decode("utf-8", "replace").strip()
                     if line:
                         stderr_tail.append(line)

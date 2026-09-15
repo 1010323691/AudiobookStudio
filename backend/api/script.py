@@ -127,8 +127,8 @@ def generate_files(req: GenerateFilesRequest) -> dict:
         task = get_task_manager().create(
             "script", f"文本解析（{name}）",
             S.generate_file,
-            str(path), cfg.llm, prompts, cfg.generation,
-        )
+            str(path), cfg.llm, prompts, cfg.generation, cfg.speaker_check,
+        )  # speaker_check 的 context_window 供解析后的断句失败校验窗口复用
         created.append({"file": name, "task_id": task.id})
     return {"task_ids": [c["task_id"] for c in created], "files": created}
 

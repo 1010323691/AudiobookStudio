@@ -175,6 +175,12 @@ class GenerationConfig(BaseModel):
     # Max files parsed in parallel (LLM jobs); the rest of a batch queue behind a
     # shared gate (see ``core/concurrency.py``). 0 / negative is clamped to 1.
     max_concurrency: int = 3
+    # 解析后的「归属抽样」比例：全量条目中重判 speaker 的抽样率（0 = 关闭）。
+    # 分两桶（不相交）：~1/3 纯随机（整书错误率"仪表"——唯一可据以判断"采样率能不能
+    # 降"的读数）+ ~2/3 风险加权（无归属标签 / ≤10 字 / 多角色场景，按特征数级联）。
+    # 每本的纯随机桶读数记入任务日志 + <workspace>/config/spot_check_history.json；
+    # 降不降采样率由用户在设置页按读数手动决定（不自动降）。
+    spot_check_rate: float = 0.05
 
 
 class AppConfig(BaseModel):

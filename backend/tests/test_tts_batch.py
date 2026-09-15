@@ -373,8 +373,59 @@ def test_run_worker_mirrors_transcript_to_log_file(tmp_path):
     assert "boom-line" in " | ".join(tail)  # the stderr tail still feeds the error message
 
 
+def test_run_worker_cancel_not_stalled_by_backlog(tmp_path):
+    """A cancel must be honoured within one line, NOT after the whole output backlog drains.
+
+    On a loaded machine (AV scan + disk / GPU contention) each line's processing is slow, so
+    the main loop falls far behind the full-speed worker and a large backlog queues up. The
+    old code checked cancel only once per full-drain cycle, so a cancel clicked mid-run waited
+    for the ENTIRE backlog (minutes) before the child was killed — the user saw the log keep
+    scrolling and thought "取消停不下来". The per-line check bounds the latency to one line.
+
+    Simulated here: the child spews 1500 lines in well under a second (they all queue up), the
+    consumer digests 20 ms/line (1500 × 20 ms = 30 s of draining), and the cancel lands at line
+    120 (~2.5 s in). Pre-fix the recognition came with the next top-of-loop check, ~30 s away;
+    the bound below pins the post-fix behaviour.
+    """
+    import sys
+    import threading
+    import time
+
+    import backend.core.tasks as core_tasks
+    from backend.engines import tts as tts_eng
+
+    class _LateCancel(_Handle):
+        """A stand-in that sets its cancel flag once the (slow) consumer digested N lines."""
+
+        def __init__(self, after: int):
+            super().__init__()
+            self.cancel_event = threading.Event()
+            self.after = after
+            self.seen = 0
+
+        def check(self):
+            if self.cancel_event.is_set():
+                raise core_tasks.TaskCancelled()
+
+        def note_line(self):
+            self.seen += 1
+            if self.seen >= self.after:
+                self.cancel_event.set()
+
+    code = ("import time\n"
+            "for i in range(1500):\n"
+            "    print(f'seg-{i}', flush=True)\n"
+            "time.sleep(300)\n")
+    h = _LateCancel(after=120)
+    t0 = time.monotonic()
+    with pytest.raises(core_tasks.TaskCancelled):
+        tts_eng.run_worker([sys.executable, "-c", code], h,
+                           lambda line: (time.sleep(0.02), h.note_line()))
+    assert time.monotonic() - t0 < 10, "cancel stalled behind the output backlog"
+
+
 # --------------------------------------------------------------------------- #
-# resume / force_all / incremental manifest / batch-status
+# resume / incremental manifest / batch-status
 # --------------------------------------------------------------------------- #
 
 def _seed_done_index0(ws):
@@ -404,14 +455,6 @@ def test_synthesize_resume_skips_done(workspace, monkeypatch):
     assert _segments_written(captured) == [1]  # only the not-yet-done segment is synthesized
 
 
-def test_synthesize_force_all_redoes_all(workspace, monkeypatch):
-    _seed_done_index0(workspace)
-    captured = {}
-    _stub_engine(monkeypatch, captured)
-    tts_batch.synthesize(_Handle(), None, "s.json", None, True)  # force_all=True
-    assert sorted(_segments_written(captured)) == [0, 1]  # re-does everything, incl. the done one
-
-
 def test_synthesize_resume_manifest_is_cumulative(workspace, monkeypatch):
     out_dir = _seed_done_index0(workspace)
     captured = {}
@@ -426,14 +469,18 @@ def test_synthesize_resume_manifest_is_cumulative(workspace, monkeypatch):
 
 
 def test_synthesize_writes_manifest_incrementally(workspace, monkeypatch):
+    """In-memory state updates per line; the disk rewrite is throttled — but the FIRST line
+    always flushes (so a cancel right after the first result loses nothing) and the run's end
+    force-flushes (so the manifest is complete whenever the run settles)."""
     captured = {}
 
     def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
         captured["cmd"] = cmd
         out = cmd[cmd.index("--out-dir") + 1]
         on_line(f"[segment] 0 ok {os.path.join(out, '0001.mp3')}")
-        # After the first segment the manifest must already reflect it (write-per-segment, not
-        # write-only-at-the-end) — this is exactly what makes a cancel lose nothing.
+        # After the first segment the manifest must already reflect it (the first line always
+        # flushes, even under the throttle) — this is exactly what makes an early cancel lose
+        # nothing.
         with open(os.path.join(out, "manifest.json"), encoding="utf-8") as f:
             mid = json.load(f)
         assert any(e["index"] == 0 and e["ok"] for e in mid), "manifest not flushed after first segment"
@@ -442,6 +489,42 @@ def test_synthesize_writes_manifest_incrementally(workspace, monkeypatch):
     monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
     monkeypatch.setattr(tts_batch, "run_worker", run_worker)
     tts_batch.synthesize(_Handle(), None, "s.json", None)
+
+    # The completion force-flush covers the throttled line: the manifest is complete at rest.
+    by = {e["index"]: e for e in json.loads(
+        (workspace / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert all(by[i]["ok"] for i in (0, 1))
+
+
+def test_synthesize_manifest_flush_is_throttled(workspace, monkeypatch):
+    """A burst of [segment] lines inside the throttle window rewrites the file only once
+    (the per-line updates stay in memory); the completion force-flush lands the complete
+    manifest. Pins that the hot path is NOT a full-file rewrite per line."""
+    captured = {}
+    writes = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        captured["cmd"] = cmd
+        out = cmd[cmd.index("--out-dir") + 1]
+        for i in (0, 1):  # both lines land within the 2s throttle window
+            on_line(f"[segment] {i} ok {os.path.join(out, f'{i + 1:04d}.mp3')}")
+
+    real_write = tts_batch._write_manifest_file  # capture before the patch below
+
+    def counting(path, manifest):
+        writes.append((len(manifest), sum(e["ok"] for e in manifest)))
+        real_write(path, manifest)
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    monkeypatch.setattr(tts_batch, "_write_manifest_file", counting)
+    tts_batch.synthesize(_Handle(), None, "s.json", None)
+
+    # The manifest always describes every segment (done + pending), so each write carries 2
+    # entries: the first-line flush sees 1 ok (segment 1 is still pending), the second line
+    # triggers NO write (throttle window), and the completion force-flush sees both ok.
+    # Exactly two disk writes for the whole run.
+    assert writes == [(2, 1), (2, 2)]
 
 
 def test_synthesize_resume_all_done_short_circuits(workspace, monkeypatch):
@@ -485,10 +568,6 @@ def test_is_done_requires_ok_and_file(workspace):
 
 def test_plan_to_synthesize_resume_skips_done():
     assert tts_batch.plan_to_synthesize({0, 1, 2}, {0, 1}) == {2}
-
-
-def test_plan_to_synthesize_force_all_ignores_done():
-    assert tts_batch.plan_to_synthesize({0, 1, 2}, {0, 1}, force_all=True) == {0, 1, 2}
 
 
 def test_plan_to_synthesize_explicit_indices_intersect():
@@ -791,6 +870,9 @@ class _RecordingManager:
 
         return _Task()
 
+    def list(self):
+        return []  # no in-flight tasks (the reset guard sees an idle manager)
+
 
 def _stub_manager(monkeypatch):
     import backend.api.tts as tts_api
@@ -808,7 +890,7 @@ def test_run_batch_dispatches_multi(workspace, monkeypatch):
     module, label, func, args = mgr.created[0]
     assert module == "tts-batch"
     assert func is tts_batch.synthesize_multi
-    assert args == (["s.json", "t.json"], 4, False, 7)
+    assert args == (["s.json", "t.json"], 4, 7)
     assert "2 个文件" in label and "续合" in label
 
 
@@ -819,7 +901,7 @@ def test_run_batch_single_file_via_scripts_uses_legacy_path(workspace, monkeypat
     run_batch(BatchRequest(scripts=["s.json"], concurrency=4))
     module, label, func, args = mgr.created[0]
     assert func is tts_batch.synthesize
-    assert args == (None, "s.json", 4, False, None)  # the byte-identical legacy call
+    assert args == (None, "s.json", 4, None)  # the byte-identical legacy call
     assert "· s.json" in label
 
 
@@ -843,3 +925,144 @@ def test_run_batch_scripts_reject_all(workspace, monkeypatch):
     with pytest.raises(HTTPException) as ei:
         run_batch(BatchRequest(scripts=["__all__"]))
     assert ei.value.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# reset_batch — 「重新全部合成」= delete the packages, then the ordinary run
+# --------------------------------------------------------------------------- #
+
+def test_reset_batch_removes_package_dirs(workspace, monkeypatch):
+    """The requested packages (mp3s + manifest) are deleted; sibling packages survive."""
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    _stub_manager(monkeypatch)
+    _seed_done_index0(workspace)  # 05_audio_chunk/s (s.json)
+    out_t = workspace / "05_audio_chunk" / "t"
+    out_t.mkdir(parents=True, exist_ok=True)
+    (out_t / "0001.mp3").write_bytes(b"fake")
+    (out_t / "manifest.json").write_text("[]", encoding="utf-8")
+    out_u = workspace / "05_audio_chunk" / "u"  # NOT requested — must survive
+    out_u.mkdir(parents=True, exist_ok=True)
+    (out_u / "0001.mp3").write_bytes(b"fake")
+
+    res = reset_batch(ResetBatchRequest(scripts=["s.json", "t.json"]))
+    assert res == {"ok": True, "removed": ["s", "t"]}
+    assert not (workspace / "05_audio_chunk" / "s").exists()
+    assert not (workspace / "05_audio_chunk" / "t").exists()
+    assert (out_u / "0001.mp3").exists()
+
+
+def test_reset_batch_noop_when_absent(workspace, monkeypatch):
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    _stub_manager(monkeypatch)
+    assert reset_batch(ResetBatchRequest(scripts=["s.json"])) == {"ok": True, "removed": []}
+
+
+def test_reset_batch_checked_name_maps_to_base_package(workspace, monkeypatch):
+    """A ``_checked`` file name maps to the SAME package the engine writes to (``package_for``
+    strips the suffix on both sides) — a reset can never orphan the engine's output."""
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    _stub_manager(monkeypatch)
+    _seed_done_index0(workspace)  # 05_audio_chunk/s
+    res = reset_batch(ResetBatchRequest(scripts=["s_checked.json"]))
+    assert res == {"ok": True, "removed": ["s"]}
+    assert not (workspace / "05_audio_chunk" / "s").exists()
+
+
+def test_reset_batch_rejects_all_sentinel(workspace, monkeypatch):
+    from fastapi import HTTPException
+
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    _stub_manager(monkeypatch)
+    with pytest.raises(HTTPException) as ei:
+        reset_batch(ResetBatchRequest(scripts=["__all__"]))
+    assert ei.value.status_code == 400
+
+
+def test_reset_batch_requires_workspace(tmp_path, monkeypatch):
+    """No workspace pointer -> the write guard refuses before any deletion."""
+    monkeypatch.setattr(core_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
+    (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
+    from fastapi import HTTPException
+
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    try:
+        core_config.reset_config_cache()
+        with pytest.raises(HTTPException) as ei:
+            reset_batch(ResetBatchRequest(scripts=["s.json"]))
+        assert ei.value.status_code == 409
+    finally:
+        core_config.reset_config_cache()
+
+
+class _InFlightManager(_RecordingManager):
+    """A manager reporting one in-flight tts-batch task (the reset guard)."""
+
+    def list(self):
+        class _Task:
+            module = "tts-batch"
+            status = "running"
+
+        return [_Task()]
+
+
+def test_reset_batch_refused_while_task_in_flight(workspace, monkeypatch):
+    """A running synthesis task is writing the package folders — the reset must wait."""
+    import backend.api.tts as tts_api
+    from fastapi import HTTPException
+
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    monkeypatch.setattr(tts_api, "get_task_manager", lambda: _InFlightManager())
+    with pytest.raises(HTTPException) as ei:
+        reset_batch(ResetBatchRequest(scripts=["s.json"]))
+    assert ei.value.status_code == 409
+
+
+def test_reset_then_ordinary_run_redoes_all(workspace, monkeypatch):
+    """「重新全部合成」end-to-end: a fully-done package is reset (deleted), and the ordinary
+    one-click run — the SAME call a fresh run is, no special flags — re-synthesizes every
+    segment instead of taking the zero-segment short-circuit."""
+    from backend.api.tts import ResetBatchRequest, reset_batch
+
+    _stub_manager(monkeypatch)
+    captured = {}
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        """Like _fake_run_worker, but leaves the mp3 files on disk (the real worker does)."""
+        captured["cmd"] = cmd
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = Path(cmd[cmd.index("--out-dir") + 1])
+        for s in segs:
+            name = str(s["index"] + 1).zfill(4) + ".mp3"
+            (out_dir / name).write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {str(out_dir / name)}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+
+    tts_batch.synthesize(_Handle(), None, "s.json", None)  # run 1: completes everything
+
+    calls = []
+
+    def counting(cmd, handle, on_line, **kw):
+        calls.append(cmd)
+
+    monkeypatch.setattr(tts_batch, "run_worker", counting)
+    tts_batch.synthesize(_Handle(), None, "s.json", None)
+    assert calls == []  # pre-reset: a plain resume has nothing left (zero-segment short-circuit)
+
+    reset_batch(ResetBatchRequest(scripts=["s.json"]))
+    assert not (workspace / "05_audio_chunk" / "s").exists()
+
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    tts_batch.synthesize(_Handle(), None, "s.json", None)  # the identical ordinary call
+    assert sorted(_segments_written(captured)) == [0, 1]  # every segment re-synthesized

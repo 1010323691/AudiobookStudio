@@ -5,7 +5,9 @@ in batches (``speaker_check.batch_size`` target entries per batch, default
 :data:`BATCH_SIZE` = 20). Each batch is ONE LLM call: the window holds the
 batch's target entries (each flagged ``"target": true``) flanked by ``±N`` context
 entries (``N = speaker_check.context_window``), and the prompt states both the target
-count and the context scope so the model knows what it may reason from. The LLM re-judges
+count and the context scope so the model knows what it may reason from, plus the
+book-wide character roster (mirroring the 段落混合检查 — a corrected speaker may name
+a character absent from the local window). The LLM re-judges
 EVERY target entry's ``speaker`` in that single call.
 
 Per batch:
@@ -18,9 +20,12 @@ Per batch:
   after the 3rd retry keeps its original speaker. This replaces the old unconditional 3×
   re-sample (+ 4× tie-break): a clean 2:1 now costs one retry instead of always three.
 
-Only a target entry's ``speaker`` may change — ``text``/``instruct`` and every context
-neighbour are untouched, and every window is built from the INPUT speakers (a batch is
-never judged against a partially-updated one). ``<stem>_checked.json`` is written once at
+Only a target entry's ``speaker`` may change — plus the deterministic removal of the
+OUTER quotation marks from a character entry's ``text`` (the prompt's optional ``text``
+key is applied only when the reply's value matches the mechanically computed strip of
+the stored text, so this stage can never rewrite text any other way) — ``instruct`` and
+every context neighbour are untouched, and every window is built from the INPUT speakers
+(a batch is never judged against a partially-updated one). ``<stem>_checked.json`` is written once at
 the end: it is the "processed" artifact shared with the 段落混合检查, which runs FIRST and
 rebuilds it (splits / deletions / renumbering) from the base file; this stage then updates
 the SAME file in place (input = the fresh ``_checked`` or the base). The base
@@ -52,6 +57,34 @@ from .script import _llm_chat_completion, _llm_chat_completion_stream
 # A batch whose re-judged speakers disagree with the originals is resolved by dynamic
 # majority voting (1–3 retries, stopping at the first 2:1) — see ``check_file``.
 BATCH_SIZE = 20
+
+# Outer quotation-mark pairs the check may strip from a character entry's stored text.
+# The prompt's optional ``text`` key = the stored text minus EXACTLY ONE such outer pair
+# (inner quotes — a quoted term inside the utterance — are preserved).
+_QUOTE_PAIRS = (
+    ("“", "”"),  # curly double
+    ("「", "」"),  # corner
+    ("『", "』"),  # double corner
+    ("‘", "’"),  # curly single
+    ("\u0022", "\u0022"),  # ASCII double
+    ('\u0027', '\u0027'),  # ASCII single
+)
+
+
+def strip_outer_quotes(text: str) -> str | None:
+    """The text with its ONE outermost pair of quotation marks removed, or ``None`` when
+    the text is not wrapped in a matching outer pair (the caller then leaves it alone).
+
+    Only the outermost pair is stripped; an empty interior (``“”``) also yields ``None``
+    so a degenerate quote-only text is never reduced to an empty entry.
+    """
+    if not text or len(text) < 2:
+        return None
+    for open_q, close_q in _QUOTE_PAIRS:
+        if text.startswith(open_q) and text.endswith(close_q):
+            inner = text[len(open_q):-len(close_q)]
+            return inner if inner else None
+    return None
 
 
 def build_batch_window(entries: list, start: int, size: int, n: int, skip=None) -> list[dict]:
@@ -208,7 +241,20 @@ def parse_speaker_map(text: str | None, target_indices: list) -> dict:
     ``{"results": [...]}`` object, a bare ``[...]`` array, or an index-keyed object.
     Returns ``{}`` for anything unreadable — the caller then keeps the original speaker
     for those entries (per-item isolation). A single-target batch falls back to
-    :func:`parse_speaker`.
+    :func:`parse_speaker`. (The reply's optional ``text`` keys are dropped here — use
+    :func:`parse_speaker_map_full` for the ``(speaker, text)`` form.)
+    """
+    full = parse_speaker_map_full(text, target_indices)
+    return {idx: sp for idx, (sp, _tx) in full.items()}
+
+
+def parse_speaker_map_full(text: str | None, target_indices: list) -> dict:
+    """Parse a batch LLM reply into ``{absolute_index: (speaker, text)}``.
+
+    Same shape tolerance as :func:`parse_speaker_map`; ``text`` is the reply item's
+    optional ``text`` key — the check prompt asks for the entry's stored text with its
+    surrounding quotation marks removed (applied by ``check_file`` only after strict
+    validation) — ``None`` when the item omits the key or it is blank.
     """
     targets = list(target_indices)
     if not targets or not text:
@@ -226,12 +272,13 @@ def parse_speaker_map(text: str | None, target_indices: list) -> dict:
     if len(targets) == 1:
         sp = parse_speaker(text)
         if sp:
-            return {targets[0]: sp}
+            return {targets[0]: (sp, None)}
     return {}
 
 
 def _map_from_value(v, tset: set, targets: list) -> dict:
-    """Extract ``{index: speaker}`` from a parsed JSON value (object or array)."""
+    """Extract ``{index: (speaker, text)}`` from a parsed JSON value (object or array);
+    ``text`` is ``None`` whenever the reply item carries no usable ``text`` key."""
     if isinstance(v, dict):
         # {"results" / "speakers" / ... : [ ... ]}
         for key in ("results", "speakers", "entries", "items", "list"):
@@ -240,12 +287,12 @@ def _map_from_value(v, tset: set, targets: list) -> dict:
                 m = _map_from_list(inner, tset, targets)
                 if m:
                     return m
-        # index-keyed object: {"0": "NARRATOR", "3": "BOB"}
+        # index-keyed object: {"0": "NARRATOR", "3": "BOB"} (speaker-only values)
         m = {}
         for k, sp in v.items():
             idx = _as_int(k)
             if isinstance(sp, str) and sp.strip() and idx is not None and idx in tset:
-                m[idx] = sp.strip()
+                m[idx] = (sp.strip(), None)
         return m
     if isinstance(v, list):
         return _map_from_list(v, tset, targets)
@@ -255,14 +302,15 @@ def _map_from_value(v, tset: set, targets: list) -> dict:
 def _map_from_list(lst: list, tset: set, targets: list) -> dict:
     if not lst:
         return {}
-    # form A: [{"index": .., "speaker": ..}, ...]
+    # form A: [{"index": .., "speaker": .., "text": ..?}, ...]
     if all(isinstance(x, dict) for x in lst):
         m = {}
         for x in lst:
             idx = _as_int(x.get("index"))
             sp = x.get("speaker")
             if idx is not None and isinstance(sp, str) and sp.strip() and idx in tset:
-                m[idx] = sp.strip()
+                tx = x.get("text")
+                m[idx] = (sp.strip(), tx.strip() if isinstance(tx, str) and tx.strip() else None)
         if m:
             return m
     # form B: ["SPEAKER", ...] in target order
@@ -270,7 +318,7 @@ def _map_from_list(lst: list, tset: set, targets: list) -> dict:
         m = {}
         for i, sp in enumerate(lst):
             if i < len(targets) and sp.strip():
-                m[targets[i]] = sp.strip()
+                m[targets[i]] = (sp.strip(), None)
         if m:
             return m
     return {}
@@ -323,20 +371,25 @@ def _llm_call(llm: LLMConfig, generation: GenerationConfig, messages, handle=Non
     return content
 
 
-def _batch_user_prompt(template: str, context: str, size: int, n: int) -> str:
-    """Fill the user template's ``{context}`` and append the context-scope note.
+def _batch_user_prompt(template: str, context: str, size: int, n: int,
+                       roster: list[str] | None = None) -> str:
+    """Fill the user template's ``{context}`` and append the roster + context-scope notes.
 
     ``replace`` (not ``format``) keeps a user-edited template containing other braces from
-    raising; the appended note states the target count and the ``±n`` context scope so the
-    model knows exactly what it may reason from (requirement: attach the context-window
-    entry count).
+    raising. The appended notes carry the book-wide character roster (a corrected speaker
+    may name a character absent from the local window — mirroring the 段落混合检查's
+    injection; omitted when the roster is empty) and the target count with the ``±n``
+    context scope, so the model knows exactly what it may copy from and reason over.
     """
-    base = template.replace("{context}", context)
-    note = (
-        f"\n\n【上下文范围】上方窗口含 {size} 个 target=true 的目标条目（请逐一给出 speaker），"
+    body = template.replace("{context}", context)
+    extra = []
+    if roster:
+        extra.append("【本书角色】" + "、".join(roster))
+    extra.append(
+        f"【上下文范围】上方窗口含 {size} 个 target=true 的目标条目（请逐一给出 speaker），"
         f"目标块前后各有 {n} 条未标记 target 的上下文条目，仅供理解、不得改动。"
     )
-    return base + note
+    return body + "\n\n" + "\n".join(extra)
 
 
 def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generation: GenerationConfig) -> dict:
@@ -351,13 +404,20 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
     originals is resolved by dynamic majority voting (original + first check + 1–3 retries,
     stopping at the first 2:1). Concurrency
     is bounded by the shared gate (``generation.max_concurrency``) like parsing — one slot
-    held for the whole file. Only a target entry's ``speaker`` may change; the base file
-    is never modified (the ``<stem>_checked.json`` artifact is written once at the end —
-    in place when the input already is the ``_checked`` file, never double-suffixed).
+    held for the whole file. Only a target entry's ``speaker`` may change, plus the
+    deterministic outer-quotation-mark removal of a character entry's ``text`` (the reply's
+    optional ``text`` key, applied only when it matches the mechanically computed strip);
+    the base file is never modified (the ``<stem>_checked.json`` artifact is written once
+    at the end — in place when the input already is the ``_checked`` file, never
+    double-suffixed).
     """
     # Fail fast on a misconfigured model *before* taking a concurrency slot.
     if not (llm.model_name or "").strip():
         raise RuntimeError("请先在「文本解析」页配置 LLM 模型名称（模型不能为空）。")
+
+    # Local import: mix_check already imports from speaker_check, so a module-level
+    # import here would cycle at load time (by call time both modules are fully loaded).
+    from .mix_check import build_roster
 
     src = Path(path)
     handle.progress(0.0, "排队中（等待并发槽位）")
@@ -373,6 +433,10 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
             raise RuntimeError(f"{src.name} 为空——请先生成脚本。")
         if not all(isinstance(e, dict) for e in original):
             raise RuntimeError(f"{src.name} 含非对象条目，无法检查。")
+
+        # The book-wide roster goes into the prompt (mirroring the 段落混合检查): a
+        # corrected speaker may name a character absent from the local batch window.
+        roster = build_roster(original)
 
         n = max(0, int(check.context_window or 0))
         # Target entries per LLM call, from the user's 「每次送检段落数」 (clamped to ≥1 so a
@@ -390,6 +454,7 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
         handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
 
         changed = 0
+        unwrapped = 0  # entries whose stored text was unwrapped of its outer quotation marks
         rechecked = 0  # entries that went through re-sampling (disagreement resolution)
         proc_start = time.monotonic()
         window_chars = 0
@@ -403,7 +468,7 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
                                  ensure_ascii=False, indent=2)
             messages = [
                 {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": _batch_user_prompt(usr_template, context, size, n)},
+                {"role": "user", "content": _batch_user_prompt(usr_template, context, size, n, roster)},
             ]
 
             handle.check()  # cooperative cancel / pause before the batch
@@ -413,12 +478,17 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
 
             # -- First pass: re-judge the whole batch in one call -------------------
             try:
-                first_map = parse_speaker_map(_llm_call(llm, generation, messages, handle), targets)
+                full_map = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), targets)
             except TaskCancelled:
                 raise  # a cancel raised mid-stream must propagate, not be swallowed
             except Exception as e:  # noqa: BLE001 — unreadable first pass → keep originals
                 handle.log(f"  首批解析失败，本批保留原 speaker：{e}", "WARNING")
-                first_map = {}
+                full_map = {}
+            first_map = {i: sp for i, (sp, _tx) in full_map.items()}
+            # The reply's optional "text" keys: the stored text with its outer quotation
+            # marks removed. Collected per entry (first non-blank value wins) and applied
+            # below ONLY after strict validation against the mechanically computed strip.
+            text_sigs: dict = {i: tx for i, (_sp, tx) in full_map.items() if tx}
             window_chars += len(context)  # this call sent the window to the model
 
             # Discrepant targets: a valid re-judged speaker that differs from the original.
@@ -442,16 +512,22 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
 
                 def retry_once(run: int, pending: list) -> list:
                     """Re-send this batch's window (retry #run) and fold the new judgments
-                    into the votes of the ``pending`` entries; return the ones still tied."""
+                    into the votes of the ``pending`` entries; return the ones still tied.
+                    Any optional ``text`` keys the retry carries are folded into
+                    ``text_sigs`` (first non-blank value per entry wins)."""
                     handle.check()
                     handle.llm_rate(0, 0.0)
                     try:
-                        m = parse_speaker_map(_llm_call(llm, generation, messages, handle), targets)
+                        full = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), targets)
                     except TaskCancelled:
                         raise
                     except Exception as e:  # noqa: BLE001 — a failed retry adds no votes
                         handle.log(f"  重试第 {run} 次失败，无新票：{e}", "WARNING")
-                        m = {}
+                        full = {}
+                    m = {i: sp for i, (sp, _tx) in full.items()}
+                    for i, tx in full.items():
+                        if tx and i not in text_sigs:
+                            text_sigs[i] = tx
                     for t in pending:
                         votes[t].append(m.get(t))  # a missing/failed entry contributes no vote
                     return [t for t in pending if _pick_majority(votes[t]) is None]
@@ -481,6 +557,28 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
                     # winner None (no consensus) or == original → the original is kept.
             # (no disagreement → the batch matches the originals; nothing to change)
 
+            # The check prompt also asks the model to report a character entry's stored
+            # text with its outer quotation marks removed (the optional "text" key). Apply
+            # it only when the entry's FINAL speaker is a character and the reply's value
+            # matches the mechanically computed strip of the stored text — the value
+            # written is the computed one, so this stage can never rewrite text beyond the
+            # quote removal (instruct and every context neighbour stay untouched).
+            for t in targets:
+                sig = text_sigs.get(t)
+                if not sig or (result[t].get("speaker") or "") == "NARRATOR":
+                    continue
+                expected = strip_outer_quotes(original[t].get("text") or "")
+                if not expected or sig != expected:
+                    handle.log(
+                        f"  {t + 1}: 模型返回的 text 与「仅去外层引号」不符，忽略（text 保持原样）",
+                        "WARNING",
+                    )
+                    continue
+                if result[t].get("text") != expected:
+                    result[t]["text"] = expected
+                    unwrapped += 1
+                    handle.log(f"  {t + 1}: 台词已去除外层引号")
+
             # Advance the cumulative metrics + progress for both branches.
             handle.llm_chars(window_chars, time.monotonic() - proc_start)
             handle.progress((start + size) / total, f"已检查 {start + size}/{total} 条")
@@ -494,11 +592,16 @@ def check_file(handle, path, llm: LLMConfig, check: SpeakerCheckConfig, generati
 
         speakers = sorted({(e.get("speaker") or "UNKNOWN") for e in result})
         handle.progress(1.0, "完成")
-        handle.log(f"检查 {total} 条（{rechecked} 条经重判），{changed} 条 speaker 已更正 → {out_path.name}")
+        handle.log(
+            f"检查 {total} 条（{rechecked} 条经重判），{changed} 条 speaker 已更正"
+            + (f"、{unwrapped} 条台词去引号" if unwrapped else "")
+            + f" → {out_path.name}"
+        )
         return {
             "checked": total,
             "rechecked": rechecked,
             "changed": changed,
+            "unwrapped": unwrapped,
             "output_name": out_path.name,
             "output_path": str(out_path),
             "speakers": speakers,

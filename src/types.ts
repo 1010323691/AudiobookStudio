@@ -214,9 +214,6 @@ export interface BatchRunOptions {
   /** Reproducible seed for the run: >=0 seeds each sub-batch (seed + sub-batch seq);
    *  undefined → the persisted default (config.tts.batch_seed); -1 → random. */
   seed?: number
-  /** True → re-synthesize EVERY segment (clears the resume skip); undefined/false → resume
-   *  (only the not-yet-done segments, skipping existing audio). */
-  force_all?: boolean
 }
 export interface PrepareFoundationsResult {
   count: number
@@ -419,6 +416,9 @@ export interface AppConfig {
     banned_tokens: number[]
     /** Max files parsed in parallel (LLM jobs); the rest queue behind a shared gate. */
     max_concurrency: number
+    /** 解析后归属抽样率（0 = 关闭）：1/3 纯随机（整书错误率仪表）+ 2/3 风险加权。
+     *  每本读数记入任务日志与 config/spot_check_history.json；降不降由用户手动决定。 */
+    spot_check_rate: number
   }
   ui: { theme: string }
 }

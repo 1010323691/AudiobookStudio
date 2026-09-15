@@ -6,7 +6,7 @@ import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { listDir } from '@/api/files'
-import { batchStatusFiles, runBatch, ttsStatus } from '@/api/tts'
+import { batchStatusFiles, resetBatch, runBatch, ttsStatus } from '@/api/tts'
 import type { BatchFileStatus, BatchResult, FileItem, TTSStatus } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
@@ -304,20 +304,25 @@ async function doRun() {
   }
 }
 
-// 「重新全部合成」: the user explicitly clears the completion state and re-does EVERY segment
-// of the selected files (loads the model again, re-synthesizes all). Gated behind a confirm
-// since it is expensive and discards the resume shortcut.
+// 「重新全部合成」: step 1 deletes the selected files' synthesis packages
+// (05_audio_chunk/<包>/ — the finished mp3s + manifest); step 2 then sends the EXACT same
+// request as 一键音频合成 — with nothing left on disk the ordinary resume run re-does every
+// segment (loads the model again). There is no separate force-re-synthesis route on the
+// backend. Gated behind a confirm since it is expensive and discards the finished audio.
 async function doRunAll() {
   if (busy.value) return
   const names = selectedNames.value
   if (!names.length) return
-  if (!window.confirm('重新全部合成会清除选中文件内已完成状态并重做全部段落（需重新加载模型、耗时较长）。确定继续吗？')) return
+  if (!window.confirm('重新全部合成会删除选中文件已合成的音频（05_audio_chunk/ 下对应文件夹，含进度清单），并从头重做全部段落（需重新加载模型、耗时较长）。确定继续吗？')) return
   busy.value = true
   error.value = ''
   result.value = null
   const concurrencyNow = concurrency.value
   try {
-    const { task_id } = await runBatch({ scripts: names, concurrency: concurrencyNow, seed: runSeed(), force_all: true })
+    // Clear the completion state (the package folders) first …
+    await resetBatch(names)
+    // … then the identical one-click run: default resume, nothing done → everything re-done.
+    const { task_id } = await runBatch({ scripts: names, concurrency: concurrencyNow, seed: runSeed() })
     taskId.value = task_id
     await taskStore.refresh()
     void settings.save({ tts: { batch_concurrency: concurrencyNow } })
@@ -501,7 +506,7 @@ watch(
             <Button
               variant="outline"
               :disabled="busy || !workspaceSet || !selectedNames.length"
-              title="清除选中文件内已完成状态，重新合成全部段落"
+              title="删除选中文件已合成的音频与进度，随后从头重新合成全部段落"
               @click="doRunAll"
             >
               <RotateCcw class="h-4 w-4" />重新全部合成

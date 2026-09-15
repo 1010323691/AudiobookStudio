@@ -9,27 +9,55 @@ focus of ``test_text.py``.
 from __future__ import annotations
 
 import json
+import random
 import re
 import urllib.request
 
 import pytest
 
-from backend.core.config import LLMConfig
+from backend.core import config as core_config
+from backend.core import paths as core_paths
+from backend.core.config import GenerationConfig, LLMConfig, PromptsConfig, SpeakerCheckConfig
 from backend.core.tasks import TaskCancelled
 from backend.engines.script import (
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_USER_PROMPT,
+    SPOT_CHECK_HISTORY_CAP,
+    _append_spot_history,
+    _has_attribution_tag,
+    _is_pure_saying_tag,
     _llm_chat_completion,
     _llm_chat_completion_stream,
+    _load_spot_history,
+    _parse_entries_reply,
+    _reparse_vote,
+    _risk_tier,
+    _strip_leading_saying_tag,
+    _tag_in,
+    check_chunk_fidelity,
     clean_json_string,
+    delete_pure_saying_tags,
     fix_mojibake,
+    generate_file,
+    is_suspicious_entry_text,
+    merge_adjacent_narrator,
     process_chunk,
+    revalidate_entry,
     repair_json_array,
     salvage_json_entries,
+    select_spot_targets,
+    spot_budget,
+    spot_check_speakers,
+    split_chunk_balanced,
     split_into_chunks,
+    suspicious_entry_indices,
+    validate_sentence_splits,
 )
+from backend.engines.text import is_chapter_title
 
 BS = chr(92)  # backslash — built via chr() so no literal backslashes live in this file
+LQ, RQ = chr(0x201C), chr(0x201D)  # curly double quotes — via chr() (hand-typed quotes are unreliable)
+SQ = chr(0x0022)  # straight double quote — via chr()
 
 
 def _entry(speaker: str, text: str, instruct: str) -> dict:
@@ -233,11 +261,15 @@ class _Handle:
     def llm_rate(self, chars: int, cps: float) -> None:
         self.rates.append(cps)
 
+    def llm_chars(self, chars: int, secs: float) -> None:
+        pass  # display telemetry only — generate_file reports per-chunk throughput here
+
     def log(self, *a, **k):
         pass
 
     def check(self):
-        pass
+        if self.cancelled:
+            raise TaskCancelled("test handle cancelled")
 
     def progress(self, *a, **k):
         pass
@@ -361,3 +393,1319 @@ def test_stream_cancel_propagates_through_process_chunk(monkeypatch):
 
     with pytest.raises(TaskCancelled):
         process_chunk(handle, LLMConfig(stream=True), "model", "chunk text", 1, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 章标题防丢（split_into_chunks 尾部标题守卫）
+# --------------------------------------------------------------------------- #
+
+def test_split_evicts_trailing_title_to_next_chunk():
+    p1 = "旁" * 80
+    title = "第十章 舞会"
+    p2 = "景" * 80
+    src = p1 + "\n\n" + title + "\n\n" + p2
+    chunks = split_into_chunks(src, max_size=100)
+    # p1 (80) + title (6) fits one chunk (88) but p2 (80) doesn't -> the chunk
+    # closes with the title at its tail -> the title moves to the NEXT chunk's head
+    # (stays with the chapter body it heads, far from truncation risk).
+    assert chunks == [p1, title + "\n\n" + p2]
+
+
+def test_split_keeps_lone_title_chunk():
+    p1 = "旁" * 100
+    title = "第十一章 雨"
+    p2 = "景" * 100
+    src = p1 + "\n\n" + title + "\n\n" + p2
+    chunks = split_into_chunks(src, max_size=100)
+    # p1 (100) alone fills its chunk -> the title can't be appended -> it forms its
+    # own chunk; a chunk that IS a title is never emptied of it.
+    assert chunks == [p1, title, p2]
+
+
+# --------------------------------------------------------------------------- #
+# 忠实性校验（check_chunk_fidelity）
+# --------------------------------------------------------------------------- #
+
+def test_fidelity_passes_on_faithful_output():
+    chunk = f"他道：{LQ}这条路没有尽头。{RQ}\n\n她答：{LQ}那就一直走。{RQ}"
+    entries = [
+        {"speaker": "NARRATOR", "text": "他道"},
+        {"speaker": "A", "text": f"{LQ}这条路没有尽头。{RQ}"},
+        {"speaker": "NARRATOR", "text": "她答"},
+        {"speaker": "B", "text": f"{LQ}那就一直走。{RQ}"},
+    ]
+    assert check_chunk_fidelity(chunk, entries) == []
+
+
+def test_fidelity_catches_dropped_line():
+    chunk = f"他道：{LQ}这条路没有尽头。{RQ}\n\n她答：{LQ}那就一直走。{RQ}"
+    entries = [
+        {"speaker": "NARRATOR", "text": "他道"},
+        {"speaker": "A", "text": f"{LQ}这条路没有尽头。{RQ}"},
+    ]
+    # the second quoted passage is absent from every output text -> reported by skeleton
+    assert check_chunk_fidelity(chunk, entries) == ["那就一直走"]
+
+
+def test_fidelity_immune_to_quote_and_tag_removal():
+    # 引号被剥离、语气标签并入旁白 —— 骨架不变 -> 不误报
+    chunk = f"他道：{LQ}这条路没有尽头。{RQ}\n\n她答：{LQ}那就一直走。{RQ}"
+    entries = [
+        {"speaker": "NARRATOR", "text": "他道，她答"},
+        {"speaker": "A", "text": "这条路没有尽头"},
+        {"speaker": "B", "text": "那就一直走。"},
+    ]
+    assert check_chunk_fidelity(chunk, entries) == []
+
+
+def test_fidelity_ignores_short_and_empty_quotes():
+    # <4 词字符的引语不作保真信号（单字感叹不值得触发重发）
+    chunk = f"他喊：{LQ}走。{RQ}"
+    assert check_chunk_fidelity(chunk, [{"speaker": "A", "text": "随便什么内容。"}]) == []
+    assert check_chunk_fidelity("", [{"speaker": "A", "text": "x"}]) == []
+
+
+# --------------------------------------------------------------------------- #
+# 对半切开（split_chunk_balanced）
+# --------------------------------------------------------------------------- #
+
+def test_split_balanced_prefers_paragraph_boundary():
+    chunk = "甲" * 50 + "\n\n" + "乙" * 50
+    assert split_chunk_balanced(chunk) == ("甲" * 50, "乙" * 50)
+
+
+def test_split_balanced_falls_back_to_newline():
+    chunk = "甲" * 50 + "\n" + "乙" * 50
+    assert split_chunk_balanced(chunk) == ("甲" * 50, "乙" * 50)
+
+
+def test_split_balanced_falls_back_to_sentence_end():
+    chunk = "甲" * 40 + "。" + "乙" * 50 + "。"
+    assert split_chunk_balanced(chunk) == ("甲" * 40 + "。", "乙" * 50 + "。")
+
+
+def test_split_balanced_no_boundary_returns_whole():
+    assert split_chunk_balanced("甲" * 50) == ("甲" * 50, "")
+
+
+# --------------------------------------------------------------------------- #
+# process_chunk 忠实性恢复（mocked urlopen）
+# --------------------------------------------------------------------------- #
+
+def _chat_payload(content: str) -> bytes:
+    return json.dumps(
+        {"choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 3, "completion_tokens": 4}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def test_process_chunk_fidelity_double_tokens_recovers_missing_line(monkeypatch):
+    # 首轮回复静默丢了一条引语（模型漂移 / 尾部截断）：忠实性校验捕获 ->
+    # 阶梯第 1 步：max_tokens 临时翻倍再跑一次，其完整回复被采纳（共 2 次调用）。
+    partial = json.dumps([
+        {"speaker": "NARRATOR", "text": "他道"},
+        {"speaker": "A", "text": f"{LQ}这条路没有尽头。{RQ}"},
+    ], ensure_ascii=False)
+    full = json.dumps([
+        {"speaker": "NARRATOR", "text": "他道"},
+        {"speaker": "A", "text": f"{LQ}这条路没有尽头。{RQ}"},
+        {"speaker": "B", "text": f"{LQ}那就一直走。{RQ}"},
+    ], ensure_ascii=False)
+    calls = {"n": 0, "temps": [], "max_tokens": []}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        body = json.loads(req.data.decode("utf-8"))
+        calls["temps"].append(body["temperature"])
+        calls["max_tokens"].append(body["max_tokens"])
+        return _BodyResp(_chat_payload(partial if calls["n"] == 1 else full))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    chunk = f"他道：{LQ}这条路没有尽头。{RQ}\n\n{LQ}那就一直走。{RQ}她答。"
+    result = process_chunk(
+        _Handle(),
+        LLMConfig(base_url="http://x/v1", api_key="k", model_name="m", stream=False),
+        "m", chunk, 1, 1, temperature=0.6, max_tokens=100,
+    )
+
+    assert [e["text"] for e in result] == [
+        "他道", f"{LQ}这条路没有尽头。{RQ}", f"{LQ}那就一直走。{RQ}",
+    ]
+    assert calls["n"] == 2
+    assert calls["temps"] == [0.6, 0.6]
+    assert calls["max_tokens"] == [100, 200]
+
+
+def test_process_chunk_fidelity_split_in_half(monkeypatch):
+    # 原发 + 翻倍 max_tokens 重跑都丢了后半的引语 -> 阶梯第 2 步：chunk 在段落边界
+    # 对半切开，两半各再跑一次（2 + 1 + 1 = 4 次调用，阶梯到头不递归），内容全部找回。
+    chunk = f"A说：{LQ}第一句话内容。{RQ}\n\nB说：{LQ}第二句话内容。{RQ}"
+    left, _right = split_chunk_balanced(chunk)  # the paragraph boundary, mid-chunk
+    left_json = json.dumps([
+        {"speaker": "NARRATOR", "text": "A说"},
+        {"speaker": "A", "text": f"{LQ}第一句话内容。{RQ}"},
+    ], ensure_ascii=False)
+    right_json = json.dumps([
+        {"speaker": "NARRATOR", "text": "B说"},
+        {"speaker": "B", "text": f"{LQ}第二句话内容。{RQ}"},
+    ], ensure_ascii=False)
+    full_user = DEFAULT_USER_PROMPT.format(context="(Beginning of text)", chunk=chunk)
+    left_user = DEFAULT_USER_PROMPT.format(context="(Beginning of text)", chunk=left)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        content = left_json if user in (full_user, left_user) else right_json
+        return _BodyResp(_chat_payload(content))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    result = process_chunk(
+        _Handle(),
+        LLMConfig(base_url="http://x/v1", api_key="k", model_name="m", stream=False),
+        "m", chunk, 1, 1, temperature=0.6, max_tokens=100,
+    )
+
+    assert [e["text"] for e in result] == [
+        "A说", f"{LQ}第一句话内容。{RQ}", "B说", f"{LQ}第二句话内容。{RQ}",
+    ]
+    assert calls["n"] == 4
+
+
+def test_process_chunk_fidelity_unrecoverable_keeps_best(monkeypatch):
+    # 原发 + 翻倍重跑都静默丢行，且 chunk 无任何安全切分边界（阶梯到头）：
+    # 优雅保留最好结果（共 2 次调用），不丢弃、不循环。
+    partial = json.dumps([
+        {"speaker": "NARRATOR", "text": "他道"},
+    ], ensure_ascii=False)
+    calls = {"n": 0, "temps": [], "max_tokens": []}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        body = json.loads(req.data.decode("utf-8"))
+        calls["temps"].append(body["temperature"])
+        calls["max_tokens"].append(body["max_tokens"])
+        return _BodyResp(_chat_payload(partial))  # 每次都丢行
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    # 无换行、无句末标点 → split_chunk_balanced 找不到任何安全边界，不可再切
+    chunk = f"他道：{LQ}这条路没有尽头{RQ}她答"
+    result = process_chunk(
+        _Handle(),
+        LLMConfig(base_url="http://x/v1", api_key="k", model_name="m", stream=False),
+        "m", chunk, 1, 1, temperature=0.6, max_tokens=100,
+    )
+
+    assert [e["text"] for e in result] == ["他道"]  # 保留最好结果，不丢弃
+    assert calls["n"] == 2
+    assert calls["temps"] == [0.6, 0.6]
+    assert calls["max_tokens"] == [100, 200]
+
+
+# --------------------------------------------------------------------------- #
+# 相邻旁白机械合并（merge_adjacent_narrator）
+# --------------------------------------------------------------------------- #
+
+def test_merge_narrator_merges_adjacent_run():
+    entries = [
+        {"speaker": "NARRATOR", "text": "夜色沉了下来", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "风穿过巷子", "instruct": "b"},
+        {"speaker": "BOB", "text": f"{LQ}回来。{RQ}", "instruct": "c"},
+        {"speaker": "NARRATOR", "text": "灯亮了", "instruct": "d"},
+    ]
+    original = [dict(e) for e in entries]
+    out, n = merge_adjacent_narrator(entries, is_chapter_title)
+    # first entry's instruct survives the merge; the run is one entry; BOB breaks it
+    assert n == 1
+    assert out == [
+        {"speaker": "NARRATOR", "text": "夜色沉了下来风穿过巷子", "instruct": "a"},
+        {"speaker": "BOB", "text": f"{LQ}回来。{RQ}", "instruct": "c"},
+        {"speaker": "NARRATOR", "text": "灯亮了", "instruct": "d"},
+    ]
+    assert entries == original  # 输入列表不被改动
+
+
+def test_merge_narrator_chains_and_keeps_first_instruct():
+    entries = [
+        {"speaker": "NARRATOR", "text": "一", "instruct": "slow"},
+        {"speaker": "NARRATOR", "text": "二", "instruct": "fast"},
+        {"speaker": "NARRATOR", "text": "三", "instruct": "loud"},
+    ]
+    out, n = merge_adjacent_narrator(entries, is_chapter_title)
+    assert n == 2
+    assert out == [{"speaker": "NARRATOR", "text": "一二三", "instruct": "slow"}]
+
+
+def test_merge_narrator_keeps_titles_standalone():
+    entries = [
+        {"speaker": "NARRATOR", "text": "前章结尾"},
+        {"speaker": "NARRATOR", "text": "第十章 舞会"},
+        {"speaker": "NARRATOR", "text": "舞会开始了"},
+    ]
+    out, n = merge_adjacent_narrator(entries, is_chapter_title)
+    assert n == 0  # 标题行的前后两侧一律不合并
+    assert [e["text"] for e in out] == ["前章结尾", "第十章 舞会", "舞会开始了"]
+
+
+def test_merge_narrator_caps_merged_length():
+    a = {"speaker": "NARRATOR", "text": "甲" * 3900}
+    b = {"speaker": "NARRATOR", "text": "乙" * 200}
+    out, n = merge_adjacent_narrator([a, b], is_chapter_title, max_len=4000)
+    assert n == 0  # 3900 + 200 = 4100 ≥ 4000 -> 不合并
+    assert out == [a, b]
+
+
+def test_merge_narrator_default_cap_blocks_oversize():
+    # 缺省上限 100 字：60 + 60 = 120 ≥ 100 -> 不合并
+    a = {"speaker": "NARRATOR", "text": "甲" * 60}
+    b = {"speaker": "NARRATOR", "text": "乙" * 60}
+    out, n = merge_adjacent_narrator([a, b], is_chapter_title)
+    assert n == 0
+    assert out == [a, b]
+
+
+def test_merge_narrator_merges_short_run_by_default():
+    # 缺省上限 100 字：40 + 40 = 80 < 100 -> 合并
+    a = {"speaker": "NARRATOR", "text": "甲" * 40}
+    b = {"speaker": "NARRATOR", "text": "乙" * 40}
+    out, n = merge_adjacent_narrator([a, b], is_chapter_title)
+    assert n == 1
+    assert out == [{"speaker": "NARRATOR", "text": "甲" * 40 + "乙" * 40}]
+
+
+# --------------------------------------------------------------------------- #
+# 断句失败校验（解析后条目级重判：外层引号包裹 + 引号内「…道：」标签 → 带窗口重跑）
+# --------------------------------------------------------------------------- #
+
+# 被校验条目的固定样例：外层弯引号包裹，引号内开头是纯语气标签（可整段丢弃）
+SUSP_ENTRY = {
+    "speaker": "NARRATOR",
+    "text": f"{LQ}林某冷笑道：{LQ}二哥还没出来吗？{RQ}{RQ}",
+    "instruct": "",
+}
+ROSTER = frozenset({"NARRATOR", "林某"})
+_LLM = LLMConfig(base_url="http://x/v1", api_key="k", model_name="m", stream=False)
+
+# 四种互不相同的合法重判（骨架都能拼回原文，角色都在花名册内）
+W_KEEP = json.dumps([  # 标签保留为旁白段 + 台词段（2 段，2 主体）
+    {"speaker": "NARRATOR", "text": "林某冷笑道。"},
+    {"speaker": "林某", "text": "二哥还没出来吗？"},
+], ensure_ascii=False)
+W_DROP = json.dumps([  # 纯标签整段丢弃（提示词编辑 (e)）→ 单段
+    {"speaker": "林某", "text": "二哥还没出来吗？"},
+], ensure_ascii=False)
+W_ALL_NARR = json.dumps([{"speaker": "NARRATOR", "text": "林某冷笑道二哥还没出来吗？"}],
+                        ensure_ascii=False)
+W_ALL_LIN = json.dumps([{"speaker": "林某", "text": "林某冷笑道二哥还没出来吗？"}],
+                       ensure_ascii=False)
+
+
+def test_suspicious_detector_pins():
+    # 触发 = 外层双引号包裹（弯/直任意形式）且引号跨度内有「…道 + 冒号」；
+    # 冒号是硬条件（知道/难道/道理 的「道」后无冒号 → 不触发）。
+    suspicious = [
+        f"{LQ}又道：{LQ}二哥还没出来吗？{RQ}{RQ}",  # 嵌套同款引号（rfind 取最宽跨度）
+        f"{LQ}杜尘笑道：{LQ}快走！{RQ}{RQ}",
+        f"{SQ}林某道：{SQ}知道了{SQ}{SQ}",          # 直引号包裹 + 直引号内层
+        f"{LQ}道：{LQ}快走！{RQ}{RQ}",              # 标签在跨度开头（^ 分支）
+        f"{SQ}沉声道：{SQ}嗯{SQ}{SQ}",
+        f"{LQ}冷笑道 ：{LQ}走{RQ}{RQ}",             # 道 与冒号之间允许空白
+        f"{LQ}又道：{SQ}嗯{SQ}{RQ}",                # 弯包裹 + 直内层（混合形式）
+        f"{LQ}他低声道：{LQ}快走。{RQ}{RQ}",
+    ]
+    clean = [
+        f"说道：二哥还没出来吗？",                  # 有标签但无包裹
+        f"{LQ}二哥还没出来吗？{RQ}",                # 有包裹但无标签
+        f"他低声道：{LQ}快走。{RQ}",                # 标签在包裹之外
+        f"{LQ}难道是这样。{RQ}",                    # 「道」后无冒号
+        f"{LQ}道理很简单。{RQ}",
+        f"{LQ}他知道了。{RQ}",                      # 知道（无冒号）
+        f"{LQ}嗯。{RQ}",
+        f"{LQ}{RQ}",                                # 空包裹
+        "",
+    ]
+    for t in suspicious:
+        assert is_suspicious_entry_text(t) is True, repr(t)
+    for t in clean:
+        assert is_suspicious_entry_text(t) is False, repr(t)
+
+
+def test_suspicious_indices_skips_non_dicts():
+    entries = [
+        {"speaker": "NARRATOR", "text": f"{LQ}又道：{LQ}嗯？{RQ}{RQ}", "instruct": ""},
+        {"speaker": "林某", "text": f"{LQ}走。{RQ}", "instruct": ""},
+        {"speaker": "NARRATOR", "text": f"{LQ}他知道了。{RQ}", "instruct": ""},
+        {"speaker": "NARRATOR", "text": f'{SQ}说道：{SQ}好{SQ}{SQ}', "instruct": ""},
+        "not-a-dict",
+    ]
+    assert suspicious_entry_indices(entries) == [0, 3]
+
+
+def test_strip_leading_saying_tag():
+    wrapped = f"{LQ}林某冷笑道：{LQ}二哥还没出来吗？{RQ}{RQ}"
+    # 内层开引号保留（剥掉的只有标签本身）——该形态只用于忠实性门的骨架，骨架忽略引号
+    assert _strip_leading_saying_tag(wrapped) == f"{LQ}{LQ}二哥还没出来吗？{RQ}{RQ}"
+    # 开头的「知道：」同样可剥（两种骨架都过门，由重判多票裁决）
+    assert _strip_leading_saying_tag(f"{LQ}他知道：这件事。{RQ}") == f"{LQ}这件事。{RQ}"
+    # 无开头标签 / 未包裹 → 原样返回（中段标签不剥——交给段落混合检查）
+    assert _strip_leading_saying_tag(f"{LQ}二哥。{RQ}") == f"{LQ}二哥。{RQ}"
+    assert _strip_leading_saying_tag("林某冷笑道：走") == "林某冷笑道：走"
+
+
+def test_reparse_vote_accepts_faithful_rederivations():
+    # 单段：纯标签整段丢弃（编辑 (e)）→ 骨架 = 剥标签后的原文
+    assert _reparse_vote([{"speaker": "林某", "text": "二哥还没出来吗？"}],
+                         SUSP_ENTRY, ROSTER) == (("林某", "二哥还没出来吗"),)
+    # 两段：标签保留为旁白段 → 骨架 = 原文（含标签）
+    assert _reparse_vote([
+        {"speaker": "NARRATOR", "text": "林某冷笑道。"},
+        {"speaker": "林某", "text": "二哥还没出来吗？"},
+    ], SUSP_ENTRY, ROSTER) == (("NARRATOR", "林某冷笑道"), ("林某", "二哥还没出来吗"))
+    # 骨架对引号/冒号编辑免疫：原样保留包裹也通过
+    assert _reparse_vote(
+        [{"speaker": "NARRATOR", "text": SUSP_ENTRY["text"]}], SUSP_ENTRY, ROSTER) is not None
+
+
+def test_reparse_vote_rejects_unfaithful_or_unknown():
+    bad = [
+        [{"speaker": "林某", "text": "二哥出来了吗？"}],        # 丢词（还没）
+        [{"speaker": "林某", "text": f"{LQ}二哥还没出来吗？{RQ}罢了"}],  # 增词
+        [{"speaker": "赵四", "text": "二哥还没出来吗？"}],       # 角色不在花名册
+        [{"speaker": "林某", "text": "二哥"},
+         {"speaker": "林某", "text": "还没出来吗？"}],          # 多段同主体
+        [{"speaker": "林某", "text": "二哥还没出来吗？"},
+         {"speaker": "NARRATOR", "text": "林某冷笑道。"}],      # 段序颠倒
+        [{"speaker": "NARRATOR", "text": ""}],                  # 空段文字
+        [{"speaker": "NARRATOR"}],                              # 缺 text
+        [],                                                     # 无段
+        ["not-a-dict"],                                         # 非 dict 段
+    ]
+    for parts in bad:
+        assert _reparse_vote(parts, SUSP_ENTRY, ROSTER) is None, parts
+
+
+def _run_revalidate(monkeypatch, payloads, handle=None):
+    """Serve ``payloads`` in order (one non-stream body per call); over-call = error."""
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        if calls["n"] > len(payloads):
+            raise AssertionError(f"LLM called {calls['n']} times, expected {len(payloads)}")
+        return _BodyResp(_chat_payload(payloads[calls["n"] - 1]))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    parts = revalidate_entry(
+        handle or _Handle(), _LLM, GenerationConfig(),
+        "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}", SUSP_ENTRY, "ctx", ROSTER,
+    )
+    return parts, calls
+
+
+def test_revalidate_identical_replies_stop_after_two_calls(monkeypatch):
+    # 2:0 即出多数 → 第 3 次调用省掉（与角色匹配检查同一「首次 2:1 即止」规则）
+    parts, calls = _run_revalidate(monkeypatch, [W_KEEP, W_KEEP, W_KEEP])
+    assert calls["n"] == 2
+    assert [(p["speaker"], p["text"]) for p in parts] == [
+        ("NARRATOR", "林某冷笑道。"), ("林某", "二哥还没出来吗？"),
+    ]
+
+
+def test_revalidate_21_majority_settles_on_third_call(monkeypatch):
+    parts, calls = _run_revalidate(monkeypatch, [W_KEEP, W_DROP, W_KEEP])
+    assert calls["n"] == 3  # 两次 1:1 → 第 3 次打破平局
+    assert parts[0]["speaker"] == "NARRATOR"  # 2 段（保留标签）的回复胜出
+
+
+def test_revalidate_tie_escalates_to_fourth_call(monkeypatch):
+    parts, calls = _run_revalidate(monkeypatch, [W_KEEP, W_DROP, W_ALL_NARR, W_KEEP])
+    assert calls["n"] == 4  # 3 次 1:1:1 无共识 → 按规则再跑第 4 次
+    assert parts[0]["speaker"] == "NARRATOR"
+
+
+def test_revalidate_four_distinct_keeps_entry(monkeypatch):
+    parts, calls = _run_revalidate(monkeypatch, [W_KEEP, W_DROP, W_ALL_NARR, W_ALL_LIN])
+    assert calls["n"] == 4
+    assert parts is None  # 无共识 → 从不猜，条目保持原样
+
+
+def test_revalidate_bad_replies_contribute_no_votes(monkeypatch):
+    # 不可解析 + 未过门的回复不投票；两次无票耗尽前 2 次尝试后，
+    # 两次相同的好回复仍能在第 4 次调用后定出多数
+    bad_gate = json.dumps([{"speaker": "赵四", "text": "二哥还没出来吗？"}],
+                          ensure_ascii=False)
+    parts, calls = _run_revalidate(
+        monkeypatch, ["这不是JSON", bad_gate, W_DROP, W_DROP])
+    assert calls["n"] == 4
+    assert [(p["speaker"], p["text"]) for p in parts] == [("林某", "二哥还没出来吗？")]
+
+
+def test_revalidate_cancel_propagates(monkeypatch):
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(W_KEEP))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    with pytest.raises(TaskCancelled):
+        revalidate_entry(_Handle(cancelled=True), _LLM, GenerationConfig(),
+                         "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}",
+                         SUSP_ENTRY, "ctx", ROSTER)
+    assert calls["n"] == 0  # 取消在任何调用之前上抛
+
+
+def test_validate_no_flagged_entries_skips_llm(monkeypatch):
+    entries = [
+        {"speaker": "NARRATOR", "text": "夜色。", "instruct": ""},
+        {"speaker": "林某", "text": f"{LQ}走。{RQ}", "instruct": ""},
+    ]
+
+    def urlopen(req, *a, **k):
+        raise AssertionError("no LLM call expected")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    out, flagged, fixed = validate_sentence_splits(
+        _Handle(), _LLM, GenerationConfig(), "sys", "T", entries)
+    assert (out, flagged, fixed) == (entries, 0, 0)  # 同一个 list 对象原样返回
+
+
+def test_validate_applies_wins_in_descending_order(monkeypatch):
+    # 下标 1 的 1→2 拆分必须在下标 3 的重写之后应用——窗口全部按原始列表预建，
+    # 升序应用会让拆分移动尚未处理条目的下标，窗口指错条目。
+    t1 = f"{LQ}林某冷笑道：{LQ}二哥还没出来吗？{RQ}{RQ}"
+    t2 = f'{SQ}说道：{SQ}知道了。{SQ}{SQ}'
+    entries = [
+        {"speaker": "NARRATOR", "text": "夜色。", "instruct": ""},
+        {"speaker": "NARRATOR", "text": t1, "instruct": ""},
+        {"speaker": "NARRATOR", "text": "风起了。", "instruct": ""},
+        {"speaker": "NARRATOR", "text": t2, "instruct": ""},
+        {"speaker": "林某", "text": "嗯。", "instruct": ""},
+        {"speaker": "李四", "text": "哦。", "instruct": ""},
+    ]
+    pristine = [dict(e) for e in entries]
+    w1 = json.dumps([
+        {"speaker": "NARRATOR", "text": "林某冷笑道。"},
+        {"speaker": "林某", "text": "二哥还没出来吗？"},
+    ], ensure_ascii=False)
+    w2 = json.dumps([{"speaker": "李四", "text": "知道了。"}], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        chunk = user.rsplit("SOURCE TEXT:", 1)[1].strip()
+        if chunk == t1:
+            return _BodyResp(_chat_payload(w1))
+        if chunk == t2:
+            return _BodyResp(_chat_payload(w2))
+        raise AssertionError(f"unexpected re-parse chunk: {chunk!r}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    out, flagged, fixed = validate_sentence_splits(
+        _Handle(), _LLM, GenerationConfig(), "sys",
+        "CTX={context}\nSOURCE TEXT:\n{chunk}", entries, context_window=1)
+
+    assert (flagged, fixed) == (2, 2)
+    assert entries == pristine  # 输入列表保持原样
+    # 下标 1 拆成 2 条（列表 +1 项），原条目顺序其余不动 → 7 条
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", "夜色。"),
+        ("NARRATOR", "林某冷笑道。"),
+        ("林某", "二哥还没出来吗？"),
+        ("NARRATOR", "风起了。"),
+        ("李四", "知道了。"),
+        ("林某", "嗯。"),
+        ("李四", "哦。"),
+    ]
+
+
+def test_validate_no_consensus_keeps_entries_and_list(monkeypatch):
+    t1 = f"{LQ}林某冷笑道：{LQ}二哥还没出来吗？{RQ}{RQ}"
+    entries = [
+        {"speaker": "NARRATOR", "text": "夜色。", "instruct": ""},
+        {"speaker": "NARRATOR", "text": t1, "instruct": ""},
+        {"speaker": "林某", "text": "嗯。", "instruct": ""},
+    ]
+    bad = json.dumps([{"speaker": "赵四", "text": "二哥还没出来吗？"}], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(bad))  # 每次都未过花名册门 → 无票
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    out, flagged, fixed = validate_sentence_splits(
+        _Handle(), _LLM, GenerationConfig(), "sys", "T", entries)
+    assert (out, flagged, fixed) == (entries, 1, 0)  # 同一对象，零改写
+    assert calls["n"] == 4  # 基础 1 + 重试 2 无共识 → 再跑第 4 次
+
+
+@pytest.fixture
+def workspace(monkeypatch, tmp_path):
+    """A throwaway project root + workspace (mirrors ``test_merge.py``) —
+    ``generate_file`` writes its output through ``get_layout().parsed_json``."""
+    monkeypatch.setattr(core_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
+    (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}),
+                                       encoding="utf-8")
+    core_config.reset_config_cache()
+    ws = tmp_path / "Book"
+    core_config.set_workspace_pointer(str(ws))
+    yield ws
+    core_config.reset_config_cache()
+
+
+def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch, workspace):
+    # 1 次解析 + 2 条疑似断句失败 × 2 次校验调用（2:0 即止）= 共 5 次 LLM 调用。
+    # 第 2 条（直引号包裹 + 说道：）重写为单条；第 1 条（弯引号 + 冷笑道：）拆为两段，
+    # 拆出的旁白段恰是独立纯归属标签（林某冷笑道。——无引号）→ 被确定性标签清理删除
+    # （紧邻台词条目），不再进入机械合并；负例（知道，无冒号）保持原样。
+    source = (
+        "夜色像潮水一样漫进街巷。\n"
+        f"林某冷笑道：{LQ}二哥还没出来吗？{RQ}\n"
+        f"林某：{LQ}知道了。{RQ}\n"
+        f"说道：{SQ}嗯，去吧。{SQ}\n"
+        f"李四：{SQ}嗯。{SQ}\n"
+        "他知道了。\n"
+    )
+    t1 = f"{LQ}林某冷笑道：{LQ}二哥还没出来吗？{RQ}{RQ}"
+    t2 = f"{SQ}说道：{SQ}嗯，去吧。{SQ}{SQ}"
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": t1, "instruct": "b"},
+        {"speaker": "林某", "text": f"{LQ}知道了。{RQ}", "instruct": "c"},
+        {"speaker": "NARRATOR", "text": t2, "instruct": "d"},
+        {"speaker": "李四", "text": f"{SQ}嗯。{SQ}", "instruct": "e"},
+        {"speaker": "NARRATOR", "text": f"{LQ}他知道了。{RQ}", "instruct": "f"},
+    ], ensure_ascii=False)
+    w1 = json.dumps([
+        {"speaker": "NARRATOR", "text": "林某冷笑道。", "instruct": "g"},
+        {"speaker": "林某", "text": "二哥还没出来吗？", "instruct": "h"},
+    ], ensure_ascii=False)
+    w2 = json.dumps([{"speaker": "李四", "text": "嗯，去吧。", "instruct": "i"}],
+                    ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        chunk = user.rsplit("SOURCE TEXT:", 1)[1].strip()
+        if chunk == t1:
+            return _BodyResp(_chat_payload(w1))
+        if chunk == t2:
+            return _BodyResp(_chat_payload(w2))
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))  # write_text 在 Windows 会翻译 \n → \r\n
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(), GenerationConfig(spot_check_rate=0.0),
+        SpeakerCheckConfig(),
+    )  # spot_check_rate=0：默认 0.05 会在此跑归属抽样，打破下面的调用数断言
+
+    assert calls["n"] == 5  # 1 解析 + 2×2 校验
+    assert result["count"] == 6
+    assert result["suspicious"] == 2
+    assert result["suspicious_fixed"] == 2
+    assert result["tags_deleted"] == 1  # 拆出的旁白段 = 独立纯标签（无引号）→ 删除
+    assert result["merged_narrator"] == 0  # 标签删除后无相邻旁白可合并
+    assert result["speakers"] == ["NARRATOR", "李四", "林某"]
+    assert result["output_name"] == "chapter.json"
+    assert result["input_chars"] == len(source.strip())
+
+    out = json.loads((workspace / "03_parsed_json" / "chapter.json").read_text("utf-8"))
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", "夜色像潮水一样漫进街巷。"),  # 纯标签段已删除，开头旁白保持原样
+        ("林某", "二哥还没出来吗？"),
+        ("林某", f"{LQ}知道了。{RQ}"),
+        ("李四", "嗯，去吧。"),                                # 直引号包裹 → 单条重写
+        ("李四", f"{SQ}嗯。{SQ}"),
+        ("NARRATOR", f"{LQ}他知道了。{RQ}"),                   # 负例（知道，无冒号）原样
+    ]
+    assert out[0]["instruct"] == "a"
+    assert result["entries"] == out
+
+
+# --------------------------------------------------------------------------- #
+# 纯归属标签条清理（确定性删除，零 LLM 成本）
+# --------------------------------------------------------------------------- #
+
+
+def test_pure_tag_predicate_positives():
+    # 五归属动词收尾（含末尾标点形态与无标点形态；「，」/「：」/「！」/「……」均剥掉后再判）
+    for t in (
+        "老道瞪眼怒道。", "杜尘暗喜，急道。", "史蒂夫解释道。",
+        "他沉声道：", "胖女人惊呼道！", "她颤声道……",
+        "他低声说。", "他追问。", "他放声喊。", "他答道。",
+        "他冷笑道",  # 无末尾标点同样命中
+    ):
+        assert _is_pure_saying_tag(_entry("NARRATOR", t, ""), is_chapter_title), t
+
+
+def test_pure_tag_predicate_negatives():
+    # 知道/难道 的「道」= 形态守卫（与归属抽样同一守卫），不是标签
+    for t in ("他不知道。", "她不知道。", "他难道。"):
+        assert not _is_pure_saying_tag(_entry("NARRATOR", t, ""), is_chapter_title), t
+    # 动词不在句末 → 普通叙述
+    for t in ("这很有道理。", "他知道答案。"):
+        assert not _is_pure_saying_tag(_entry("NARRATOR", t, ""), is_chapter_title), t
+    # 「叙述 + 标签」混合条（>10 字）→ 保留（阈值即两者分界）
+    assert not _is_pure_saying_tag(
+        _entry("NARRATOR", "老道被这一记马屁拍得舒舒服服，点头道。", ""), is_chapter_title)
+    # 任何引号 → 台词内容而非标签（删了会整句丢失台词）
+    assert not _is_pure_saying_tag(_entry("NARRATOR", f"{LQ}快说。{RQ}", ""), is_chapter_title)
+    # 章标题（注意 CHAPTER_RE 要求「第N回」与标题之间有分隔符，空格形式才会命中）
+    assert not _is_pure_saying_tag(_entry("NARRATOR", "第5回 问道", ""), is_chapter_title)
+    # 角色条 → 不动
+    assert not _is_pure_saying_tag(_entry("老道", "打老道。", ""), is_chapter_title)
+    # 空 / 纯标点（剥尽后无核）/ 非 dict
+    assert not _is_pure_saying_tag(_entry("NARRATOR", "", ""), is_chapter_title)
+    assert not _is_pure_saying_tag(_entry("NARRATOR", "。。。", ""), is_chapter_title)
+    assert not _is_pure_saying_tag("NARRATOR: 他说道。", is_chapter_title)
+
+
+def test_pure_tag_delete_adjacency():
+    line = _entry("林某", f"{LQ}知道了。{RQ}", "")
+    narr = _entry("NARRATOR", "夜色像潮水一样漫进街巷。", "")
+    tag = _entry("NARRATOR", "林某冷笑道。", "")
+    # 台词在前 → 删
+    kept, n, texts = delete_pure_saying_tags([line, tag], is_chapter_title)
+    assert n == 1 and len(kept) == 1 and kept[0] is line
+    assert texts == ["林某冷笑道。"]
+    # 台词在后 → 删
+    kept, n, _ = delete_pure_saying_tags([tag, line], is_chapter_title)
+    assert n == 1 and len(kept) == 1 and kept[0] is line
+    # 孤立（无邻接）→ 留
+    assert delete_pure_saying_tags([tag], is_chapter_title)[1] == 0
+    # 两侧皆旁白 → 留
+    kept, n, _ = delete_pure_saying_tags(
+        [narr, tag, _entry("NARRATOR", "风声很紧。", "")], is_chapter_title)
+    assert n == 0 and len(kept) == 3
+    # 隔一条旁白（距离 2）→ 留
+    kept, n, _ = delete_pure_saying_tags([line, narr, tag], is_chapter_title)
+    assert n == 0 and len(kept) == 3
+    # 非级联：两个相邻标签，只删与台词紧邻的那一个（邻接按删除前列表判定）
+    kept, n, texts = delete_pure_saying_tags(
+        [_entry("NARRATOR", "风声很紧。", ""), tag, tag, line], is_chapter_title)
+    assert n == 1 and len(kept) == 3 and texts == ["林某冷笑道。"]
+    # 空 speaker 条目 ≠ 对白 → 不满足邻接
+    kept, n, _ = delete_pure_saying_tags([_entry("", "嗯。", ""), tag], is_chapter_title)
+    assert n == 0 and len(kept) == 2
+
+
+def test_generate_file_e2e_pure_tag_delete(tmp_path, monkeypatch, workspace):
+    # 解析产出 [旁白, 纯标签, 台词] → 标签条确定性删除（零额外 LLM 调用），
+    # 结果 2 条、无合并（删除不会制造新的旁白相邻对）。
+    source = (
+        "老道士坐在堂中，闭目养神。\n"
+        "老道士瞪眼怒道。\n"
+        f"老道士：{LQ}你敢动我的弟子？{RQ}\n"
+    )
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "老道士坐在堂中，闭目养神。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "老道士瞪眼怒道。", "instruct": "b"},
+        {"speaker": "老道士", "text": f"{LQ}你敢动我的弟子？{RQ}", "instruct": "c"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "tag.txt"
+    src.write_bytes(source.encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(), GenerationConfig(spot_check_rate=0.0),
+        SpeakerCheckConfig(),
+    )
+    assert calls["n"] == 1  # 除解析外零 LLM 调用（断句校验零命中、标签清理纯机械）
+    assert result["count"] == 2
+    assert result["tags_deleted"] == 1
+    assert result["merged_narrator"] == 0
+    assert result["suspicious"] == 0
+
+    out = json.loads((workspace / "03_parsed_json" / "tag.json").read_text("utf-8"))
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", "老道士坐在堂中，闭目养神。"),
+        ("老道士", f"{LQ}你敢动我的弟子？{RQ}"),
+    ]
+
+
+def test_generate_file_e2e_pure_tag_gone_before_spot(tmp_path, monkeypatch, workspace):
+    # 标签条必须在归属抽样之前被删除：抽样若先跑，可能把标签条重判成角色 speaker，
+    # 使其逃过纯 NARRATOR 规则。rate=1.0 全量抽样、零分歧 → 每批恰 1 次调用。
+    source = (
+        "老道士坐在堂中，闭目养神。\n"
+        "老道士瞪眼怒道。\n"
+        f"老道士：{LQ}你敢动我的弟子？{RQ}\n"
+        "堂外风声鹤唳。\n"
+    )
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "老道士坐在堂中，闭目养神。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "老道士瞪眼怒道。", "instruct": "b"},
+        {"speaker": "老道士", "text": f"{LQ}你敢动我的弟子？{RQ}", "instruct": "c"},
+        {"speaker": "NARRATOR", "text": "堂外风声鹤唳。", "instruct": "d"},
+    ], ensure_ascii=False)
+    spot_payloads = []
+
+    def urlopen(req, *a, **k):
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        if "SOURCE TEXT:" not in user:
+            spot_payloads.append(user)
+            return _BodyResp(_chat_payload({
+                "results": [
+                    {"index": 0, "speaker": "NARRATOR"},
+                    {"index": 1, "speaker": "老道士"},
+                    {"index": 2, "speaker": "NARRATOR"},
+                ]
+            }))
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "tag2.txt"
+    src.write_bytes(source.encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(spot_check_rate=1.0),
+        SpeakerCheckConfig(context_window=10),
+        rng=random.Random(7),
+    )
+    # 标签条在抽样前已删除：抽样窗口里根本没有它
+    assert result["tags_deleted"] == 1
+    assert result["count"] == 3
+    assert len(spot_payloads) == 1
+    assert "瞪眼怒道" not in spot_payloads[0]
+    assert result["spot_checked"] == 3
+    assert result["spot_fixed"] == 0  # 零分歧 → 无改判
+    assert result["merged_narrator"] == 0
+
+    out = json.loads((workspace / "03_parsed_json" / "tag2.json").read_text("utf-8"))
+    assert [(e["speaker"], e["text"]) for e in out] == [
+        ("NARRATOR", "老道士坐在堂中，闭目养神。"),
+        ("老道士", f"{LQ}你敢动我的弟子？{RQ}"),
+        ("NARRATOR", "堂外风声鹤唳。"),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 归属抽样（spot check）
+# --------------------------------------------------------------------------- #
+
+def test_spot_budget_table():
+    # @0.05：预算 = max(1, round(rate·N)) 封顶 N；1/3 → 纯随机，其余 → 风险
+    assert spot_budget(1, 0.05) == (0, 1)
+    assert spot_budget(2, 0.05) == (0, 1)
+    assert spot_budget(10, 0.05) == (0, 1)
+    assert spot_budget(100, 0.05) == (2, 3)
+    assert spot_budget(101, 0.05) == (2, 3)
+    # rate = 0 / 负 → 关闭；无条目 → 关闭
+    assert spot_budget(100, 0.0) == (0, 0)
+    assert spot_budget(100, -0.1) == (0, 0)
+    assert spot_budget(0, 0.05) == (0, 0)
+    # rate ≥ 1 → 全量
+    assert spot_budget(5, 1.0) == (2, 3)
+
+
+def test_tag_in_positives():
+    # 人名（2~3 字）× 五动词
+    for name in ("林某", "王小明", "任昊"):
+        for verb in "说道问答喊":
+            assert _tag_in(f"{name}{verb}"), (name, verb)
+    # 他/她 × 五动词
+    for pronoun in "他她":
+        for verb in "说道问答喊":
+            assert _tag_in(f"{pronoun}{verb}"), (pronoun, verb)
+    # 标签在句首之外的位置同样命中
+    assert _tag_in("林某说他知道这件事")
+
+
+def test_tag_in_negatives():
+    # 知道/难道 是形态而非标签（「道」前一字符 = 知/难 的形态守卫，不是词表黑名单）
+    for t in ("他知道", "她知道", "不知道", "谁知道", "他难道", "这道理", "林某知道"):
+        assert not _tag_in(t), t
+    # 纯旁白行（无五动词）
+    assert not _tag_in("风平浪静")
+    assert not _tag_in("")
+
+
+def test_has_attribution_tag_prev_rule():
+    # 标签可落在前一条（「林某说」在台词行之前）
+    assert _has_attribution_tag("", "林某说")
+    assert _has_attribution_tag("他走了", "王小明答")
+    assert not _has_attribution_tag("他走了", None)
+    assert not _has_attribution_tag("", "他走了")  # 前一条也无标签
+
+
+def test_risk_tier_combos():
+    long_tx = "这件事必须从长计议，绝对不可轻举妄动，否则后果不堪设想。"  # 29 字
+    # tier 0：有标签 + 长 + 少说话人
+    e0 = [_entry("林某", "林某说" + long_tx, "")]
+    assert _risk_tier(e0[0], e0, 0) == 0
+    # tier 1：无标签 + 长 + 少说话人
+    e1 = [_entry("林某", long_tx, "")]
+    assert _risk_tier(e1[0], e1, 0) == 1
+    # tier 2：无标签 + 短
+    e2 = [_entry("林某", "嗯。", "")]
+    assert _risk_tier(e2[0], e2, 0) == 2
+    # tier 3：无标签 + 短 + 窗口内 ≥4 个不同非 NARRATOR 说话人
+    e3 = [
+        _entry("王某", "王某沉默着，没有开口。", ""),
+        _entry("赵某", "赵某只是站在原地不动。", ""),
+        _entry("孙某", "孙某把门轻轻关上了。", ""),
+        _entry("周某", "周某回头看了一眼。", ""),
+        _entry("林某", "嗯。", ""),
+    ]
+    assert _risk_tier(e3[4], e3, 4) == 3
+
+
+def test_risk_tier_short_boundary():
+    # ≤10 字 → 短（10 字命中，11 字不命中）
+    e10 = [_entry("林某", "1234567890", "")]
+    e11 = [_entry("林某", "12345678901", "")]
+    assert _risk_tier(e10[0], e10, 0) == 2  # 无标签 + 短
+    assert _risk_tier(e11[0], e11, 0) == 1  # 仅无标签
+
+
+def test_risk_tier_multi_speaker_boundary():
+    long_tx = "这是一段足够长的旁白文字，用来撑满字数。"
+
+    def mk(neighbors):
+        es = [_entry(s, long_tx, "") for s in neighbors]
+        es.append(_entry("林某", "林某说这是一段足够长的旁白文字。", ""))  # 有标签 + 长
+        return es
+
+    # 4 个不同非 NARRATOR 说话人（含自身）→ 命中
+    e4 = mk(["王某", "赵某", "孙某", "周某"])
+    assert _risk_tier(e4[-1], e4, 4) == 1
+    # 3 个（2 邻居 + 自身）→ 不命中
+    e3 = mk(["王某", "赵某"])
+    assert _risk_tier(e3[-1], e3, len(e3) - 1) == 0
+
+
+def test_risk_tier_window_clamps_at_file_start():
+    # i=0：窗口 clamp 到 [0, N)——不越界，计数照常
+    es = [_entry("林某", "林某说这是一段足够长的旁白文字。", "")] + [
+        _entry(s, "这是一段足够长的旁白文字，用来撑满字数。", "")
+        for s in ("王某", "赵某", "孙某", "周某")
+    ]
+    assert _risk_tier(es[0], es, 0) == 1  # 窗口 [0,5) 内 5 个不同说话人 → 命中
+
+
+def _big_entries(n):
+    """n 条确定性混层条目（仅两个说话人 → 无人命中多角色特征；tier = 标签 + 短）。"""
+    long_tx = "这是一段足够长的旁白文字，用来撑满字数，供抽样使用。"  # 26 字，无五动词
+    out = []
+    for i in range(n):
+        sp = "林某" if i % 2 == 0 else "李四"
+        if i % 4 == 0:
+            out.append(_entry(sp, "嗯。", ""))                       # 无标签 + 短 → tier 2
+        elif i % 4 == 1:
+            out.append(_entry(sp, f"{sp}说{long_tx}", ""))           # 标签 + 长 → tier 0
+        elif i % 4 == 2:
+            out.append(_entry(sp, long_tx, ""))                      # 无标签 + 长 → tier 1
+        else:
+            out.append(_entry(sp, f"{sp}说嗯。", ""))                # 标签 + 短 → tier 1
+    return out
+
+
+def test_select_buckets_disjoint_and_deterministic():
+    entries = _big_entries(200)
+    n_random, n_risk = spot_budget(200, 0.05)
+    assert (n_random, n_risk) == (3, 7)
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(42))
+    assert len(rt) == n_random and len(rk) == n_risk
+    assert set(rt).isdisjoint(rk)  # 两桶不相交
+    assert rt == sorted(rt) and rk == sorted(rk)
+    assert all(0 <= i < 200 for i in rt + rk)
+    # 同 seed → 同选择；换 seed → 不同选择
+    assert select_spot_targets(entries, n_random, n_risk, random.Random(42)) == (rt, rk)
+    assert select_spot_targets(entries, n_random, n_risk, random.Random(43)) != (rt, rk)
+
+
+def test_select_cascade_fills_high_tiers_first():
+    long_tx = "这是一段足够长的旁白文字，用来撑满字数。"
+    E = lambda sp, tx: {"speaker": sp, "text": tx, "instruct": ""}
+    # 仅两个说话人 → 无多角色特征；tier = 无标签 + 短
+    entries = (
+        [E("林某", "林某说" + long_tx) for _ in range(5)]   # tier 0 ×5
+        + [E("李四", long_tx) for _ in range(4)]            # tier 1 ×4
+        + [E("林某", "林某说嗯。") for _ in range(4)]        # tier 1 ×4
+        + [E("李四", "嗯。") for _ in range(3)]             # tier 2 ×3
+    )
+    tier_of = [_risk_tier(entries[i], entries, i) for i in range(len(entries))]
+    assert tier_of == [0] * 5 + [1] * 8 + [2] * 3  # 层构成钉死
+    # 预算 12 > tier1+2 可用 11 → 必然动用 tier 0 补足（预算恒用满）
+    n_random, n_risk = 1, 12
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(7))
+    assert len(rt) == 1 and len(rk) == n_risk
+    assert set(rt).isdisjoint(rk)
+    # 级联不变量：抽中了 tier k，则所有更高 tier 的（非随机桶）条目都已抽中
+    in_rk = set(rk)
+    for k in range(3):
+        if any(tier_of[i] == k for i in in_rk):
+            for higher in range(k + 1, 4):
+                for i in range(len(entries)):
+                    if tier_of[i] == higher and i not in rt:
+                        assert i in in_rk, (k, higher, i)
+    # tier 0 补足必然发生
+    assert any(tier_of[i] == 0 for i in in_rk)
+    # 同 seed → 同选择
+    assert select_spot_targets(entries, 1, 12, random.Random(7)) == (rt, rk)
+
+
+def test_spot_history_append_keeps_last_cap(tmp_path, monkeypatch, workspace):
+    handle = _Handle()
+    for i in range(55):
+        _append_spot_history(handle, f"book{i:02d}", {
+            "rate": 0.05,
+            "random_n": 10, "random_errors": i % 3, "random_rate": (i % 3) / 10,
+            "risk_n": 20, "risk_errors": i % 2,
+        })
+    data = json.loads(
+        (workspace / "config" / "spot_check_history.json").read_bytes().decode("utf-8"))
+    runs = data["runs"]
+    assert len(runs) == SPOT_CHECK_HISTORY_CAP  # 55 条 → 丢最旧的 5 条
+    assert [r["file"] for r in runs] == [f"book{i:02d}" for i in range(5, 55)]
+    first = runs[0]
+    assert first["file"] == "book05"
+    assert first["rate"] == 0.05
+    assert first["random"] == {"n": 10, "errors": 2, "rate": 0.2}
+    assert first["risk"] == {"n": 20, "errors": 1}
+    assert first["ts"]
+
+
+def test_spot_history_corrupt_or_missing(tmp_path, monkeypatch, workspace):
+    (workspace / "config").mkdir(parents=True, exist_ok=True)
+    hist = workspace / "config" / "spot_check_history.json"
+    hist.write_bytes(b"{corrupt")
+    assert _load_spot_history() == []  # 损坏 → 空历史（不抛）
+    hist.write_bytes(b'{"runs": "not-a-list"}')
+    assert _load_spot_history() == []
+    hist.unlink()
+    assert _load_spot_history() == []  # 缺失 → 空历史
+
+
+def test_spot_off_makes_zero_llm_calls(monkeypatch):
+    def urlopen(req, *a, **k):
+        raise AssertionError("no LLM call when spot is off")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+    res, st = spot_check_speakers(
+        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.0)
+    assert res is entries
+    assert st == {
+        "checked": 0, "fixed": 0, "rate": 0.0,
+        "random_n": 0, "random_errors": 0, "random_rate": None,
+        "risk_n": 0, "risk_errors": 0,
+    }
+    # check=None → 同样关闭（无批几何 / 提示词）
+    res, st = spot_check_speakers(
+        _Handle(), _LLM, GenerationConfig(), None, entries, 0.05)
+    assert res is entries and st["checked"] == 0
+
+
+# 6 条小文件：context_window=10 → 任何目标组合都只有一组（一次调用）
+_SPOT_FIXTURE = [
+    {"speaker": "NARRATOR", "text": "夜色渐浓，街上的行人稀落下来。", "instruct": "a"},
+    {"speaker": "林某", "text": f"{LQ}你终于来了。{RQ}", "instruct": "b"},
+    {"speaker": "林某", "text": "他站在门口，半天没有出声。", "instruct": "c"},
+    {"speaker": "NARRATOR", "text": f"{LQ}嗯，路上堵。{RQ}", "instruct": "d"},
+    {"speaker": "李四", "text": f"{SQ}知道了。{SQ}", "instruct": "e"},
+    {"speaker": "NARRATOR", "text": "两人转身，走进了巷子深处。", "instruct": "f"},
+]
+_SPOT_CHECK = SpeakerCheckConfig(batch_size=20, context_window=10)
+
+
+def test_spot_zero_disagreement_one_call_no_change(monkeypatch):
+    # 首判与原判全同 → 每组恰 1 次调用、零改动、原列表对象原样返回
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+    n_random, n_risk = spot_budget(len(entries), 0.5)
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(1))
+    targets = sorted(set(rt) | set(rk))
+    assert len(targets) == n_random + n_risk
+    payload = json.dumps({"results": [
+        {"index": t, "speaker": entries[t]["speaker"]} for t in targets
+    ]}, ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(payload))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    result, stats = spot_check_speakers(
+        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+    assert calls["n"] == 1  # 无分歧 → 无重试
+    assert result is entries  # 零修正 → 原列表对象
+    assert stats["checked"] == len(targets)
+    assert stats["fixed"] == 0
+    assert stats["random_errors"] == 0 and stats["risk_errors"] == 0
+
+
+def test_spot_21_majority_applies_after_two_calls(monkeypatch):
+    # 模型恒判「林某」：非林某目标 → [原值, 林某, 林某] = 2:1 → 首判 + 1 重试即停
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+    n_random, n_risk = spot_budget(len(entries), 0.5)
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(1))
+    targets = sorted(set(rt) | set(rk))
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        payload = json.dumps({"results": [
+            {"index": t, "speaker": "林某"} for t in targets
+        ]}, ensure_ascii=False)
+        return _BodyResp(_chat_payload(payload))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    result, stats = spot_check_speakers(
+        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+
+    flipped = [t for t in targets if entries[t]["speaker"] != "林某"]
+    assert flipped  # 6 条中至多 2 条是林某 → 必有可翻转目标
+    assert calls["n"] == 2  # 首判 + 1 次重试（2:1 早停，无第 2/3 次）
+    assert stats["fixed"] == len(flipped)
+    assert [e["speaker"] for e in result] == [
+        "林某" if t in flipped else e["speaker"] for t, e in enumerate(entries)
+    ]
+    # 只改 speaker：text / instruct 一律不动
+    for t in flipped:
+        assert result[t]["text"] == entries[t]["text"]
+        assert result[t]["instruct"] == entries[t]["instruct"]
+    for t, e in enumerate(result):
+        if t not in flipped:
+            assert e == entries[t]
+
+
+def test_spot_no_consensus_four_calls_keeps_original(monkeypatch):
+    # 每次调用都换一个全新说话人 → 5 票 5 样 → 3 次重试跑满 → 保留原值
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+    n_random, n_risk = spot_budget(len(entries), 0.5)
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(1))
+    targets = sorted(set(rt) | set(rk))
+    seq = ["王某", "赵某", "孙某", "周某"]  # 均不在夹具说话人集合里
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        sp = seq[min(calls["n"] - 1, len(seq) - 1)]
+        payload = json.dumps({"results": [
+            {"index": t, "speaker": sp} for t in targets
+        ]}, ensure_ascii=False)
+        return _BodyResp(_chat_payload(payload))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    result, stats = spot_check_speakers(
+        _Handle(), _LLM, GenerationConfig(), _SPOT_CHECK, entries, 0.5, random.Random(1))
+
+    assert calls["n"] == 4  # 首判 + 3 次重试（始终无严格多数）
+    assert stats["fixed"] == 0
+    assert result is entries  # 全部保留 → 原列表对象
+
+
+def test_spot_quote_strip_adoption_rules(monkeypatch):
+    # 零分歧（重申原 speaker）+ 可选 text 键的三条采纳规则（rate=1.0 → 全量 6 条）：
+    #  - 与「仅去外层引号」机械值严格一致 + 角色 → 采纳（写入计算值）
+    #  - 不符 → WARNING + 忽略
+    #  - 终值 NARRATOR → 绝不剥
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+    n_random, n_risk = spot_budget(len(entries), 1.0)
+    rt, rk = select_spot_targets(entries, n_random, n_risk, random.Random(1))
+    targets = sorted(set(rt) | set(rk))
+    assert targets == list(range(6))
+
+    from backend.engines.speaker_check import strip_outer_quotes
+
+    class _LogHandle(_Handle):
+        def __init__(self):
+            super().__init__()
+            self.logs: list = []
+
+        def log(self, msg, level=None):
+            self.logs.append((level, str(msg)))
+
+    handle = _LogHandle()
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        items = []
+        for t in targets:
+            item = {"index": t, "speaker": entries[t]["speaker"]}
+            stripped = strip_outer_quotes(entries[t]["text"] or "")
+            if stripped:
+                if entries[t]["speaker"] == "NARRATOR":
+                    item["text"] = stripped           # 终值 NARRATOR → 必须忽略
+                elif t == 1:
+                    item["text"] = stripped + "改"    # 不符 → WARNING + 忽略
+                else:
+                    item["text"] = stripped           # 严格一致 → 采纳
+            items.append(item)
+        return _BodyResp(_chat_payload(json.dumps({"results": items}, ensure_ascii=False)))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    result, stats = spot_check_speakers(
+        handle, _LLM, GenerationConfig(), _SPOT_CHECK, entries, 1.0, random.Random(1))
+
+    assert calls["n"] == 1  # 零分歧 → 无重试
+    assert stats["fixed"] == 0
+    # 条目 4（李四，直引号包裹）→ 采纳（写入机械计算值）
+    assert result[4]["text"] == strip_outer_quotes(entries[4]["text"])
+    assert result[4]["text"] != entries[4]["text"]
+    # 条目 1（林某包裹，回值不符）→ 保持原样
+    assert result[1]["text"] == entries[1]["text"]
+    # 条目 3（NARRATOR 包裹）→ 不剥
+    assert result[3]["text"] == entries[3]["text"]
+    # 其余条目整体不动；instruct 全程不动
+    for t in (0, 2, 5):
+        assert result[t] == entries[t]
+    assert all(r["instruct"] == e["instruct"] for r, e in zip(result, entries))
+    # 不符回值产生了 WARNING
+    assert any(level == "WARNING" for level, _ in handle.logs)
+
+
+def test_spot_cancel_propagates_and_changes_nothing(monkeypatch):
+    entries = [dict(e) for e in _SPOT_FIXTURE]
+
+    def urlopen(req, *a, **k):
+        raise AssertionError("no LLM call may happen once cancelled")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    with pytest.raises(TaskCancelled):
+        spot_check_speakers(
+            _Handle(cancelled=True), _LLM, GenerationConfig(),
+            _SPOT_CHECK, entries, 0.5, random.Random(1))
+    # 输入列表原样（浅拷贝在取消前不落地）
+    assert entries == [dict(e) for e in _SPOT_FIXTURE]
+
+
+def test_generate_file_e2e_spot_check(tmp_path, monkeypatch, workspace):
+    # 1 解析 + spot 首判 + 1 次投票重试 = 3 次调用。纯随机桶目标被（每次回复都）改判为
+    # 花名册内另一角色 → 2:1 → 应用并随基文件写出；读数进 result 与历史文件。
+    source = (
+        "夜色像潮水一样漫进街巷。\n"
+        f"林某说：{LQ}这件事要慎重。{RQ}\n"
+        f"李四：{SQ}嗯，好。{SQ}\n"
+        "他点了点头，没有再说什么。\n"
+    )
+    parse_entries = [
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "a"},
+        {"speaker": "林某", "text": f"{LQ}这件事要慎重。{RQ}", "instruct": "b"},
+        {"speaker": "NARRATOR", "text": f"{SQ}嗯，好。{SQ}", "instruct": "c"},  # 对白藏在旁白
+        {"speaker": "NARRATOR", "text": "他点了点头，没有再说什么。", "instruct": "d"},
+    ]
+    parse_reply = json.dumps(parse_entries, ensure_ascii=False)
+    rate = 1.0
+    n_random, n_risk = spot_budget(len(parse_entries), rate)
+    assert (n_random, n_risk) == (1, 3)
+    rng_seed = 42
+    rt, rk = select_spot_targets(parse_entries, n_random, n_risk,
+                                 random.Random(rng_seed))
+    assert rt  # 纯随机仪表桶非空
+    flip = rt[0]
+    wrong = "李四" if parse_entries[flip]["speaker"] != "李四" else "林某"
+    targets = sorted(set(rt) | set(rk))
+
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        if "SOURCE TEXT:" in user:
+            return _BodyResp(_chat_payload(parse_reply))
+        payload = json.dumps({"results": [
+            {"index": t, "speaker": wrong if t == flip else parse_entries[t]["speaker"]}
+            for t in targets
+        ]}, ensure_ascii=False)
+        return _BodyResp(_chat_payload(payload))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(spot_check_rate=rate),
+        SpeakerCheckConfig(context_window=10),
+        rng=random.Random(rng_seed),
+    )
+
+    assert calls["n"] == 3  # 1 解析 + spot 首判 + 1 次投票重试
+    # 修正已随基文件写出——翻牌条目本身是角色，永不被合并，下标不受影响
+    out = json.loads((workspace / "03_parsed_json" / "chapter.json").read_text("utf-8"))
+    assert out[flip]["speaker"] == wrong
+    # 其余条目 = 翻牌后的列表经机械旁白合并（spot 阶段在合并之前——与引擎同一确定性链）
+    post = [dict(e) for e in parse_entries]
+    post[flip]["speaker"] = wrong
+    expected, _merged = merge_adjacent_narrator(post, is_chapter_title)
+    assert [(e["speaker"], e["text"]) for e in out] == \
+        [(e["speaker"], e["text"]) for e in expected]
+    assert result["count"] == len(expected)
+    assert result["merged_narrator"] == _merged
+    # 六个 result 字段
+    assert result["spot_checked"] == len(targets)
+    assert result["spot_fixed"] == 1
+    assert result["spot_rate"] == rate
+    assert result["spot_random_n"] == n_random
+    assert result["spot_random_errors"] == 1  # 被改判的条目属纯随机桶
+    assert result["spot_random_rate"] == 1.0 / n_random
+    # 历史文件含本书读数（config/ 下，绝不进 03_parsed_json/）
+    hist = json.loads(
+        (workspace / "config" / "spot_check_history.json").read_bytes().decode("utf-8"))
+    assert len(hist["runs"]) == 1
+    run = hist["runs"][0]
+    assert run["file"] == "chapter"
+    assert run["rate"] == rate
+    assert run["random"] == {"n": n_random, "errors": 1, "rate": 1.0 / n_random}
+    assert run["risk"]["n"] == n_risk
+    assert run["risk"]["errors"] == 0
+    assert run["ts"]
+    # 解析产物目录里只有基文件（历史文件不得污染「全部文件」聚合）
+    assert [p.name for p in (workspace / "03_parsed_json").iterdir()] == ["chapter.json"]
+
+
+def test_generate_file_cancel_mid_spot_writes_nothing(tmp_path, monkeypatch, workspace):
+    # 取消落在 spot 阶段的 LLM 调用上 → TaskCancelled 上抛：基文件与历史文件都不落盘
+    # （两者都只在阶段整体返回之后才写）。
+    source = (
+        "夜色像潮水一样漫进街巷。\n"
+        f"林某说：{LQ}这件事要慎重。{RQ}\n"
+        "他走了。\n"
+    )
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "a"},
+        {"speaker": "林某", "text": f"{LQ}这件事要慎重。{RQ}", "instruct": "b"},
+        {"speaker": "NARRATOR", "text": "他走了。", "instruct": "c"},
+    ], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        if "SOURCE TEXT:" in user:
+            return _BodyResp(_chat_payload(parse_reply))
+        raise TaskCancelled("cancel landed in the spot stage")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))
+    with pytest.raises(TaskCancelled):
+        generate_file(
+            _Handle(), str(src), _LLM, PromptsConfig(),
+            GenerationConfig(spot_check_rate=1.0),
+            SpeakerCheckConfig(context_window=10),
+        )
+    assert not (workspace / "03_parsed_json" / "chapter.json").exists()
+    assert not (workspace / "config" / "spot_check_history.json").exists()

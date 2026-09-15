@@ -15,8 +15,10 @@ Two mechanisms, and nothing else:
   one: fixing attribution is 角色匹配检查's job) or ``split`` (narration mixed with a
   character's line, or lines of 2+ characters) into ``parts``. A split is adopted only if
   it passes ALL gates (``validate_split_parts``): ≥2 well-formed parts; the parts' texts
-  (whitespace-stripped) concatenate EXACTLY to the entry's text; every part speaker is
-  ``NARRATOR`` or in the file-wide character roster; the parts hold ≥2 distinct speakers.
+  re-assemble the entry's text (whitespace + quote characters stripped on both sides,
+  tolerating the prompt-permitted split-point punctuation fix at part seams); every part
+  speaker is ``NARRATOR`` or in the file-wide character roster; the parts hold ≥2
+  distinct speakers.
   Any failure rejects the whole split — no voting, because a split is all-or-nothing and
   the gates make text corruption impossible. Gate-rejected splits get ONE retry pass
   (``group_retry_indices`` + the retry block in ``mix_check_file``): after the batch loop,
@@ -73,6 +75,62 @@ PUNCT_EXTRA = "~〜～"  # ~ 〜 ～
 def _no_ws(text: str) -> str:
     """All whitespace characters removed (basis for deletability + exact-partition checks)."""
     return "".join(ch for ch in text if not ch.isspace())
+
+
+# Quote characters treated as removable around dialogue parts. The mix-check prompt
+# permits the model to strip them, so the re-assembly gate drops them on BOTH sides
+# (symmetrically) — the comparison is quote-insensitive, which is exactly what makes
+# the permitted edit checkable while still catching any real text corruption.
+_QUOTE_CHARS = frozenset(
+    '\u0022\u0027\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f'  # " ' curly-double curly-single corner-open corner-close
+)
+
+
+def _norm_reassembly(text: str) -> str:
+    """Comparison form for the re-assembly gate: all whitespace and quote characters
+    removed (applied identically to the parts and the original, so the prompt-permitted
+    quote removal around dialogue parts is transparent to the check)."""
+    return "".join(ch for ch in _no_ws(text) if ch not in _QUOTE_CHARS)
+
+
+# The split-point fix the prompt permits: a dangling "：" / "，" left at a seam,
+# rewritten to "。" (full-width forms — the only ones Chinese text carries).
+_SEAM_ORIG_CHARS = frozenset("：，")
+_SEAM_PART_CHAR = "。"
+
+
+def _parts_reassemble(parts: list, original_text: str) -> bool:
+    """Whether the parts' texts re-assemble the original, tolerating exactly the two
+    edits the mix-check prompt permits: (a) quotation marks removed around dialogue
+    parts; (b) a dangling "：" / "，" left at a split point rewritten to "。".
+
+    Both sides are compared in the quote/whitespace-stripped form, so edit (a) is
+    transparent. A character mismatch is accepted ONLY at a part seam (the last char of
+    one part or the first of the next) where the original holds "：" / "，" and the part
+    holds "。" — any other mismatch, or a length mismatch, fails the gate, so text
+    corruption is still impossible to smuggle in.
+    """
+    norms = [_norm_reassembly(p["text"]) for p in parts]
+    concat = "".join(norms)
+    orig = _norm_reassembly(original_text)
+    if len(concat) != len(orig):
+        return False
+    seams: set = set()
+    pos = 0
+    for k, t in enumerate(norms):
+        if t:
+            if k > 0:
+                seams.add(pos)                # leading char of part k
+            if k < len(norms) - 1:
+                seams.add(pos + len(t) - 1)   # trailing char of part k
+        pos += len(t)
+    for i, (pc, oc) in enumerate(zip(concat, orig)):
+        if pc == oc:
+            continue
+        if i in seams and pc == _SEAM_PART_CHAR and oc in _SEAM_ORIG_CHARS:
+            continue  # the documented split-point punctuation fix
+        return False
+    return True
 
 
 def is_deletable_text(text: str | None) -> bool:
@@ -206,9 +264,12 @@ def validate_split_parts(original: dict, parts, allowed: frozenset) -> tuple[boo
 
     ANY failure rejects the whole split — the entry is kept unchanged. Gates, in order:
 
-    - (a) ≥2 parts, each a dict with non-empty ``speaker`` and non-blank ``text``;
-    - (b) the parts' texts (whitespace-stripped) concatenate EXACTLY to the entry's text
-      (whitespace-stripped) — no reordering, nothing dropped, nothing added;
+    - (a) ≥2 parts, each a dict with non-empty ``speaker`` and content-bearing ``text``
+      (non-empty after whitespace/quote removal);
+    - (b) the parts' texts re-assemble the entry's text — compared with whitespace and
+      quote characters stripped on both sides, tolerating the prompt-permitted split-point
+      punctuation fix at part seams (see ``_parts_reassemble``) — no reordering, nothing
+      dropped, nothing added;
     - (c) every part speaker ∈ ``allowed`` (``NARRATOR`` ∪ the file-wide roster);
     - (d) the parts hold ≥2 DISTINCT speakers (a same-subject "split" is not a mix).
     """
@@ -220,10 +281,10 @@ def validate_split_parts(original: dict, parts, allowed: frozenset) -> tuple[boo
         sp, tx = p.get("speaker"), p.get("text")
         if not (isinstance(sp, str) and sp.strip()):
             return False, "拆分段缺少 speaker"
-        if not (isinstance(tx, str) and _no_ws(tx)):
+        if not (isinstance(tx, str) and _norm_reassembly(tx)):
             return False, "拆分段 text 为空"
-    if "".join(_no_ws(p["text"]) for p in parts) != _no_ws(original.get("text") or ""):
-        return False, "拆分段文字无法逐字拼回原文"
+    if not _parts_reassemble(parts, original.get("text") or ""):
+        return False, "拆分段文字无法拼回原文（超出「去引号 / 切分点标点修正」两种允许编辑）"
     speakers = [p["speaker"].strip() for p in parts]
     for sp in speakers:
         if sp not in allowed:
@@ -279,8 +340,9 @@ def _mix_user_prompt(template: str, context: str, roster: list[str], target_coun
     if retry_notes:
         extra.append(
             "【重试提示】下列条目上一轮被判 split，但拆分未通过校验（条目保持原样）。请重新判定："
-            "确属多主体则严格按规则重新拆分（各段 text 必须是原条 text 的逐字切片，"
-            "不得丢字 / 添字 / 重排，speaker 必须来自窗口或本书角色），否则判 keep："
+            "确属多主体则严格按规则重新拆分（各段 text 必须是原条 text 的切片，仅允许"
+            "去除对话引号、修正切分点悬空标点两种编辑，不得丢字 / 添字 / 重排，"
+            "speaker 必须来自窗口或本书角色），否则判 keep："
         )
         extra.extend(f"- 窗口中 index={idx} 的条目：{reason}" for idx, reason in retry_notes)
     return body + "\n\n" + "\n".join(extra)

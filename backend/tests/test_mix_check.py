@@ -8,9 +8,10 @@ pattern ``test_speaker_check.py`` uses).
   entries makes ZERO LLM calls);
 - the LLM ``keep`` / ``split`` verdict parser (shape-tolerant, non-targets dropped,
   garbage → keep, never guess);
-- the four gates of ``validate_split_parts`` (≥2 well-formed parts, verbatim
-  re-assembly of the original text, file-wide roster whitelist, ≥2 distinct
-  subjects) — ANY failure rejects the whole split;
+- the four gates of ``validate_split_parts`` (≥2 well-formed parts, re-assembly of
+  the original text — quote/whitespace-stripped on both sides, tolerating the
+  prompt-permitted split-point punctuation fix at part seams — file-wide roster
+  whitelist, ≥2 distinct subjects) — ANY failure rejects the whole split;
 - the two retry mechanisms: (a) a batch whose reply is unreadable (call failure or
   zero usable verdicts) is re-asked ONCE in place, immediately — its recovered
   verdicts process normally and the batch never waits for the end pass; (b) the
@@ -215,6 +216,72 @@ def test_validate_split_rejects_single_subject():
         frozenset({"NARRATOR"}),
     )
     assert not ok and "≥2 个不同主体" in why
+
+
+def test_validate_split_tolerates_quote_removal():
+    # The prompt permits the model to strip the quotation marks around dialogue parts:
+    # the re-assembly gate compares quote-insensitively, so the stripped parts still
+    # re-assemble the original.
+    original = {"speaker": "NARRATOR", "text": "林晚抬头：「你终于来了。」窗外雨声渐紧。"}
+    allowed = frozenset({"NARRATOR", "林晚"})
+    ok, _ = validate_split_parts(
+        original,
+        [
+            {"speaker": "NARRATOR", "text": "林晚抬头："},
+            {"speaker": "林晚", "text": "你终于来了。"},  # quotes stripped by the model
+            {"speaker": "NARRATOR", "text": "窗外雨声渐紧。"},
+        ],
+        allowed,
+    )
+    assert ok
+
+
+def test_validate_split_tolerates_seam_punctuation_fix():
+    # The prompt permits fixing a dangling "：" / "，" left at a split point (→ "。") —
+    # accepted only at part seams (trailing char of one part / leading of the next).
+    original = {"speaker": "NARRATOR", "text": "林晚抬头：「你来了。」，她转身。"}
+    allowed = frozenset({"NARRATOR", "林晚"})
+    ok, _ = validate_split_parts(
+        original,
+        [
+            {"speaker": "NARRATOR", "text": "林晚抬头。"},   # trailing "：" fixed at the seam
+            {"speaker": "林晚", "text": "「你来了。」"},
+            {"speaker": "NARRATOR", "text": "。她转身。"},   # leading "，" fixed at the seam
+        ],
+        allowed,
+    )
+    assert ok
+
+
+def test_validate_split_rejects_mid_part_punctuation_change():
+    # The seam fix does NOT apply mid-part: a "：" rewritten to "，" away from any part
+    # boundary is a real text change → rejected (only the two documented edits pass).
+    original = {"speaker": "NARRATOR", "text": "林晚抬头：「你来了。」她转身。"}
+    allowed = frozenset({"NARRATOR", "林晚"})
+    ok, why = validate_split_parts(
+        original,
+        [
+            # "：" → "，" mid-part (the part continues with the quoted utterance).
+            {"speaker": "NARRATOR", "text": "林晚抬头，「你来了。」"},
+            {"speaker": "NARRATOR", "text": "她转身。"},
+        ],
+        allowed,
+    )
+    assert not ok and "无法拼回原文" in why
+
+
+def test_validate_split_rejects_quote_only_part():
+    # A part whose text is nothing but quotation marks carries no content → gate (a).
+    original = {"speaker": "NARRATOR", "text": "「你来了。」她转身。"}
+    ok, why = validate_split_parts(
+        original,
+        [
+            {"speaker": "林晚", "text": "「"},
+            {"speaker": "NARRATOR", "text": "你来了。」她转身。"},
+        ],
+        frozenset({"NARRATOR", "林晚"}),
+    )
+    assert not ok and "text 为空" in why
 
 
 # --------------------------------------------------------------------------- #
@@ -437,6 +504,49 @@ def test_mix_file_split_narration_plus_line(tmp_path, monkeypatch, inert_layout)
     assert "target" in user  # the window JSON (with target flags) is embedded
 
 
+def test_mix_file_adopts_prompt_style_split(tmp_path, monkeypatch, inert_layout):
+    """The model applies the two prompt-permitted edits (quotes stripped around the
+    dialogue part, the dangling "：" at the split point fixed to "。") → the split still
+    clears the re-assembly gate and the unwrapped texts land in the artifact. (林晚 must
+    sit in the roster — the part-speaker whitelist is NARRATOR ∪ roster — so the file
+    carries a stored 林晚 entry, as in the class-1 fixture.)"""
+    entries = [
+        _entry("NARRATOR", "夜色像潮水一样漫进街巷。"),
+        _entry("NARRATOR", "林晚抬头：「你终于来了。」窗外的雨声一阵紧似一阵。"),
+        _entry("林晚", "「我等你很久了。」"),
+    ]
+    src = _write(tmp_path, "chapter2.json", entries)
+    before = src.read_bytes()
+    parts = [
+        {"speaker": "NARRATOR", "text": "林晚抬头。"},
+        {"speaker": "林晚", "text": "你终于来了。"},
+        {"speaker": "NARRATOR", "text": "窗外的雨声一阵紧似一阵。"},
+    ]
+    calls = _seq_urlopen(monkeypatch, [_mix_completion([
+        {"index": 0, "action": "keep"},
+        {"index": 1, "action": "split", "parts": parts},
+        {"index": 2, "action": "keep"},
+    ])])
+
+    result = mix_check_file(_Handle(), str(src), _llm_cfg(), MixCheckConfig(),
+                           SpeakerCheckConfig(context_window=0), GenerationConfig())
+
+    assert calls["n"] == 1
+    assert src.read_bytes() == before  # the base file is byte-for-byte unchanged
+    checked = json.loads((tmp_path / "chapter2_checked.json").read_text("utf-8"))
+    assert checked == [
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "tone"},
+        {"speaker": "NARRATOR", "text": "林晚抬头。", "instruct": ""},
+        {"speaker": "林晚", "text": "你终于来了。", "instruct": ""},
+        {"speaker": "NARRATOR", "text": "窗外的雨声一阵紧似一阵。", "instruct": ""},
+        {"speaker": "林晚", "text": "「我等你很久了。」", "instruct": "tone"},
+    ]
+    assert result["splits"] == 1
+    assert result["parts"] == 3
+    assert result["rejected"] == 0
+    assert result["abandoned"] == 0
+
+
 def test_mix_file_split_multi_character(tmp_path, monkeypatch, inert_layout):
     """Class 2: one entry holding lines of TWO characters (plus a narration seam) → split."""
     entries = [
@@ -635,7 +745,7 @@ def test_mix_retry_rescues_bad_split(tmp_path, monkeypatch, inert_layout):
     # The retry call carries the gate reason and a ±1 context window around index 2.
     retry_user = calls["bodies"][1]["messages"][1]["content"]
     assert "【重试提示】" in retry_user
-    assert "逐字拼回" in retry_user  # the failed gate's reason, so the model can fix it
+    assert "无法拼回原文" in retry_user  # the failed gate's reason, so the model can fix it
     assert "index=2" in retry_user  # the hint uses the window's index field (0-based)
     assert '"index": 2' in retry_user and '"target": true' in retry_user
     assert '"index": 1' in retry_user  # the leading context entry is present

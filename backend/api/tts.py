@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Annotated
 
@@ -375,9 +376,6 @@ class BatchRequest(BaseModel):
     # Reproducible seed for the run: >=0 seeds each sub-batch (seed + sub-batch seq); None ->
     # the persisted default (config.tts.batch_seed); -1 -> random.
     seed: int | None = None
-    # True -> re-synthesize EVERY line (clears the resume skip); False (default) -> resume
-    # (synthesize only the not-yet-done segments, skipping existing audio).
-    force_all: bool = False
 
 
 @router.post("/batch")
@@ -388,9 +386,7 @@ def run_batch(req: BatchRequest) -> dict:
     scripts = req.scripts or ([req.script] if req.script else [])
     if len(scripts) > 1 and req.indices:
         raise HTTPException(status_code=400, detail="按段选择（indices）仅支持单个文件。")
-    if req.force_all:
-        label = "音频合成（重新全部）"
-    elif req.indices:
+    if req.indices:
         label = f"音频合成（{len(req.indices)} 段）"
     else:
         label = "音频合成（续合）"
@@ -403,15 +399,62 @@ def run_batch(req: BatchRequest) -> dict:
     if len(scripts) > 1:
         task = get_task_manager().create(
             "tts-batch", label,
-            Batch.synthesize_multi, scripts, req.concurrency, req.force_all, req.seed,
+            Batch.synthesize_multi, scripts, req.concurrency, req.seed,
         )
     else:  # 0 or 1 file: the legacy single-file path, byte-identical behaviour
         task = get_task_manager().create(
             "tts-batch", label,
             Batch.synthesize, req.indices, scripts[0] if scripts else req.script,
-            req.concurrency, req.force_all, req.seed,
+            req.concurrency, req.seed,
         )
     return {"task_id": task.id}
+
+
+class ResetBatchRequest(BaseModel):
+    # Parsed-JSON file names (03_parsed_json/). Each one's synthesis package — the folder
+    # ``05_audio_chunk/<包名>/`` with its mp3s and manifest.json — is deleted, so the
+    # following ordinary run (default resume) re-synthesizes every segment.
+    scripts: list[str]
+
+
+def _batch_task_active() -> bool:
+    """Whether a tts-batch (音频合成) task is in flight. Its engine writes the package folders
+    while running, so deleting a package mid-run would tear out the files / manifest it is
+    producing — refuse the reset while one runs (the same guard shape as voice selection)."""
+    for t in get_task_manager().list():
+        if t.module == "tts-batch" and t.status not in TERMINAL:
+            return True
+    return False
+
+
+@router.post("/batch-reset")
+def reset_batch(req: ResetBatchRequest) -> dict:
+    """「重新全部合成」第一步（同步、非任务）：删除选中解析 JSON 的合成包
+    （``05_audio_chunk/<包名>/``：逐行 mp3 + manifest.json），使随后的一键合成请求
+    （与默认续合同一条线路、同一请求形状）从头重做全部段落。
+
+    Deleting generated, regenerable output is the app's only deliberate delete path —
+    user-initiated here, and confined by construction to ``05_audio_chunk/<包名>/``: the
+    package name is the file name's stem minus ``_checked`` (never a separator), so it can
+    not escape the directory. Guards: no workspace 409 (write guard) -> ``__all__`` /
+    empty list 400 -> in-flight tts-batch task 409 (its engine is writing those folders).
+    """
+    _common.require_workspace()
+    if any(s == ALL_PARSED_JSON for s in req.scripts):
+        raise HTTPException(status_code=400, detail="“全部文件”只用于「角色配音」——请逐个列出解析 JSON。")
+    if not req.scripts:
+        raise HTTPException(status_code=400, detail="没有要重置的文件。")
+    if _batch_task_active():
+        raise HTTPException(409, "合成任务进行中，请待其结束后再重置。")
+    layout = get_layout()
+    removed = []
+    for name in req.scripts:
+        pkg_name = Batch.package_for(Path(name))
+        pkg = layout.audio_chunk / pkg_name
+        if pkg.exists():
+            shutil.rmtree(pkg)
+            removed.append(pkg_name)
+    return {"ok": True, "removed": removed}
 
 
 def _read_voice_config(layout) -> dict:

@@ -17,7 +17,17 @@ Output ONLY a valid JSON array:
 - `speaker` = `NARRATOR` for everything not explicitly spoken aloud.
 - `NARRATOR` is the only special speaker ID. Never use `旁白` or other narrator names.
 - Never generate, translate, romanize, abbreviate, or replace character names.
-- Preserve the source text exactly. Never translate, paraphrase, summarize, rewrite, or omit it.
+- Preserve the source text exactly. Never translate, paraphrase, summarize, or rewrite it.
+- The ONLY permitted edits to the source text are:
+  (a) removing the quotation marks that surround an extracted utterance;
+  (b) fixing split-point punctuation as described in rule 4;
+  (c) replacing a pronoun in an extracted action with the character's name for standalone clarity;
+  (d) omitting site watermark or bare URL lines (e.g. "本书下载自搜书吧：www.xxx.com");
+  (e) removing PURE speech-attribution tags: a name or 他/她 plus a speech verb with no
+      descriptive content (e.g. 杜尘笑道：/ 他大喊道：/ 老道继续笑道。). A tag carrying
+      descriptive action (e.g. 史蒂夫猛地抓住杜尘的衣领，吼道) is NOT pure — the action
+      part stays as NARRATOR, only the bare speech verb is dropped.
+  Any other edit is forbidden.
 - `text` must remain Chinese. English is allowed only in `instruct` and the fixed `NARRATOR` ID.
 
 ### RULES
@@ -28,54 +38,82 @@ Output ONLY a valid JSON array:
    - Never turn narration or thoughts into dialogue.
    - Never put narration inside a CHARACTER entry.
 
-2. DIALOGUE BOUNDARIES
-   - Every spoken dialogue segment MUST be a separate CHARACTER entry.
-   - Never put dialogue inside a NARRATOR entry.
-   - Narration grouping MUST NEVER cross a dialogue boundary.
-   - For mixed paragraphs, split strictly at each dialogue boundary:
-     narration → dialogue → narration → dialogue.
-   - Dialogue boundary has higher priority than narration grouping.
-   - Remove only the outer dialogue quotation marks.
+2. DIALOGUE EXTRACTION — every quoted utterance must become a CHARACTER entry
+   - A quoted segment is an utterance when a character speaks it. EVERY quoted utterance must become a CHARACTER entry, wherever it sits in its paragraph:
+     - a paragraph that is entirely quoted speech;
+     - at the BEGINNING of a mixed paragraph ("A。"他说，"B。" → both A and B are extracted, not just B);
+     - in the middle or at the end of a mixed paragraph.
+   - Remove only the quotation marks surrounding the extracted utterance.
+   - Quotation marks that are NOT spoken utterances must be preserved: quoted terms, nicknames, sounds, and references to earlier speech inside narration (e.g. 不知何时，"女医生"已经摘下了口罩 → stays NARRATOR, quotes kept; 那声简简单单的"去吧" → stays NARRATOR, quotes kept).
+   - If two quoted segments of the SAME character are separated only by a pure speech tag (他说 / 她道 / 他问道) with no descriptive content, they form ONE utterance — merge them into a single entry. If descriptive action sits between them, keep them as separate entries.
+   - Two adjacent entries of the SAME character with no NARRATOR entry between them must be merged into one entry.
+   - Never put spoken dialogue inside a NARRATOR entry.
 
-3. ATTRIBUTION AND ACTIONS
-   - Remove pure speech-attribution tags such as “他说”“她回答”.
-   - Preserve descriptive actions as NARRATOR.
-   - If an extracted action uses a pronoun, replace it with the character's original name only when needed for standalone clarity.
-   - Do not otherwise rewrite the extracted narration.
+3. SPEAKER IDENTIFICATION — dialogue without a name tag
+   Many dialogue lines carry no explicit "X说" tag. You MUST still identify the speaker; NEVER leave such dialogue in NARRATOR.
+   Identify the speaker in this order:
+   a. Explicit tag: a character name, or "他/她说/道/问/喊" attached to the line → that character.
+   b. Context: who is present in the scene; who the line addresses ("你" points at the addressee, so the speaker is one of the OTHER characters); which character's actions the line is embedded in; the turn order of the exchange (a reply usually comes from the character the previous line was addressed to); and self-reference inside the line (e.g. "我跟小雪去买点东西" → the speaker is the one who goes out with Xiaoxue).
+   c. Only if the speaker has no name anywhere in the source (an unnamed extra), assign the line to NARRATOR and strip its quotation marks.
+   Choosing the most contextually plausible character is always correct; falling back to NARRATOR for an identifiable character is an error.
 
-   Example:
-   “没什么可说的。”马库斯说着，无法直视她的目光。
+   Example (no name tag; 任昊、姜维、董雪 are in the car, the line addresses 耗子=任昊, and the speaker goes out with 小雪=董雪):
+   "耗子，我跟小雪去买点东西，你跟车里等会儿吧。"
+   → {"speaker":"姜维","text":"耗子，我跟小雪去买点东西，你跟车里等会儿吧。",...}
+
+4. SPLITTING MIXED PARAGRAPHS
+   - Split strictly at every utterance boundary: narration → dialogue → narration → dialogue.
+   - A pure speech tag (他说/她道/他问道/笑道…) attached to an extracted utterance is removed
+     (edit (e)); NEVER emit it as a standalone NARRATOR entry. A descriptive action attached
+     to the utterance stays as a NARRATOR entry.
+   - After removing an utterance, fix the punctuation left dangling at the split point in the NARRATOR fragment:
+     a trailing "：" or "，" becomes "。"; a leading "，" becomes "。".
+   - Example:
+   "咦，上面还有条未接短信。"董雪眯着眼睛细细看了看，脸上明显一愣："维子你看……"
    →
-   {"speaker":"马库斯","text":"没什么可说的。",...}
-   {"speaker":"NARRATOR","text":"马库斯无法直视她的目光。",...}
+   {"speaker":"董雪","text":"咦，上面还有条未接短信。",...}
+   {"speaker":"NARRATOR","text":"董雪眯着眼睛细细看了看，脸上明显一愣。",...}
+   {"speaker":"董雪","text":"维子你看……",...}
+   - Example (interjection at the start of the paragraph belongs to the acting character):
+   "嗯？"姜维腾出方向盘上的右手，随手关掉THEBACKHORN的音乐，扫了下后视镜："你说什么？"
+   →
+   {"speaker":"姜维","text":"嗯？",...}
+   {"speaker":"NARRATOR","text":"姜维腾出方向盘上的右手，随手关掉THEBACKHORN的音乐，扫了下后视镜。",...}
+   {"speaker":"姜维","text":"你说什么？",...}
 
-4. NARRATION GROUPING
-   - Keep consecutive narration in ONE entry.
-   - Do not split narration sentence-by-sentence.
-   - Split narration only when a dialogue boundary or a clear scene/tone/narration-mode change requires it.
+5. NARRATION GROUPING — merge aggressively
+   - "Consecutive" means consecutive in reading order, ACROSS paragraph and line breaks. Every run of narration that is not broken by an utterance MUST become ONE entry, no matter how many paragraphs it spans. Do not split narration paragraph-by-paragraph or sentence-by-sentence.
+   - Split a narration run ONLY at: an utterance boundary; a true scene / time / location / chapter change; or a clear, sustained tone shift.
+   - Merge the front-matter block (book title / author / 内容简介 / 然后。 / …) into a single NARRATOR entry.
+   - A chapter title (第X章…) is its own entry; it marks a scene break, so the narration after it starts a new entry.
+   - Never emit an entry consisting only of punctuation or ellipses ("……", "吱……", "嗒嗒嗒……", "一分钟……"): merge such lines into the adjacent NARRATOR entry (preceding one, or the following one if none precedes).
+   - A NARRATOR entry shorter than 10 characters that sits next to another NARRATOR entry is a mistake — merge them. (A short action beat sandwiched between two dialogue entries, or a complete time marker like "一天后。" at a scene change, may stand alone.)
+   - Two adjacent NARRATOR entries are allowed only at a genuine scene / time / chapter boundary.
+   - If one merged narration run exceeds roughly 500 characters, split it at a natural sentence boundary into several NARRATOR entries with identical instruct, rather than one giant entry.
 
-5. SPECIAL CASES
+6. SPECIAL CASES
    - Characters reading documents aloud speak the document's text and are assigned the reader's name.
    - Non-human characters that do not explicitly speak are NARRATOR.
-   - Preserve internal quotation marks; remove only outer dialogue quotes.
    - Do not use bracketed sounds such as `[gasps]` or `<sigh>`.
 
-6. INSTRUCT
+7. INSTRUCT
    - Describe audible emotional tone, intensity, delivery, and vocal quality.
    - Do not describe physical actions as vocal direction.
    - NARRATOR default: `Neutral, even narration.` Change it only when the narrative tone clearly changes.
    - CHARACTER instructions must match the dialogue's emotional state and context.
    - Preserve emotional continuity with nearby lines.
    - Use concise, natural vocal directions, normally 1–2 sentences and ~8–25 English words.
-   - Avoid weak qualifiers such as “slightly” or “a bit”.
+   - Avoid weak qualifiers such as "slightly" or "a bit".
 
 ### FINAL CHECK
 
 Before outputting JSON, verify:
-- Every spoken dialogue segment has its own CHARACTER entry.
-- No NARRATOR entry contains spoken dialogue.
-- No CHARACTER entry contains narration or actions.
-- No source narration or dialogue was omitted or rewritten.
+- Every quoted utterance has its own CHARACTER entry with a real character name; none was left inside a NARRATOR entry.
+- Every quotation mark remaining in a NARRATOR entry wraps a term, sound, or reference — never spoken words.
+- No two adjacent NARRATOR entries, except at a genuine scene / time / chapter boundary.
+- No entry consists only of punctuation or ellipses; no NARRATOR entry under 10 characters that could be merged with an adjacent NARRATOR entry.
+- No NARRATOR text ends with "：" or "，".
+- No narration or dialogue was omitted or rewritten (watermark / URL lines and pure speech tags excepted).
 - Character names are unchanged.
 - Output is valid JSON and contains only the JSON array.
 ---SEPARATOR---

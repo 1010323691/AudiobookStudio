@@ -1,7 +1,9 @@
 """Offline tests for the Speaker-check engine (``backend/engines/speaker_check.py``).
 
 Pins the batch context-window builder, the per-target speaker parser, the majority vote,
-and the core invariants — "only ``speaker`` changes", "the original file is untouched",
+and the core invariants — "only ``speaker`` changes, plus the deterministic outer-quote
+strip of a character entry's ``text`` (the reply's optional ``text`` key, applied only
+when it matches the mechanically computed strip)", "the original file is untouched",
 disagreement voting (one first check pass, then up to 3 majority retries; a strict
 majority wins, and an entry still tied keeps its original speaker), and per-item
 failure isolation — with no network access: the LLM transport is a mocked
@@ -23,6 +25,8 @@ from backend.engines.speaker_check import (
     check_file,
     parse_speaker,
     parse_speaker_map,
+    parse_speaker_map_full,
+    strip_outer_quotes,
     target_indices,
 )
 
@@ -175,6 +179,64 @@ def test_parse_speaker_map_garbage_is_empty():
 
 
 # --------------------------------------------------------------------------- #
+# parse_speaker_map_full (batch reply WITH the optional "text" key)
+# --------------------------------------------------------------------------- #
+
+def test_parse_speaker_map_full_captures_text():
+    text = ('{"results": [{"index": 0, "speaker": "A", "text": "t0"},'
+            ' {"index": 1, "speaker": "B"}]}')
+    assert parse_speaker_map_full(text, [0, 1]) == {0: ("A", "t0"), 1: ("B", None)}
+
+
+def test_parse_speaker_map_full_ignores_non_targets_and_blank_text():
+    # A text for a non-target index is dropped; a blank text key is treated as absent.
+    text = ('{"results": [{"index": 0, "speaker": "A", "text": "  "},'
+            ' {"index": 9, "speaker": "X", "text": "z"}]}')
+    assert parse_speaker_map_full(text, [0, 1]) == {0: ("A", None)}
+
+
+def test_parse_speaker_map_full_old_contract_preserved():
+    # parse_speaker_map is the speaker projection of the full parser (same tolerance,
+    # text dropped) — the two can never disagree about who said what.
+    text = '{"results": [{"index": 3, "speaker": "A", "text": "t"}, {"index": 7, "speaker": "B"}]}'
+    full = parse_speaker_map_full(text, [3, 7])
+    assert {i: sp for i, (sp, _tx) in full.items()} == parse_speaker_map(text, [3, 7])
+
+
+# --------------------------------------------------------------------------- #
+# strip_outer_quotes (the deterministic text edit the check may apply)
+# --------------------------------------------------------------------------- #
+
+def test_strip_outer_quotes_all_supported_pairs():
+    assert strip_outer_quotes("“你终于来了。”") == "你终于来了。"
+    assert strip_outer_quotes("「快跑！」") == "快跑！"
+    assert strip_outer_quotes("『小心！』") == "小心！"
+    assert strip_outer_quotes("‘小声点。’") == "小声点。"
+    assert strip_outer_quotes('"hello"') == "hello"
+    assert strip_outer_quotes("'hi'") == "hi"
+
+
+def test_strip_outer_quotes_keeps_inner_quotes():
+    # Only the outermost pair is stripped — an inner quoted term is preserved.
+    # (The expected string is concatenated so the closing "。" is unambiguous.)
+    assert strip_outer_quotes("“他说「快跑」。”") == "他说「快跑」" + "。"
+
+
+def test_strip_outer_quotes_not_wrapped_is_none():
+    assert strip_outer_quotes("他走进了房间") is None
+    # A leading CLOSER (the pair is reversed) is not a wrap.
+    assert strip_outer_quotes("”你来了。“") is None
+
+
+def test_strip_outer_quotes_empty_interior_is_none():
+    assert strip_outer_quotes("“”") is None
+    assert strip_outer_quotes("「」") is None
+    assert strip_outer_quotes("“") is None
+    assert strip_outer_quotes("") is None
+    assert strip_outer_quotes(None) is None
+
+
+# --------------------------------------------------------------------------- #
 # _pick_majority (the vote)
 # --------------------------------------------------------------------------- #
 
@@ -235,24 +297,36 @@ def _completion(content: str) -> bytes:
 
 def _map_completion(pairs):
     """A completion whose content is ``{"results": [{"index": i, "speaker": s}, ...]}``."""
-    return _completion(json.dumps(
-        {"results": [{"index": i, "speaker": s} for i, s in pairs]},
-        ensure_ascii=False,
-    ))
+    return _map_completion_with_text([(i, s, None) for i, s in pairs])
+
+
+def _map_completion_with_text(pairs):
+    """Like ``_map_completion`` but each pair is ``(index, speaker, text?)``: a non-None
+    ``text`` adds the item's optional ``text`` key (the unwrapped utterance the check
+    prompt asks for)."""
+    items = []
+    for i, s, tx in pairs:
+        item = {"index": i, "speaker": s}
+        if tx is not None:
+            item["text"] = tx
+        items.append(item)
+    return _completion(json.dumps({"results": items}, ensure_ascii=False))
 
 
 class _Handle:
-    """Minimal TaskHandle. ``cancel_after=N`` makes the N+1th ``check()`` raise."""
+    """Minimal TaskHandle. ``cancel_after=N`` makes the N+1th ``check()`` raise.
+    ``logs`` collects ``(level, msg)`` pairs for assertion."""
 
     def __init__(self, cancel_after: int | None = None):
         self.cancel_after = cancel_after
         self._n = 0
+        self.logs = []
 
     def progress(self, *a, **k):
         pass
 
     def log(self, *a, **k):
-        pass
+        self.logs.append((a[1] if len(a) > 1 else "INFO", a[0]))
 
     def llm_rate(self, *a, **k):
         pass
@@ -284,13 +358,15 @@ def _write(tmp_path, name, entries):
 
 
 def _seq_urlopen(monkeypatch, completions):
-    """Mock ``urlopen`` to hand back ``completions`` in order; a clear error if over-called."""
-    calls = {"n": 0}
+    """Mock ``urlopen`` to hand back ``completions`` in order (recording each request
+    body); a clear error if the LLM is over-called."""
+    calls = {"n": 0, "bodies": []}
 
-    def urlopen(*a, **k):
+    def urlopen(req, *a, **k):
         calls["n"] += 1
         if calls["n"] > len(completions):
             raise AssertionError(f"LLM called {calls['n']} times, expected {len(completions)}")
+        calls["bodies"].append(json.loads(req.data.decode("utf-8")))
         return _BodyResp(completions[calls["n"] - 1])
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
@@ -401,8 +477,10 @@ def test_check_file_only_speaker_changes_text_instruct_intact(tmp_path, monkeypa
                         SpeakerCheckConfig(context_window=0), GenerationConfig())
     assert src.read_bytes() == before
     checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
-    # Only entry 0's speaker changed; its text/instruct and entry 1 are fully intact.
+    # Only entry 0's speaker changed (the reply carries no "text" keys, so no quote
+    # strip is even possible); its text/instruct and entry 1 are fully intact.
     assert checked[0] == {"speaker": "ALICE", "text": "b", "instruct": "warm"}
+    assert result["unwrapped"] == 0
     assert checked[1] == entries[1]
     assert result["changed"] == 1
 
@@ -461,3 +539,105 @@ def test_check_file_requires_model_name(tmp_path):
     with pytest.raises(RuntimeError):
         check_file(_Handle(), str(src), LLMConfig(stream=False, model_name=""),
                    SpeakerCheckConfig(), GenerationConfig())
+
+
+def test_check_file_injects_book_roster_into_prompt(tmp_path, monkeypatch):
+    # The prompt's "book-wide character roster" reference is backed by a real injection:
+    # the user prompt carries 【本书角色】 (sorted, NARRATOR excluded) plus the
+    # 【上下文范围】 note (mirroring the 段落混合检查's prompt composition).
+    entries = [
+        _entry("NARRATOR", "他走进房间"),
+        _entry("BOB", "「你好。」"),
+        _entry("ALICE", "「再见。」"),
+    ]
+    src = _write(tmp_path, "chapter.json", entries)
+    calls = _seq_urlopen(monkeypatch, [_map_completion(
+        [(0, "NARRATOR"), (1, "BOB"), (2, "ALICE")])])
+
+    result = check_file(_Handle(), str(src), _llm_cfg(),
+                        SpeakerCheckConfig(context_window=1), GenerationConfig())
+
+    assert calls["n"] == 1
+    user = calls["bodies"][0]["messages"][1]["content"]
+    assert "【本书角色】ALICE、BOB" in user
+    assert "【上下文范围】" in user
+    assert json.loads((tmp_path / "chapter_checked.json").read_text("utf-8")) == entries
+    assert result["unwrapped"] == 0  # no text keys in the reply → nothing to apply
+
+
+def test_check_file_strips_quoted_dialogue_on_confirm(tmp_path, monkeypatch):
+    # No disagreement, but the first pass reports the character entry's stored text with
+    # its outer quotation marks removed (the optional "text" key) → the deterministic
+    # strip is applied; the value written is the mechanically computed one.
+    entries = [
+        _entry("NARRATOR", "他走进房间"),
+        _entry("BOB", "「你好。」"),
+    ]
+    src = _write(tmp_path, "chapter.json", entries)
+    before = src.read_bytes()
+    _seq_urlopen(monkeypatch, [_map_completion_with_text(
+        [(0, "NARRATOR", None), (1, "BOB", "你好。")])])
+
+    result = check_file(_Handle(), str(src), _llm_cfg(),
+                        SpeakerCheckConfig(context_window=0), GenerationConfig())
+
+    assert src.read_bytes() == before  # the base file is byte-for-byte unchanged
+    checked = json.loads((tmp_path / "chapter_checked.json").read_text("utf-8"))
+    assert checked[0] == entries[0]  # the NARRATOR entry is fully intact
+    assert checked[1] == {"speaker": "BOB", "text": "你好。", "instruct": "tone"}
+    assert result["changed"] == 0      # no speaker moved
+    assert result["unwrapped"] == 1    # but the dialogue was unwrapped
+
+
+def test_check_file_strips_text_after_disagreement(tmp_path, monkeypatch):
+    # The speaker flips (BOB → ALICE by 2:1 majority) and the FIRST pass reported the
+    # unwrapped text → the strip still lands on the re-labelled entry.
+    entries = [_entry("BOB", "「快跑！」")]
+    src = _write(tmp_path, "ch.json", entries)
+    _seq_urlopen(monkeypatch, [
+        _map_completion_with_text([(0, "ALICE", "快跑！")]),  # first pass
+        _map_completion_with_text([(0, "ALICE", None)]),      # retry 1 → 2:1 for ALICE
+    ])
+
+    result = check_file(_Handle(), str(src), _llm_cfg(),
+                        SpeakerCheckConfig(context_window=0), GenerationConfig())
+
+    checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
+    assert checked[0] == {"speaker": "ALICE", "text": "快跑！", "instruct": "tone"}
+    assert result["rechecked"] == 1
+    assert result["changed"] == 1
+    assert result["unwrapped"] == 1
+
+
+def test_check_file_ignores_nonconforming_text_key(tmp_path, monkeypatch):
+    # A "text" value that is NOT the stored text minus its outer quotes (the model
+    # rewrote content: 。→！) → rejected, the stored text is kept verbatim.
+    entries = [_entry("BOB", "「你好。」")]
+    src = _write(tmp_path, "ch.json", entries)
+    handle = _Handle()
+    _seq_urlopen(monkeypatch, [_map_completion_with_text([(0, "BOB", "你好！")])])
+
+    result = check_file(handle, str(src), _llm_cfg(),
+                        SpeakerCheckConfig(context_window=0), GenerationConfig())
+
+    checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
+    assert checked[0]["text"] == "「你好。」"  # untouched
+    assert result["unwrapped"] == 0
+    assert any(level == "WARNING" and "不符" in msg for level, msg in handle.logs)
+
+
+def test_check_file_ignores_text_key_for_narrator(tmp_path, monkeypatch):
+    # The prompt omits "text" for NARRATOR entries: a stray one must be ignored — quoted
+    # terms inside narration keep their quotation marks (only character entries are
+    # unwrapped, and only via the validated key).
+    entries = [_entry("NARRATOR", "「女医生」已经摘下了口罩")]
+    src = _write(tmp_path, "ch.json", entries)
+    _seq_urlopen(monkeypatch, [_map_completion_with_text(
+        [(0, "NARRATOR", "女医生已经摘下了口罩")])])
+
+    result = check_file(_Handle(), str(src), _llm_cfg(),
+                        SpeakerCheckConfig(context_window=0), GenerationConfig())
+
+    checked = json.loads((tmp_path / "ch_checked.json").read_text("utf-8"))
+    assert checked[0]["text"] == "「女医生」已经摘下了口罩"  # quotes preserved
+    assert result["unwrapped"] == 0

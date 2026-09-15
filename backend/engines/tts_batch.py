@@ -36,6 +36,11 @@ IMPLEMENTED = True
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 64
 
+# 增量 manifest 的落盘节流：内存态逐条更新，整份 JSON 重写最多每 2 秒一次（取消 / 引擎失败 /
+# 看门狗重启 / 收尾仍强制落盘）。每行都整份重写 1MB 会在磁盘 / 杀软扫描负载下拖住行处理主
+# 循环（任务日志与进度条逐行蠕动，而 worker 实际在全速张量批）。
+MANIFEST_FLUSH_INTERVAL = 2.0
+
 
 def clamp_concurrency(n) -> int:
     """Clamp a requested concurrency to ``[MIN_CONCURRENCY, MAX_CONCURRENCY]``.
@@ -235,18 +240,17 @@ def is_done(entry) -> bool:
         return False
 
 
-def plan_to_synthesize(all_indices, done_set, indices=None, force_all=False):
+def plan_to_synthesize(all_indices, done_set, indices=None):
     """Which line indices a run should synthesize (a subset of ``all_indices``).
 
     An explicit ``indices`` wins (synthesise exactly those, intersected with the valid set);
-    otherwise ``force_all`` re-does everything; otherwise the default is a *resume* — only the
-    not-yet-done lines (``all - done``).
+    otherwise the default is a *resume* — only the not-yet-done lines (``all - done``).
+    Re-doing everything is NOT a planning mode: the caller deletes the package folder first
+    (``POST /api/tts/batch-reset``), after which an ordinary resume has nothing to skip.
     """
     all_set = set(all_indices)
     if indices:
         return {int(i) for i in indices} & all_set
-    if force_all:
-        return all_set
     return all_set - set(done_set)
 
 
@@ -318,7 +322,7 @@ def _write_manifest_file(manifest_path, manifest) -> None:
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
+def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=None) -> dict:
     """Task worker: synthesize ONE script's lines (default = resume: only the not-yet-done).
 
     The shared per-file body of both run shapes: ``synthesize`` (single file, the legacy
@@ -337,10 +341,15 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_a
     skip the already-done segments), down to batch 1, where a repeat timeout strikes the in-flight
     segment and two strikes isolate it as a recorded failure (the run continues without it).
 
-    The package ``manifest.json`` is the cumulative source of truth and is written *incrementally*
-    (after every segment), so a cancel keeps whatever finished. The default run is a *resume* —
-    it skips segments already done (``ok`` + file on disk); ``force_all`` re-synthesizes every line.
-    A resume with nothing left short-circuits without spawning the engine.
+    The package ``manifest.json`` is the cumulative source of truth: the in-memory state updates
+    after every segment, and the disk rewrite is throttled (at most once per
+    ``MANIFEST_FLUSH_INTERVAL``) with a forced flush on cancel / engine failure / watchdog restart
+    / completion — a cancel keeps whatever finished; only a hard kill of the backend can lose up
+    to the interval's worth of segments (their files stay on disk, so a resume re-does only what
+    the manifest still lacks). A run is a *resume* — it skips segments already done
+    (``ok`` + file on disk); a resume with nothing left short-circuits without spawning the
+    engine. Re-doing everything is not a mode here: the caller deletes the package folder
+    first (``POST /api/tts/batch-reset``), after which an ordinary resume has nothing to skip.
     """
     src = resolve_parsed_json(script)
     script = _load_script(src)
@@ -374,13 +383,11 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_a
     all_indices = {s["index"] for s in all_segments}
     old_entries = load_manifest(out_dir)
     done_set = {i for i in all_indices if is_done(old_entries.get(i))}
-    to_do = plan_to_synthesize(all_indices, done_set, indices, force_all)
+    to_do = plan_to_synthesize(all_indices, done_set, indices)
     segments = [s for s in all_segments if s["index"] in to_do]
     run_total = len(segments)
 
-    if force_all:
-        handle.log(f"重新全部合成：{run_total} 段（全部重做；共 {len(all_segments)} 段）")
-    elif indices is None and done_set:
+    if indices is None and done_set:
         handle.log(f"续合：已完成 {len(done_set)} 段，本次合成剩余 {run_total} 段（共 {len(all_segments)} 段）")
     else:
         handle.log(f"开始音频合成：{run_total} 段")
@@ -440,9 +447,22 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_a
     by_index = {s["index"]: s for s in segments}
     in_flight: set = set()  # indices the current child was generating (from its [watchdog] line)
 
-    def _write_manifest() -> None:
-        # The cumulative manifest, flushed after every segment so a cancel keeps what finished.
+    # In-memory truth updates on every [segment] line, but the full-file disk rewrite is
+    # throttled to at most once per MANIFEST_FLUSH_INTERVAL: under disk / AV-scanner load a
+    # 1MB rewrite per line stalled this line-processing loop (task log and progress bar crept
+    # one line at a time while the worker itself was tensor-batching at full speed). The first
+    # line always flushes (last_flush starts at 0); forced flushes still fire on cancel, engine
+    # failure, watchdog restart and completion — a cancel loses nothing, a hard kill of the
+    # backend loses at most the interval's worth of segments (their files stay on disk, so a
+    # resume re-does only what the manifest still lacks).
+    last_flush = [0.0]  # time.monotonic() of the last manifest write to disk
+
+    def _write_manifest(force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_flush[0] < MANIFEST_FLUSH_INTERVAL:
+            return
         _write_manifest_file(manifest_path, build_manifest(all_segments, old_entries, seg_results, root=ws))
+        last_flush[0] = now
 
     def on_line(line: str) -> None:
         if line.startswith("[segment]"):
@@ -464,55 +484,66 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_a
     excluded: set = set()
     struck: dict = {}
     attempt = 0
-    while True:
-        if attempt > MAX_ATTEMPTS:
-            raise RuntimeError(
-                f"音频合成引擎反复超时（{MAX_ATTEMPTS} 次缩批重试后仍未完成）——已完成进度已保住，"
-                f"请调小「批内段数」后重试。"
+    try:
+        while True:
+            if attempt > MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"音频合成引擎反复超时（{MAX_ATTEMPTS} 次缩批重试后仍未完成）——已完成进度已保住，"
+                    f"请调小「批内段数」后重试。"
+                )
+            remaining = [s for s in segments
+                         if s["index"] not in excluded
+                         and not (seg_results.get(s["index"]) or {}).get("ok")]
+            if not remaining:
+                break
+            seg_file.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
+            cmd = _build_cmd(
+                python, worker, seg_file, vc_path, out_dir,
+                language=t.language, device=t.device,
+                model=t.model, base_model=t.base_model, design_model=t.design_model,
+                ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
+                workspace=ws,
             )
-        remaining = [s for s in segments
-                     if s["index"] not in excluded
-                     and not (seg_results.get(s["index"]) or {}).get("ok")]
-        if not remaining:
-            break
-        seg_file.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
-        cmd = _build_cmd(
-            python, worker, seg_file, vc_path, out_dir,
-            language=t.language, device=t.device,
-            model=t.model, base_model=t.base_model, design_model=t.design_model,
-            ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
-            workspace=ws,
-        )
-        in_flight.clear()  # a fresh child starts with an empty in-flight set
-        try:
-            run_worker(cmd, handle, on_line, temp_files=(seg_file,),
-                       fail_prefix="音频合成引擎", watchdog_code=124, log_file=run_log)
-            break  # a clean exit (0)
-        except WorkerWatchdogTimeout:
-            attempt += 1
-            if workers > 1:
-                workers = max(1, workers // 2)
-                handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+            in_flight.clear()  # a fresh child starts with an empty in-flight set
+            try:
+                run_worker(cmd, handle, on_line, temp_files=(seg_file,),
+                           fail_prefix="音频合成引擎", watchdog_code=124, log_file=run_log)
+                break  # a clean exit (0)
+            except WorkerWatchdogTimeout:
+                attempt += 1
+                if workers > 1:
+                    workers = max(1, workers // 2)
+                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+                else:
+                    # workers == 1: strike the in-flight segment; two strikes isolate a poison
+                    # segment
+                    newly = []
+                    for i in list(in_flight):
+                        struck[i] = struck.get(i, 0) + 1
+                        if struck[i] >= 2:
+                            excluded.add(i)
+                            seg_results[i] = {"ok": False, "path": "", "reason": "超时（已隔离）"}
+                            newly.append(i)
+                    if newly:
+                        names = "、".join(f"第 {i + 1} 段" for i in sorted(newly))
+                        handle.log(f"{names} 连续两次超时 → 隔离为失败，其余段继续", "WARNING")
+                    else:
+                        handle.log("看门狗触发（单段超时，首次记罚）→ 重启引擎重试", "WARNING")
+                # The restart rebuilds its segment table from in-memory state (a throttled
+                # manifest can't cause re-synthesis) — flush anyway so a backend crash in the
+                # gap can't make a later resume re-do the last ~2s.
+                _write_manifest(force=True)
                 continue
-            # workers == 1: strike the in-flight segment; two strikes isolate a poison segment
-            newly = []
-            for i in list(in_flight):
-                struck[i] = struck.get(i, 0) + 1
-                if struck[i] >= 2:
-                    excluded.add(i)
-                    seg_results[i] = {"ok": False, "path": "", "reason": "超时（已隔离）"}
-                    newly.append(i)
-            if newly:
-                names = "、".join(f"第 {i + 1} 段" for i in sorted(newly))
-                handle.log(f"{names} 连续两次超时 → 隔离为失败，其余段继续", "WARNING")
-                _write_manifest()
-            else:
-                handle.log("看门狗触发（单段超时，首次记罚）→ 重启引擎重试", "WARNING")
-            continue
+    except Exception:
+        # Cancel / engine failure / attempt cap: flush whatever finished since the last
+        # throttled write, then let the exception settle the task as before.
+        _write_manifest(force=True)
+        raise
 
-    # Final manifest (the incremental writes already cover it; a safety net in case the child
-    # exits before its last line is drained).
-    _write_manifest()
+    # Final manifest (the throttled writes may lag up to the interval; this one is
+    # authoritative — also a safety net in case the child exits before its last line is
+    # drained).
+    _write_manifest(force=True)
 
     completed = 0
     failed = []
@@ -546,10 +577,10 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, force_a
     }
 
 
-def synthesize(handle, indices=None, script=None, concurrency=None, force_all=False, seed=None) -> dict:
+def synthesize(handle, indices=None, script=None, concurrency=None, seed=None) -> dict:
     """Single-file entry (the legacy ``POST /api/tts/batch`` path and the tests): delegates
     verbatim to :func:`_synthesize_one`. Signature kept identical so positional callers work."""
-    return _synthesize_one(handle, indices, script, concurrency, force_all, seed)
+    return _synthesize_one(handle, indices, script, concurrency, seed)
 
 
 class _ScaledHandle:
@@ -591,7 +622,7 @@ class _ScaledHandle:
         self._parent.llm_chars(chars, secs)
 
 
-def synthesize_multi(handle, scripts, concurrency=None, force_all=False, seed=None) -> dict:
+def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
     """Task worker: synthesize several parsed JSON files in ONE task, sequentially.
 
     Each file is one package (``05_audio_chunk/<stem>/``) synthesized by its own one-shot
@@ -621,7 +652,7 @@ def synthesize_multi(handle, scripts, concurrency=None, force_all=False, seed=No
         sub = _ScaledHandle(handle, i / n, 1.0 / n, name)
         sub.log(f"文件 {i + 1}/{n}：{name}")
         try:
-            res = _synthesize_one(sub, None, name, concurrency, force_all, seed)
+            res = _synthesize_one(sub, None, name, concurrency, seed)
             for f in res["failed"]:
                 failed_all.append({**f, "script": name})
             per_file.append({

@@ -259,6 +259,19 @@ async function save() {
               </span>
             </div>
           </div>
+          <div class="space-y-1.5">
+            <Label>归属抽样率（0 = 关闭）</Label>
+            <div class="flex flex-wrap items-center gap-3">
+              <Input v-model.number="draft.generation.spot_check_rate" type="number" step="0.01" min="0" max="0.5" class="max-w-[8rem]" />
+              <span class="text-xs text-muted-foreground">
+                解析完成后按比例抽条目重判 speaker（1/3 纯随机做整书错误率仪表 + 2/3 风险加权：
+                无归属标签 / ≤10 字 / 多角色场景），高置信改判直接写入解析结果。
+                每本的纯随机桶错误率会记入任务日志与
+                <code class="text-xs">config/spot_check_history.json</code>
+                ——连续几本 &lt;1% 时可在此手动调低（不会自动降）。
+              </span>
+            </div>
+          </div>
         </CardContent>
       </Card>
 

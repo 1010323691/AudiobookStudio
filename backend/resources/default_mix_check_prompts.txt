@@ -6,27 +6,39 @@ of this batch (there may be several); the other entries are context only.
 For EVERY target entry, decide exactly one of two actions:
 
 * "keep" — the entry holds a SINGLE speaking subject: pure narration (description,
-  action, thought, scene-setting), or one character's continuous speech — even if its
-  stored "speaker" label looks wrong. Fixing a single-subject label is NOT this
-  stage's job; that belongs to the later 角色匹配检查 (character-matching) stage.
+  action, thought, scene-setting), or one character's continuous speech — even when
+  that speech is wrapped in quotation marks or interrupted by a PURE speech tag
+  (他说 / 她道 / 他问道, with no descriptive content): a pure tag belongs to the same
+  speech act and does NOT force a split. This holds even if the entry's stored
+  "speaker" label looks wrong: fixing a single-subject label is NOT this stage's
+  job; that belongs to the later 角色匹配检查 (character-matching) stage.
 * "split" — the entry MIXES speaking subjects: narration interleaved with a character's
-  dialogue (even a short speech tag such as "他说：" attached to a line is narration),
-  or lines belonging to two or more different characters. Split it into the MINIMUM
-  number of consecutive parts, one speaking subject per part, in the original text
-  order.
+  dialogue (a quoted utterance inside a narration entry, a descriptive action between
+  two utterances, or narration inside a dialogue entry), or lines belonging to two or
+  more different characters. A pure speech tag (他说 / 她道) alone does NOT count as a
+  second subject. Split it into the MINIMUM number of consecutive parts, one speaking
+  subject per part, in the original text order.
 
 RULES:
 
 * A part's "speaker" is the character who SAYS that part (copied EXACTLY from an entry
   in the window or from the book-wide character roster), or "NARRATOR" for non-dialogue.
-* The parts' "text" values must be the VERBATIM slices of the entry's "text" that,
-  concatenated in the same order, reproduce the entry's text EXACTLY — no rewording,
-  no reordering, nothing dropped, nothing added, no translation, no punctuation
-  changes. Only the part boundaries and the speaker labels may change.
+* The parts' "text" values must be the VERBATIM slices of the entry's "text", in the
+  same order, reproducing the entry's text except for the two permitted edits below —
+  no rewording, no reordering, nothing else dropped or added, no translation.
+  Only the part boundaries, the speaker labels, and these two edits may change:
+  (a) remove the quotation marks surrounding a part that is spoken dialogue (marks
+  around a quoted term, sound, or reference inside narration STAY);
+  (b) fix split-point punctuation left dangling in a NARRATOR part: a trailing "："
+  or "，" becomes "。", a leading "，" becomes "。".
 * A split needs at least TWO parts and at least TWO DISTINCT speakers among them.
   Never split a single-subject entry; never use "split" to change one subject's label.
 * Decide ONLY from the provided window and roster; never invent a speaker absent from
-  both.
+  both. If a dialogue part's speaker truly cannot be determined from them (an unnamed
+  speaker), label that part "NARRATOR" and strip its quotation marks.
+* Quoted terms, nicknames, sounds, and references to earlier speech inside narration
+  are NOT spoken dialogue and never force a split
+  (e.g. 不知何时，“女医生”已经摘下了口罩 → keep).
 * Judge ONLY the target entries (those marked "target": true). Do not change or comment
   on any context entry.
 * NEVER translate, romanize, transliterate, localize, paraphrase, or normalize a
@@ -47,6 +59,8 @@ object: {"results": [...]} — one item per target entry. Single speaking subjec
 {"index": <index>, "action": "keep"}. Mixes narration with dialogue, or contains lines
 of 2+ different characters → {"index": <index>, "action": "split", "parts": [{"speaker":
 "...", "text": "..."}, ...]} with the parts in original text order, each "text" a
-verbatim slice of the entry's text and each "speaker" copied exactly from the window or
-the book-wide character roster (or "NARRATOR"). Never split a single-subject entry.
+verbatim slice of the entry's text, except that the quotation marks around dialogue
+parts are removed and dangling "：" / "，" at split points become "。", and each
+"speaker" copied exactly from the window or the book-wide character roster (or
+"NARRATOR"). Never split a single-subject entry.
 No markdown, no extra keys.
