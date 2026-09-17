@@ -38,6 +38,9 @@ Contract with the backend (all on STDOUT unless noted)
   - ``[result]   <absolute path>``    -> the primary file produced
   - ``[segment]  <index> ok <path>``  -> one batch segment succeeded
   - ``[segment]  <index> error <reason>`` -> one batch segment failed (batch continues)
+    (``index`` = the row's segment-table position — in pooled multi-file runs that is the
+    pool-global index; a row may additionally carry ``out_dir`` / ``file_index`` deciding
+    its chapter package dir and file number, see _row_output_paths)
   - ``[design]   <index> ok <seed> <path>`` -> one design candidate rendered (design-batch;
     index = the row's position in the jobs file; seed = that sub-batch's seed)
   - ``[design]   <index> error <reason>`` -> one design candidate failed (run continues)
@@ -1283,12 +1286,31 @@ def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed, *, force
     return [(True, (w, _sr)) for w in wavs]
 
 
+def _row_output_paths(r: dict, fallback_out_dir: str, width: int) -> tuple:
+    """(mp3, wav) output paths for one row (pure).
+
+    A row may carry its own save location for pooled multi-file runs: ``out_dir`` (the
+    chapter package directory, absolute) and ``file_index`` (the line's position inside
+    its chapter). Both are optional — when absent the row falls back to the whole-batch
+    ``out_dir`` + the segment-table ``index``, so single-file runs stay byte-identical to
+    the legacy behaviour. The file number is ``file_index + 1``; ``width`` only zero-pads
+    it (zfill never truncates) — the manifest stores the real path, so file naming is
+    cosmetic, never the attribution mechanism.
+    """
+    out_dir = r.get("out_dir") or fallback_out_dir
+    num = int(r.get("file_index", r["index"])) + 1
+    fname = str(num).zfill(width)
+    return os.path.join(out_dir, fname + ".mp3"), os.path.join(out_dir, fname + ".wav")
+
+
 def _save_and_report(rows, results, out_dir, width, report, batch_seed=None) -> None:
     """Save each generated row (wav -> mp3) and emit its ``[segment]`` line + progress.
 
     Runs on the main (coordinator) thread after the watchdog returns. A per-row save / encode
     fault is a recorded error, never a run abort (matching the old per-segment tolerance).
     ``batch_seed`` is unused here (the design-batch save variant records it per candidate).
+    Save location per :func:`_row_output_paths` — a row's own ``out_dir`` / ``file_index``
+    (pooled multi-file) wins over the whole-batch ``out_dir`` + segment index.
     """
     import numpy as np
 
@@ -1304,9 +1326,10 @@ def _save_and_report(rows, results, out_dir, width, report, batch_seed=None) -> 
         if wav.size == 0:
             report(index, False, "模型返回空音频")
             continue
-        fname = str(index + 1).zfill(width)
-        out_mp3 = os.path.join(out_dir, fname + ".mp3")
-        wav_tmp = os.path.join(out_dir, fname + ".wav")
+        out_mp3, wav_tmp = _row_output_paths(r, out_dir, width)
+        parent = os.path.dirname(out_mp3)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         try:
             _save_wav(wav, sr, wav_tmp)
             if _wav_to_mp3(wav_tmp, out_mp3):
@@ -1669,8 +1692,15 @@ def _run_batch(args) -> int:
             report_result(index, False, f"不支持的声音类型：{vtype}")
             continue
 
+        # Pooled multi-file runs tag each row with its chapter save location: ``out_dir``
+        # (package dir) + ``file_index`` (line position in that chapter). Both optional —
+        # single-file rows omit them and fall back to the whole-batch --out-dir + index.
+        # ``index`` stays the row's scheduling identity (protocol / watchdog / filename
+        # width); ``file_index`` only decides the file number and package.
         row = {"seg": seg, "index": index, "speaker": canonical, "vd": vd,
-               "text": text, "instruct": instruct, "chars": len(text)}
+               "text": text, "instruct": instruct, "chars": len(text),
+               "out_dir": (seg.get("out_dir") or None),
+               "file_index": int(seg.get("file_index", index))}
         classified.setdefault((vtype, canonical), []).append(row)
 
     # -- build the execution groups: per character, most lines first, rows length-ascending --

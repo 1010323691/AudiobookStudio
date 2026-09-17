@@ -974,6 +974,104 @@ def test_save_and_report_design_protocol_and_fault_tolerance(tmp_path, monkeypat
 
 
 # --------------------------------------------------------------------------- #
+# _row_output_paths — per-row chapter save location (pooled multi-file runs)
+# --------------------------------------------------------------------------- #
+
+def test_row_output_paths_fallback_and_override():
+    tw = _load_worker()
+    fb = r"C:\ws\05_audio_chunk\pool_fallback"
+    # Legacy rows (no out_dir / file_index) fall back to the whole-batch dir + segment
+    # index — byte-identical to the pre-pooling formula.
+    assert tw._row_output_paths({"index": 3}, fb, 4) == (
+        os.path.join(fb, "0004.mp3"), os.path.join(fb, "0004.wav"))
+    # Pooled rows carry their own chapter dir + local line number (file number =
+    # file_index + 1, zero-padded to the pool width). The segment-table index is
+    # never used for the file number once file_index is present.
+    assert tw._row_output_paths({"index": 12, "out_dir": r"C:\ws\05_audio_chunk\t",
+                                 "file_index": 37}, fb, 5) == (
+        r"C:\ws\05_audio_chunk\t\00038.mp3", r"C:\ws\05_audio_chunk\t\00038.wav")
+    # zfill pads but never truncates: a number wider than `width` keeps its digits.
+    assert tw._row_output_paths({"index": 0, "file_index": 99999}, fb, 4) == (
+        os.path.join(fb, "100000.mp3"), os.path.join(fb, "100000.wav"))
+    # Empty-string out_dir also falls back (truthiness, not presence).
+    assert tw._row_output_paths({"index": 0, "out_dir": ""}, fb, 4) == (
+        os.path.join(fb, "0001.mp3"), os.path.join(fb, "0001.wav"))
+
+
+def test_save_and_report_pool_rows_land_in_own_packages(tmp_path, monkeypatch):
+    tw = _load_worker()
+
+    # The save path imports numpy/soundfile lazily — stub them (the lean 3.14 env has
+    # neither; the real .venv-tts has both), and stub the pydub-based WAV->MP3 encode.
+    class _Nd:  # the fake ndarray type: no real value is an instance of it
+        pass
+
+    class _Arr:
+        def __init__(self, x):
+            self.x = x
+            self.size = len(x)
+            self.ndim = 1
+
+        def __len__(self):
+            return self.size
+
+    def _np_array(x):
+        return x if isinstance(x, _Arr) else _Arr(x)  # idempotent, like the real one
+
+    fake_np = types.SimpleNamespace(array=_np_array, ndarray=_Nd)
+    encoded = []
+
+    class _FakeSF:
+        @staticmethod
+        def write(path, data, sr):
+            with open(path, "wb") as f:
+                f.write(b"RIFF" + bytes(100))
+
+    def _fake_wav_to_mp3(wav_path, mp3_path):
+        assert os.path.exists(wav_path)
+        with open(mp3_path, "wb") as f:
+            f.write(b"ID3" + bytes(1200))  # >= 1024B, so the encode counts as good
+        encoded.append(mp3_path)
+        return True
+
+    monkeypatch.setitem(sys.modules, "numpy", fake_np)
+    monkeypatch.setitem(sys.modules, "soundfile", _FakeSF)
+    monkeypatch.setattr(tw, "_wav_to_mp3", _fake_wav_to_mp3)
+
+    pkg_a = str(tmp_path / "s")  # chapter package s
+    pkg_b = str(tmp_path / "t")  # chapter package t
+    fallback = str(tmp_path / "fallback")
+    rows = [
+        {"index": 0, "out_dir": pkg_a, "file_index": 3},   # pooled -> s/0004.mp3
+        {"index": 1, "out_dir": pkg_b, "file_index": 0},   # pooled -> t/0001.mp3
+        {"index": 2, "file_index": 7},                     # legacy fallback -> fallback/0008.mp3
+    ]
+    results = [
+        (True, ([1.0] * 8, 24000)),  # ok
+        (True, ([], 24000)),         # empty audio -> recorded error, no file touched
+        (True, ([1.0] * 8, 24000)),  # ok, falls back to the batch out_dir
+    ]
+    reports = []
+    tw._save_and_report(rows, results, fallback, 4,
+                        lambda i, ok, p: reports.append((i, ok, p)))
+    # Reports always carry the segment-table index (pool-global in a pooled run),
+    # never the file_index.
+    assert reports == [
+        (0, True, os.path.join(pkg_a, "0004.mp3")),
+        (1, False, "模型返回空音频"),
+        (2, True, os.path.join(fallback, "0008.mp3")),
+    ]
+    # Files land in their own chapter packages; the file number is file_index + 1.
+    assert sorted(encoded) == sorted([os.path.join(pkg_a, "0004.mp3"),
+                                      os.path.join(fallback, "0008.mp3")])
+    assert (tmp_path / "s" / "0004.mp3").exists()
+    assert not (tmp_path / "t" / "0001.mp3").exists()      # empty-audio row wrote nothing
+    assert not (tmp_path / "s" / "0001.mp3").exists()      # index 0 was NOT used as a number
+    # No stray WAV left behind (the successful encode removes it).
+    assert not list((tmp_path / "s").glob("*.wav")) and not list((tmp_path / "fallback").glob("*.wav"))
+
+
+# --------------------------------------------------------------------------- #
 # The worker module loads in the lean backend (stdlib-only top level)
 # --------------------------------------------------------------------------- #
 
@@ -987,6 +1085,7 @@ def test_worker_module_loads_without_torch():
                  "_free_vram_budget", "_free_vram", "_total_vram", "_warmup",
                  "_synth_sub_batch", "plan_next_sub_batch", "plan_row_tokens",
                  "_run_design_batch", "_save_and_report_design", "_generate_rows",
+                 "_row_output_paths", "_save_and_report",
                  "_clone_input_overhead", "band_cap_for_chars", "VramGovernor",
                  "plan_merge_batches", "normalize_pause_ms", "boundary_gap_ms",
                  "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac"):

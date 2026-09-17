@@ -201,7 +201,8 @@ const result = ref<BatchResult | null>(null)
 const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
 
 // 一键合成「批内段数」上限 (1..64)：把多段垫成一个 GPU 张量批，一批最多能垫多少段（只是上限，
-// 不是固定并发数；模型只加载一次。实际每批条数 = min(段长分档〔短段跑满、长段自动降低、超长
+// 不是固定并发数；模型只加载一次。多文件时所有章节的段进同一个任务池，由同一引擎子进程统一
+// 调度。实际每批条数 = min(段长分档〔短段跑满、长段自动降低、超长
 // 单独〕, 实测显存动态调节, 显存估算, 单批字符上限)）。
 // Seeded from the persisted config; written back to it on each run (see doRun).
 const MIN_CONCURRENCY = 1
@@ -316,7 +317,7 @@ async function doRun() {
   const concurrencyNow = concurrency.value
   try {
     // Default (resume): synthesize only the not-yet-done segments, skipping existing audio
-    // (a fully-done file never loads the model at all).
+    // (fully-done files contribute no segments to the pool).
     const { task_id } = await runBatch({ scripts: names, concurrency: concurrencyNow, seed: runSeed() })
     taskId.value = task_id
     await taskStore.refresh()
@@ -340,7 +341,7 @@ async function doRunAll() {
   if (busy.value) return
   const names = selectedNames.value
   if (!names.length) return
-  if (!window.confirm('重新全部合成会删除选中文件已合成的音频（05_audio_chunk/ 下对应文件夹，含进度清单），并从头重做全部段落（需重新加载模型、耗时较长）。确定继续吗？')) return
+  if (!window.confirm('重新全部合成会删除选中文件已合成的音频（05_audio_chunk/ 下对应文件夹，含进度清单），并从头重做全部段落（模型加载一次、耗时较长）。确定继续吗？')) return
   busy.value = true
   error.value = ''
   result.value = null
@@ -526,8 +527,10 @@ watch(
         </Badge>
       </h1>
       <p class="mt-1 text-muted-foreground">
-        勾选一个或多个解析 JSON 后合成：多文件在一个任务里按顺序逐个合成（每个未完成文件启动一次
-        引擎、模型只加载一次；已完成文件自动跳过），单段 / 单文件失败会记录而不中断；行内的
+        勾选一个或多个解析 JSON 后合成：多文件在一个任务里合成——所有章节的待合成段读入同一个
+        TTS 任务池，由同一引擎子进程统一排序 / 分组 / 批调度（模型只加载一次；已完成段自动
+        跳过），单段失败会记录而不中断；每段按章节归属写回
+        <code class="text-xs">05_audio_chunk/&lt;该章包&gt;/</code>。行内的
         已合成 / 总段落 · 角色 · 已就绪声音 实时刷新。每个 JSON 合成成一个「包」：音频段与
         <code class="text-xs">manifest.json</code> 一起保存到 <code class="text-xs">05_audio_chunk/&lt;JSON 基名&gt;/</code>。
       </p>
@@ -638,7 +641,8 @@ watch(
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Layers class="h-5 w-5" />一键音频合成</CardTitle>
           <CardDescription>
-            按勾选的文件逐个合成（每个文件单独启动一次引擎、模型只加载一次；已完成文件自动跳过）。
+            把勾选文件的所有待合成段放进同一个 TTS 任务池，由一次引擎子进程统一调度
+            （模型只加载一次；已完成段自动跳过）。
             把多段垫成 GPU 张量批一次并行推理（「批内段数」只是上限，1 = 逐段串行；实际每批条数
             按段长自动分档——短段跑满、长段自动降低、超长单独——并按实测显存余量实时升降），
             实时显示「正在生成（角色 X）」与「完成 i / N 段」及成功 / 失败。

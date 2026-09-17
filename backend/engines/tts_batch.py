@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core import pathio
@@ -200,6 +201,172 @@ def _build_segments(script, indices=None):
     return segments
 
 
+@dataclass
+class _PooledFile:
+    """One chapter file's bookkeeping inside a pooled multi-file run.
+
+    ``pending`` / ``by_index`` / ``seg_results`` are keyed by the *chapter-local* index
+    (the line's position in this file's JSON); the pool-global index only exists on the
+    pool rows and is mapped back here through the run's ``pool_map``. ``error`` is set
+    only for prep-stage fatals (missing / corrupt / empty script, package collision) —
+    engine-level failures are expressed by the top-level ``failed`` list and this
+    package's manifest, never by ``error``.
+    """
+
+    name: str
+    src: Path | None = None
+    pkg: str = ""
+    out_dir: Path | None = None
+    manifest_path: Path | None = None
+    all_segments: list = field(default_factory=list)
+    by_index: dict = field(default_factory=dict)
+    old_entries: dict = field(default_factory=dict)
+    seg_results: dict = field(default_factory=dict)
+    pending: list = field(default_factory=list)
+    done_count: int = 0
+    all_count: int = 0
+    error: str | None = None
+    dirty: bool = False
+
+
+def _build_pool_rows(files, pool_start: int = 0) -> tuple:
+    """Expand the files' pending segments into the unified pool rows (pure).
+
+    Returns ``(pool_rows, pool_owners)`` — parallel lists, one row per pending segment in
+    request order (files, then chapter-local index order). Each row is the chapter's
+    segment dict plus the pooled-run fields the worker reads: ``index`` = the row's
+    pool-global position (its scheduling identity: protocol lines, watchdog, file-number
+    width) numbered consecutively from ``pool_start``; ``out_dir`` = the chapter's package
+    dir (absolute); ``file_index`` = the line's position inside its chapter (the manifest
+    key and the file number). Files with a prep fatal or nothing pending contribute no
+    rows. (On a watchdog restart the remaining rows are filtered in place and keep their
+    original pool indices — never renumbered.)
+    """
+    pool_rows: list[dict] = []
+    pool_owners: list = []
+    for f in files:
+        if f.error or not f.pending:
+            continue
+        for local in f.pending:
+            row = dict(f.by_index[local])
+            row["index"] = pool_start
+            row["out_dir"] = str(f.out_dir)
+            row["file_index"] = local
+            pool_rows.append(row)
+            pool_owners.append(f)
+            pool_start += 1
+    return pool_rows, pool_owners
+
+
+def _handle_segment_pool(line: str, pool_map: dict, pool_total: int, handle) -> None:
+    """Route a ``[segment] <pool-index> ok|error <detail>`` line to its owning chapter.
+
+    ``pool_index`` is the row's pool-global segment-table position (the worker's scheduling
+    identity); ``pool_map`` is the single source mapping it back to ``(file, local index)``
+    — the pool index is NEVER used as a chapter-internal index. Malformed lines and unknown
+    indices are logged as warnings and dropped, exactly like the single-file
+    :func:`_handle_segment`.
+    """
+    parts = line[len("[segment]"):].split(None, 2)
+    if len(parts) < 2:
+        handle.log(line, "WARNING")
+        return
+    try:
+        pool_index = int(parts[0])
+    except ValueError:
+        handle.log(line, "WARNING")
+        return
+    status = parts[1]
+    detail = parts[2] if len(parts) > 2 else ""
+    owner = pool_map.get(pool_index)
+    if owner is None:
+        handle.log(f"未知段索引 {pool_index}（池共 {pool_total} 段）：{line}", "WARNING")
+        return
+    f, local = owner
+    speaker = (f.by_index.get(local) or {}).get("speaker") or "(未知)"
+    num = f"[{pool_index + 1}/{pool_total}]"
+    if status == "ok":
+        f.seg_results[local] = {"ok": True, "path": detail, "reason": ""}
+        f.dirty = True
+        handle.log(f"{num} {f.name} · {speaker}：完成")
+    else:
+        f.seg_results[local] = {"ok": False, "path": "", "reason": detail}
+        f.dirty = True
+        handle.log(f"{num} {f.name} · {speaker}：失败（{detail}）", "ERROR")
+
+
+def _settle_pool(handle, files) -> dict:
+    """Aggregate the pooled run's final result (the same shape the legacy multi run returned).
+
+    ``files`` is in request order and so is the result's ``files`` list; the top-level
+    ``failed`` list is ordered file order → chapter-local index order (the worker's
+    cross-chapter execution order never leaks into any result or manifest ordering). Per
+    file: a prep fatal is all-zeros + ``error``; a no-pending file reports its cumulative
+    completion; a pooled file reports ``total = len(pending)`` and the count of this run's
+    ok results. The failure test (``attempted`` — files that pooled or errored — with
+    ``completed == 0``) mirrors the single-file fatal rule: a selection where every
+    actually-pooled segment failed (or every file was a prep fatal) fails the task; an
+    all-complete / all-empty / one-chapter-sinks-others-succeed selection succeeds.
+    """
+    per_file: list[dict] = []
+    failed_all: list[dict] = []
+    for f in files:
+        if f.error:
+            per_file.append({
+                "script": f.name, "total": 0, "completed": 0, "failed": 0,
+                "output_dir": "", "manifest_path": "", "done_count": 0, "all_count": 0,
+                "error": f.error,
+            })
+            continue
+        done = count_completion(f.all_segments, load_manifest(f.out_dir))
+        # completed = this run's ok results; a no-pending file reports its cumulative
+        # completion (the legacy zero-short-circuit shape).
+        completed = (sum(1 for i in f.pending if (f.seg_results.get(i) or {}).get("ok"))
+                     if f.pending else done["completed"])
+        file_failed = 0
+        for local in f.pending:
+            r = f.seg_results.get(local)
+            if r and r.get("ok"):
+                continue
+            file_failed += 1
+            failed_all.append({
+                "index": local,
+                "speaker": (f.by_index.get(local) or {}).get("speaker", ""),
+                "reason": (r or {}).get("reason") or "（引擎未返回结果）",
+                "script": f.name,
+            })
+        per_file.append({
+            "script": f.name,
+            # total = this run's pooled rows; a no-pending file reports its whole segment
+            # count (the legacy zero-short-circuit shape: all-done / empty files).
+            "total": len(f.pending) if f.pending else f.all_count,
+            "completed": completed,
+            "failed": file_failed,
+            "output_dir": str(f.out_dir),
+            "manifest_path": str(f.manifest_path),
+            "done_count": done["completed"],
+            "all_count": done["total"],
+            "error": None,
+        })
+    result = {
+        "total": sum(r["total"] for r in per_file),
+        "completed": sum(r["completed"] for r in per_file),
+        "failed": failed_all,
+        "output_dir": "",  # pooled run: each chapter has its own package (see ``files``)
+        "manifest_path": "",
+        "done_count": sum(r["done_count"] for r in per_file),
+        "all_count": sum(r["all_count"] for r in per_file),
+        "files": per_file,
+    }
+    attempted = [f for f in files if f.error or f.pending]
+    if not attempted or result["completed"] > 0:
+        handle.progress(1.0, "完成")
+        return result
+    if result["total"] > 0:
+        raise RuntimeError(f"全部 {result['total']} 段合成失败（各章节原因见任务日志与结果 files 字段）。")
+    raise RuntimeError(f"所选 {len(files)} 个文件全部无法合成（原因见任务日志与结果 files 字段）。")
+
+
 def package_for(src: Path) -> str:
     """The package (sub-folder in ``05_audio_chunk/``) a source JSON's batch output lands in.
 
@@ -354,9 +521,10 @@ def _write_manifest_file(manifest_path, manifest) -> None:
 def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=None) -> dict:
     """Task worker: synthesize ONE script's lines (default = resume: only the not-yet-done).
 
-    The shared per-file body of both run shapes: ``synthesize`` (single file, the legacy
-    API path / tests) and ``synthesize_multi`` (several files in one task, in order) call
-    this — with a progress-scaling :class:`_ScaledHandle` in the multi case.
+    The single-file body behind :func:`synthesize` (the legacy API path and the tests).
+    The multi-file shape does NOT call this: ``synthesize_multi`` pools every chapter's
+    pending segments into one engine subprocess (see there) instead of running one
+    subprocess per file.
 
     ``concurrency`` is only the *per-batch ceiling* (the most segments that may share one GPU
     tensor batch); the worker sets the actual size at runtime from the segment-length bands and
@@ -612,115 +780,254 @@ def synthesize(handle, indices=None, script=None, concurrency=None, seed=None) -
     return _synthesize_one(handle, indices, script, concurrency, seed)
 
 
-class _ScaledHandle:
-    """One file's view of a multi-file task handle: progress scaled, everything else verbatim.
-
-    The task has a single progress bar; file *i* of *n* runs in the window
-    ``[i/n, (i+1)/n]`` (``base + frac·weight``), so the bar climbs monotonically across
-    files and can never dip below the start of the current file (even across the worker's
-    restart-on-watchdog progress reset). Non-empty progress labels are prefixed with the
-    file name so the step row always names the file being synthesized (a bare "完成" from
-    file *i* would otherwise linger while file *i*+1 starts). ``log`` / ``check`` (and the
-    LLM telemetry methods, unused on this path) forward to the parent untouched, so
-    cancel/pause semantics are identical to a single-file run.
-    """
-
-    def __init__(self, parent, base: float, weight: float, name: str):
-        self._parent = parent
-        self._base = base
-        self._weight = weight
-        self._name = name
-
-    def progress(self, frac: float, current: str = "") -> None:
-        label = f"{self._name} · {current}" if current else ""
-        self._parent.progress(self._base + float(frac) * self._weight, label)
-
-    def log(self, msg: str, level: str = "INFO") -> None:
-        self._parent.log(msg, level)
-
-    def check(self) -> None:
-        self._parent.check()
-
-    def llm_chunk(self, text: str) -> None:
-        self._parent.llm_chunk(text)
-
-    def llm_rate(self, chars: int, cps: float) -> None:
-        self._parent.llm_rate(chars, cps)
-
-    def llm_chars(self, chars: int, secs: float) -> None:
-        self._parent.llm_chars(chars, secs)
-
-
 def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
-    """Task worker: synthesize several parsed JSON files in ONE task, sequentially.
+    """Task worker: synthesize several parsed JSON files (chapters) in ONE task — pooled.
 
-    Each file is one package (``05_audio_chunk/<stem>/``) synthesized by its own one-shot
-    engine subprocess — the model loads once per file, and a file that is already fully
-    done short-circuits without spawning the engine at all (no wasted model load). The run
-    is sequential: two engine processes would never run at once (they would fight over
-    GPU memory).
+    Every selected chapter's *pending* segments (resume: the not-yet-done lines) are read
+    into one unified TTS task pool and a SINGLE engine subprocess schedules the whole pool:
+    the worker's speaker grouping / ordering / lazy sub-batch / VRAM governance now run
+    across chapter boundaries (the model set loads once; a short chapter's tail no longer
+    starves the batch). Each pool row carries its chapter attribution (``out_dir`` = the
+    chapter's package dir, ``file_index`` = the line's position inside that chapter) so
+    every result lands back in the right chapter package — the pool's scheduling order is
+    decoupled from the chapter order, but results and manifests keep the chapter-local
+    order. 章节是数据组织单位，不是 GPU 调度单位。
 
-    Per-file fatal errors (missing / corrupt / empty script, an engine run that produces
-    nothing) are *isolated*: logged, recorded on that file's result entry, and the run
-    continues with the next file — one bad file never sinks the batch (the same principle
-    as 角色配音's per-character failure isolation). The task fails only when nothing was
-    synthesized while something was actually attempted; an all-complete / all-empty
-    selection settles as a success (each such file took the zero-short-circuit).
+    Prep-stage fatals (missing / corrupt / empty script, a package collision) are
+    *isolated* per file: logged, recorded on that file's ``error`` entry, and the run
+    continues with the other files. An engine-level "all of a file's segments failed"
+    does NOT set ``error`` — it is expressed by the top-level ``failed`` list (each entry
+    tagged with its ``script``) and the chapter's own manifest ``ok: false`` entries (one
+    bad chapter never sinks the pool — the same principle as 角色配音's per-character
+    failure isolation). The task fails only when every actually-pooled segment failed
+    (or every file was a prep fatal); an all-complete / all-empty selection settles as a
+    success without spawning the engine.
 
-    Cancellation propagates: ``TaskCancelled`` is re-raised (NEVER swallowed by the
-    per-file error isolation), so a cancel mid-run settles as ``cancelled`` — whatever
-    finished in the earlier files is kept (each file's manifest is written incrementally).
+    Progress is driven directly by the worker's ``[progress]`` lines (0→1 over the whole
+    pool — the backend emits no per-file progress windows). Cancellation propagates:
+    ``TaskCancelled`` is re-raised (NEVER swallowed by the per-file error isolation); a
+    forced manifest flush covers every pooled file first, so a cancel keeps whatever
+    finished.
     """
     if not scripts:
         raise RuntimeError("没有可合成的文件——请先在「待合成」列表勾选解析 JSON。")
     n = len(scripts)
-    per_file: list[dict] = []
-    failed_all: list[dict] = []
+    layout = get_layout()
+    ws = layout.workspace
+
+    # voice_config is optional here — a character missing from it becomes a clear
+    # per-segment error (the run continues), not a crash. Read + lazily migrated ONCE for
+    # the whole pool (same logic as _synthesize_one; the worker resolves the relative
+    # ref_audio against --workspace, so the rewrite happens before any spawn).
+    vc_path = layout.voice_profiles / "voice_config.json"
+    voice_config = {}
+    if vc_path.exists():
+        try:
+            loaded = json.loads(vc_path.read_text("utf-8"))
+            if isinstance(loaded, dict):
+                voice_config = loaded
+        except Exception as e:  # noqa: BLE001
+            handle.log(f"voice_config.json 无法解析（{e}）——相关角色将失败。", "WARNING")
+        _n, migrated_vc = pathio.migrate_entries_in(vc_path, ws, "dict", ("ref_audio",))
+        if isinstance(migrated_vc, dict):
+            voice_config = migrated_vc
+
+    # -- per-file prep (request order): fatal files are isolated, the rest join the pool --
+    files: list[_PooledFile] = []
+    pkg_owner: dict = {}  # package -> first file claiming it (collision defence)
     for i, name in enumerate(scripts):
         handle.check()  # cancel / pause point before any work on file i
-        sub = _ScaledHandle(handle, i / n, 1.0 / n, name)
-        sub.log(f"文件 {i + 1}/{n}：{name}")
+        f = _PooledFile(name=name)
+        files.append(f)
+        handle.log(f"文件 {i + 1}/{n}：{name}")
         try:
-            res = _synthesize_one(sub, None, name, concurrency, seed)
-            for f in res["failed"]:
-                failed_all.append({**f, "script": name})
-            per_file.append({
-                "script": name,
-                "total": res["total"],
-                "completed": res["completed"],
-                "failed": len(res["failed"]),
-                "output_dir": res["output_dir"],
-                "manifest_path": res["manifest_path"],
-                "done_count": res["done_count"],
-                "all_count": res["all_count"],
-                "error": None,
-            })
+            src = resolve_parsed_json(name)
+            script = _load_script(src)
+            f.src = src
+            pkg = package_for(src)
+            # API-layer defence: the UI already filters _checked names, but a direct API
+            # call could pass both x.json and x_checked.json — they map to ONE package and
+            # would write the same files / manifest, so fail the second clearly instead of
+            # corrupting silently.
+            if pkg in pkg_owner:
+                raise RuntimeError(f"包目录 {pkg} 与 {pkg_owner[pkg]} 冲突（同一包不可被两个文件合成）")
+            pkg_owner[pkg] = name
+            f.pkg = pkg
+            f.out_dir = layout.audio_chunk / pkg
+            f.manifest_path = f.out_dir / "manifest.json"
+            f.all_segments = _build_segments(script)
+            f.by_index = {s["index"]: s for s in f.all_segments}
+            f.old_entries = load_manifest(f.out_dir)
+            all_indices = {s["index"] for s in f.all_segments}
+            done_set = {i for i in all_indices if is_done(f.old_entries.get(i))}
+            f.pending = sorted(plan_to_synthesize(all_indices, done_set))
+            f.all_count = len(f.all_segments)
+            if f.pending:
+                if done_set:
+                    handle.log(f"续合：已完成 {len(done_set)} 段，待合成 {len(f.pending)} 段（共 {f.all_count} 段）")
+                else:
+                    handle.log(f"待合成 {len(f.pending)} 段（共 {f.all_count} 段）")
+            else:
+                # Nothing left (all done, or an empty script) — rewrite the engine-owned
+                # manifest and contribute no rows to the pool (no wasted model work).
+                f.out_dir.mkdir(parents=True, exist_ok=True)
+                _write_manifest_file(f.manifest_path,
+                                     build_manifest(f.all_segments, f.old_entries, {}, root=ws))
+                handle.log("无待合成段，跳过" if not f.all_count else f"已全部完成，跳过（0/{f.all_count} 段待合成）")
         except TaskCancelled:
             raise  # cancel is a task-level outcome — never "file failed, keep going"
-        except Exception as e:  # noqa: BLE001 — one bad file is isolated, the batch continues
-            handle.log(f"文件 {name} 合成失败（跳过，继续其余文件）：{e}", "ERROR")
-            per_file.append({
-                "script": name, "total": 0, "completed": 0, "failed": 0,
-                "output_dir": "", "manifest_path": "", "done_count": 0, "all_count": 0,
-                "error": str(e),
-            })
+        except Exception as e:  # noqa: BLE001 — one bad file is isolated, the pool continues
+            f.error = str(e)
+            handle.log(f"文件 {name} 准备失败（跳过，继续其余文件）：{e}", "ERROR")
 
-    result = {
-        "total": sum(r["total"] for r in per_file),
-        "completed": sum(r["completed"] for r in per_file),
-        "failed": failed_all,
-        "output_dir": "",  # multi-file: each file has its own package (see ``files``)
-        "manifest_path": "",
-        "done_count": sum(r["done_count"] for r in per_file),
-        "all_count": sum(r["all_count"] for r in per_file),
-        "files": per_file,
-    }
-    # Nothing synthesized while something WAS attempted (or a file errored) is a failure;
-    # an all-complete / all-empty selection succeeds — the legacy zero-short-circuit, per file.
-    attempted = [r for r in per_file if r["total"] > 0 or r["error"]]
-    if not attempted or result["completed"] > 0:
-        handle.progress(1.0, "完成")
-        return result
-    raise RuntimeError(
-        f"全部 {result['total']} 段合成失败（各文件原因见任务日志与结果 files 字段）。"
-    )
+    if not voice_config:
+        handle.log("警告：未找到 voice_config.json——请先在「角色配音」页生成角色声音，否则所有段都会失败。", "WARNING")
+
+    # -- build the unified pool ----------------------------------------------------------
+    pool_rows, pool_owners = _build_pool_rows(files)
+    pool_total = len(pool_rows)
+    # The single source mapping pool-global index -> (chapter file, chapter-local index).
+    pool_map = {row["index"]: (f, row["file_index"]) for row, f in zip(pool_rows, pool_owners)}
+
+    # -- engine prep (once; the model set loads once for the whole pool) ------------------
+    seg_file = layout.temp / f"batch_segments_{uuid.uuid4().hex[:12]}.json"
+    python, worker = resolve_engine()
+    cfg = get_config()
+    t = cfg.tts
+    # 批内段数（仅上限）: the request's value, else the persisted default
+    # (config.tts.batch_concurrency); clamped to [1, 64] — ONE cap for the whole pool.
+    workers = clamp_concurrency(concurrency if concurrency else t.batch_concurrency)
+    # seed: the request's value, else the persisted default (config.tts.batch_seed); -1 = random.
+    seed = seed if seed is not None else t.batch_seed
+    try:
+        seed = int(seed)
+    except (TypeError, ValueError):
+        seed = -1
+
+    # Multi-manifest throttled flush: one shared 2s clock, every pooled (dirty, non-fatal)
+    # file's manifest rewritten together. Forced flushes (cancel / engine failure /
+    # watchdog restart / completion) cover ALL pooled files — a cancel keeps whatever
+    # finished in every chapter, not just the last one touched.
+    last_flush = [0.0]
+
+    def flush_manifests(force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_flush[0] < MANIFEST_FLUSH_INTERVAL:
+            return
+        for f in files:
+            if f.error or not f.pending:
+                continue
+            if not force and not f.dirty:
+                continue
+            f.dirty = False
+            _write_manifest_file(f.manifest_path,
+                                 build_manifest(f.all_segments, f.old_entries, f.seg_results, root=ws))
+        last_flush[0] = now
+
+    # In-flight POOL indices the current child was generating (from its [watchdog] line) —
+    # shared with on_line below; a strike at workers==1 targets these, mapped back to their
+    # chapters for the manifest write.
+    in_flight: set = set()
+
+    def on_line(line: str) -> None:
+        if line.startswith("[segment]"):
+            _handle_segment_pool(line, pool_map, pool_total, handle)
+            flush_manifests()
+        elif line.startswith("[watchdog]"):
+            in_flight.update(_parse_watchdog_indices(line))
+            handle.log(line, "WARNING")
+        else:
+            handle.log(line)
+
+    run_log = layout.logs / f"tts_batch_{time.strftime('%Y%m%d_%H%M%S')}.log"
+
+    # No pool (everything done / empty, or every file a prep fatal): settle without the
+    # engine — all-fatals raise inside _settle_pool (nothing was synthesized).
+    if pool_total == 0:
+        handle.log(f"无待合成段（{n} 个文件），不启动引擎")
+        return _settle_pool(handle, files)
+
+    # The pooled rows' own out_dir decides their save location; the whole-batch --out-dir is
+    # just the worker's required fallback (constraint 3) — the first pooled file's package.
+    for f in files:
+        if f.pending and not f.error:
+            f.out_dir.mkdir(parents=True, exist_ok=True)  # the manifest flush needs the dir
+    out_dir_fallback = next(f.out_dir for f in files if f.pending and not f.error)
+    handle.log(f"引擎：.venv-tts（一次性子进程，全池统一调度，模型只加载一次）· 批内上限 {workers} 段")
+    handle.log(f"运行日志（排障用，含每次重启的完整引擎输出）：{run_log}")
+
+    MAX_ATTEMPTS = 8
+    excluded: set = set()  # pool indices isolated after two strikes
+    struck: dict = {}
+    attempt = 0
+    try:
+        while True:
+            if attempt > MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"音频合成引擎反复超时（{MAX_ATTEMPTS} 次缩批重试后仍未完成）——已完成进度已保住，"
+                    f"请调小「批内段数」后重试。"
+                )
+            # The restart keeps the remaining rows' ORIGINAL pool indices (no renumbering):
+            # the manifest / result mapping and the workers' protocol stay stable across
+            # restarts.
+            remaining = []
+            for row in pool_rows:
+                if row["index"] in excluded:
+                    continue
+                f, local = pool_map[row["index"]]
+                if (f.seg_results.get(local) or {}).get("ok"):
+                    continue
+                remaining.append(row)
+            if not remaining:
+                break
+            seg_file.write_bytes(json.dumps(remaining, ensure_ascii=False).encode("utf-8"))
+            cmd = _build_cmd(
+                python, worker, seg_file, vc_path, out_dir_fallback,
+                language=t.language, device=t.device,
+                model=t.model, base_model=t.base_model, design_model=t.design_model,
+                ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
+                workspace=ws, disabled_checks=disabled_planner_checks(t),
+            )
+            in_flight.clear()  # a fresh child starts with an empty in-flight set
+            try:
+                run_worker(cmd, handle, on_line, temp_files=(seg_file,),
+                           fail_prefix="音频合成引擎", watchdog_code=124, log_file=run_log)
+                break  # a clean exit (0)
+            except WorkerWatchdogTimeout:
+                attempt += 1
+                if workers > 1:
+                    workers = max(1, workers // 2)
+                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+                else:
+                    # workers == 1: strike the in-flight POOL rows; two strikes isolate a
+                    # poison row — mapped back to its chapter for the manifest write.
+                    newly = []
+                    for pi in sorted(in_flight):
+                        struck[pi] = struck.get(pi, 0) + 1
+                        if struck[pi] >= 2:
+                            excluded.add(pi)
+                            f, local = pool_map[pi]
+                            f.seg_results[local] = {"ok": False, "path": "", "reason": "超时（已隔离）"}
+                            f.dirty = True
+                            newly.append((f, local, pi))
+                    if newly:
+                        names = "、".join(f"{f.name} 第 {local + 1} 段（池内第 {pi + 1}）"
+                                          for f, local, pi in sorted(newly, key=lambda t_: t_[2]))
+                        handle.log(f"{names} 连续两次超时 → 隔离为失败，其余段继续", "WARNING")
+                    else:
+                        handle.log("看门狗触发（单段超时，首次记罚）→ 重启引擎重试", "WARNING")
+                # The restart rebuilds its segment table from in-memory state (a throttled
+                # manifest can't cause re-synthesis) — flush every pooled file anyway so a
+                # backend crash in the gap can't make a later resume re-do the last ~2s.
+                flush_manifests(force=True)
+                continue
+    except Exception:
+        # Cancel / engine failure / attempt cap: force-flush every pooled file's manifest,
+        # then let the exception settle the task (TaskCancelled re-raised verbatim).
+        flush_manifests(force=True)
+        raise
+
+    # Final authoritative manifests (the throttled writes may lag up to the interval; also a
+    # safety net in case the child exits before its last line is drained).
+    flush_manifests(force=True)
+    return _settle_pool(handle, files)

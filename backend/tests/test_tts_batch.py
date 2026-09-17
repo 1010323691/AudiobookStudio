@@ -653,36 +653,99 @@ def _seed_done_package(ws, pkg, done):
     return out_dir
 
 
-def test_synthesize_multi_one_done_short_circuits(workspace, monkeypatch):
-    """A fully-done file never spawns the engine; the pending file runs; results aggregate."""
-    ws = workspace
-    _seed_second_file(ws)
-    _seed_done_package(ws, "t", [(0, "C", "uno", "0001.mp3"), (1, "C", "dos", "0002.mp3")])
-    calls = []
+def _fake_run_worker_pool(calls, errors=(), progress=False):
+    """A run_worker stand-in for POOLED multi-file runs: records the cmd, then replays the
+    pool rows per the REAL worker's save rules — file number = file_index + 1 (the row's
+    chapter position; the segment-table index when absent), zero-padded to the loaded
+    table's width, saved under the row's own out_dir (the cmd's --out-dir is only the
+    fallback). ``errors`` = (package-dir-name, file_index) pairs that get an error line
+    instead of a file; ``progress`` emits the worker's [progress] lines the way the real
+    run_worker intercepts them (straight to handle.progress)."""
 
     def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
         calls.append(cmd)
         with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
             segs = json.load(f)
-        out_dir = cmd[cmd.index("--out-dir") + 1]
+        fallback = cmd[cmd.index("--out-dir") + 1]
+        width = max(4, len(str(len(segs))))
+        if progress:
+            handle.progress(0.05, "生成中")
         for s in segs:
-            # write the file the line claims to have produced (is_done = ok + file on disk)
-            (Path(out_dir) / f"{s['index'] + 1:04d}.mp3").write_bytes(b"fake")
-            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+            local = s.get("file_index", s["index"])
+            num = int(local) + 1
+            out = s.get("out_dir") or fallback
+            if (Path(out).name, local) in errors:
+                on_line(f"[segment] {s['index']} error 强制失败（fake worker）")
+            else:
+                (Path(out) / f"{num:0{width}d}.mp3").write_bytes(b"fake")
+                on_line(f"[segment] {s['index']} ok {os.path.join(out, f'{num:0{width}d}.mp3')}")
+        if progress:
+            handle.progress(1.0, "完成")
         return deque()
 
+    return run_worker
+
+
+def _stub_engine_pool(monkeypatch, calls, errors=(), progress=False):
+    """Point the engine at the pooled fake worker (no real .venv-tts subprocess)."""
     monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
-    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    monkeypatch.setattr(tts_batch, "run_worker", _fake_run_worker_pool(calls, errors, progress))
+
+
+def test_pool_rows_carry_per_row_out_dir_and_file_index():
+    """_build_pool_rows (pure): pool indices consecutive from 0; file_index stays
+    chapter-local; out_dir is each chapter's own package; fatal / no-pending files
+    contribute no rows; the input segments are not mutated."""
+    from backend.engines.tts_batch import _PooledFile, _build_pool_rows
+    s_segs = [{"index": 0, "speaker": "A", "text": "a", "instruct": "", "pause_after": None},
+              {"index": 1, "speaker": "B", "text": "b", "instruct": "", "pause_after": None}]
+    t_segs = [{"index": 0, "speaker": "C", "text": "c", "instruct": "", "pause_after": None},
+              {"index": 2, "speaker": "C", "text": "d", "instruct": "", "pause_after": None}]  # local gap kept
+    fatal = _PooledFile(name="bad.json", error="无法解析")
+    empty = _PooledFile(name="empty.json", pending=[])
+    s = _PooledFile(name="s.json", out_dir=Path("C:/ws/05_audio_chunk/s"),
+                    all_segments=s_segs, by_index={x["index"]: x for x in s_segs}, pending=[0, 1])
+    t = _PooledFile(name="t.json", out_dir=Path("C:/ws/05_audio_chunk/t"),
+                    all_segments=t_segs, by_index={x["index"]: x for x in t_segs}, pending=[0, 2])
+    rows, owners = _build_pool_rows([s, fatal, t, empty])
+    assert [r["index"] for r in rows] == [0, 1, 2, 3]  # pool-global, consecutive
+    assert [r["file_index"] for r in rows] == [0, 1, 0, 2]  # chapter-local, gaps kept
+    assert [Path(r["out_dir"]) for r in rows] == [
+        Path("C:/ws/05_audio_chunk/s")] * 2 + [Path("C:/ws/05_audio_chunk/t")] * 2
+    assert [o.name for o in owners] == ["s.json", "s.json", "t.json", "t.json"]
+    assert rows[0]["speaker"] == "A" and rows[3]["text"] == "d"  # the chapter's fields ride along
+    assert s_segs[0] == {"index": 0, "speaker": "A", "text": "a", "instruct": "", "pause_after": None}
+
+
+def test_synthesize_multi_one_done_file_contributes_no_pool_rows(workspace, monkeypatch):
+    """A fully-done file contributes no pool rows — one engine spawn for the pending file;
+    the pool's rows carry per-row chapter attribution; results aggregate per chapter."""
+    ws = workspace
+    _seed_second_file(ws)
+    _seed_done_package(ws, "s", [(0, "A", "hello", "0001.mp3"), (1, "B", "world", "0002.mp3")])
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
     h = _Handle()
     result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
 
     assert len(calls) == 1  # the done file short-circuits (no wasted model load)
-    assert _cmd_flag(calls[0], "--out-dir").endswith(os.path.join("05_audio_chunk", "s"))
+    rows = json.loads(Path(calls[0][calls[0].index("--segments-file") + 1]).read_text("utf-8"))
+    assert len(rows) == 2  # t's two rows only — s contributed none
+    assert [r["index"] for r in rows] == [0, 1]  # pool-global positions, consecutive
+    assert [r["file_index"] for r in rows] == [0, 1]  # t's chapter-local line positions
+    assert all(r["out_dir"].endswith(os.path.join("05_audio_chunk", "t")) for r in rows)
+    # --out-dir is the first POOLED file's package (fallback only, never a per-row dir here)
+    assert _cmd_flag(calls[0], "--out-dir").endswith(os.path.join("05_audio_chunk", "t"))
     assert [f["script"] for f in result["files"]] == ["s.json", "t.json"]  # request order
-    assert result["files"][0]["completed"] == 2 and result["files"][0]["error"] is None
-    assert result["files"][1]["completed"] == 2 and result["files"][1]["error"] is None
+    s, t = result["files"]
+    assert s["total"] == 2 and s["completed"] == 2 and s["error"] is None  # no-rows short form
+    assert t["total"] == 2 and t["completed"] == 2 and t["error"] is None
     assert result["total"] == 4 and result["completed"] == 4 and result["failed"] == []
     assert result["done_count"] == 4 and result["all_count"] == 4
+    # the done file's cumulative manifest survives the run (rewritten in the no-rows path)
+    m = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert m[0]["ok"] and m[1]["ok"]
 
 
 def test_synthesize_multi_all_done_no_engine(workspace, monkeypatch):
@@ -723,73 +786,98 @@ def test_synthesize_multi_zero_segment_files_succeed(workspace, monkeypatch):
 
 
 def test_synthesize_multi_failed_segments_tagged_with_script(workspace, monkeypatch):
-    """One failed segment in file 2: the run succeeds; the failure carries its file name."""
+    """One failed segment in chapter 2: the run succeeds; the failure carries its file name
+    and LOCAL index; the chapter's error stays None (engine-level failures are NOT a
+    prep fatal) and the package manifest records ok:false."""
     ws = workspace
     _seed_second_file(ws)
-
-    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
-        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
-            segs = json.load(f)
-        out_dir = cmd[cmd.index("--out-dir") + 1]
-        for s in segs:
-            # fail exactly one segment — in file 2 only (the package dir is named after the stem)
-            if Path(out_dir).name == "t" and s["index"] == 1:
-                on_line(f"[segment] {s['index']} error 强制失败（fake worker）")
-            else:
-                (Path(out_dir) / f"{s['index'] + 1:04d}.mp3").write_bytes(b"fake")
-                on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
-        return deque()
-
-    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
-    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    calls = []
+    _stub_engine_pool(monkeypatch, calls, errors={("t", 1)})
     h = _Handle()
     result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
     assert result["completed"] == 3  # 2 from s.json + 1 from t.json
     assert len(result["failed"]) == 1
-    assert result["failed"][0]["script"] == "t.json" and result["failed"][0]["index"] == 1
+    assert result["failed"][0] == {"index": 1, "speaker": "C",
+                                    "reason": "强制失败（fake worker）", "script": "t.json"}
     assert result["files"][0]["failed"] == 0 and result["files"][1]["failed"] == 1
+    assert result["files"][1]["error"] is None  # new semantics: engine-level ≠ error
+    t = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "t" / "manifest.json").read_text("utf-8"))}
+    assert t[0]["ok"] and t[1]["ok"] is False and t[1]["reason"] == "强制失败（fake worker）"
 
 
-def test_synthesize_multi_progress_windowed_and_monotonic(workspace, monkeypatch):
-    """File i of n runs in the progress window [i/n, (i+1)/n]; the bar never dips and the
-    step label always names the active file (no lingering '完成' from the previous file)."""
+def test_synthesize_multi_progress_driven_by_worker_pool_span(workspace, monkeypatch):
+    """The whole pool's progress is driven by the worker's [progress] lines (0→1); the
+    backend's pooled path emits no per-file progress windows or labels."""
     ws = workspace
     _seed_second_file(ws)
-    _stub_engine(monkeypatch, {})
+    calls = []
+    _stub_engine_pool(monkeypatch, calls, progress=True)
     h = _Handle()
     tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
     fracs = [p[0] for p in h.progresses]
-    assert fracs == pytest.approx([0.01, 0.5, 0.51, 1.0, 1.0])  # per-file windows, then the final 完成
-    assert all(a <= b + 1e-9 for a, b in zip(fracs, fracs[1:]))
+    assert fracs == [0.05, 1.0, 1.0]  # the worker's pool span, then the final settle
+    assert all(a <= b + 1e-9 for a, b in zip(fracs, fracs[1:]))  # monotonic non-decreasing
     labels = [lbl for _f, lbl in h.progresses]
-    assert "s.json · 启动引擎" in labels and "s.json · 完成" in labels
-    assert "t.json · 启动引擎" in labels and "t.json · 完成" in labels
+    assert not any("启动引擎" in lbl for lbl in labels)  # the backend never emits its own
+    assert not any(lbl.startswith("s.json") or lbl.startswith("t.json") for lbl in labels)
+    assert labels[-1] == "完成"
 
 
 def test_synthesize_multi_per_file_fatal_error_isolated(workspace, monkeypatch):
-    """A corrupt file 2 is a recorded per-file error — file 1's success is kept, no exception."""
+    """A corrupt file 2 is a recorded PREP-stage error — file 1's success is kept, the bad
+    file contributes no pool rows, no exception."""
     ws = workspace
     (ws / "03_parsed_json" / "bad.json").write_text("{ not json", encoding="utf-8")
-    _stub_engine(monkeypatch, {})
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
     h = _Handle()
     result = tts_batch.synthesize_multi(h, ["s.json", "bad.json"], 4)
     assert result["files"][0]["completed"] == 2 and result["files"][0]["error"] is None
     assert result["files"][1]["error"] and "无法解析" in result["files"][1]["error"]
-    assert result["completed"] == 2  # the batch as a whole succeeded
+    assert result["files"][1]["total"] == 0  # fatal files are all-zeros
+    assert result["completed"] == 2  # the pool as a whole succeeded
     assert any(lvl == "ERROR" for lvl, _msg in h.logs)  # the isolation is logged
+    assert len(calls) == 1
+    rows = json.loads(Path(calls[0][calls[0].index("--segments-file") + 1]).read_text("utf-8"))
+    assert all(Path(r["out_dir"]).name == "s" for r in rows)  # bad.json never joined the pool
 
 
 def test_synthesize_multi_all_files_fail_raises(workspace):
-    """Nothing got synthesized while files WERE attempted → the task fails."""
+    """Nothing got synthesized while files WERE attempted (prep fatals) → the task fails."""
     ws = workspace
     (ws / "03_parsed_json" / "bad.json").write_text("{ not json", encoding="utf-8")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="全部无法合成"):
         tts_batch.synthesize_multi(_Handle(), ["bad.json", "also-missing.json"], 4)
 
 
-def test_synthesize_multi_cancel_between_files(workspace, monkeypatch):
-    """A cancel at the file boundary propagates (never 'file failed, keep going') — file 1's
-    work is kept, file 2 never reaches the engine."""
+def test_synthesize_multi_cancel_in_prep_never_reaches_engine(workspace, monkeypatch):
+    """A cancel at the prep-stage boundary propagates (never 'file failed, keep going') —
+    the engine never spawns."""
+    ws = workspace
+    _seed_second_file(ws)
+    from backend.core.tasks import TaskCancelled
+
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    h = _Handle()
+    n = 0
+
+    def check():
+        nonlocal n
+        n += 1
+        if n == 2:  # the boundary check before file 2's prep
+            raise TaskCancelled()
+
+    h.check = check
+    with pytest.raises(TaskCancelled):
+        tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert calls == []
+
+
+def test_synthesize_multi_cancel_keeps_finished_pool_work(workspace, monkeypatch):
+    """A cancel mid-run propagates; the finished work's manifests are force-flushed and
+    kept."""
     ws = workspace
     _seed_second_file(ws)
     from backend.core.tasks import TaskCancelled
@@ -800,32 +888,258 @@ def test_synthesize_multi_cancel_between_files(workspace, monkeypatch):
         calls.append(cmd)
         with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
             segs = json.load(f)
-        out_dir = cmd[cmd.index("--out-dir") + 1]
+        fallback = cmd[cmd.index("--out-dir") + 1]
+        width = max(4, len(str(len(segs))))
         for s in segs:
-            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
-        return deque()
+            local = s.get("file_index", s["index"])
+            num = int(local) + 1
+            out = s.get("out_dir") or fallback
+            (Path(out) / f"{num:0{width}d}.mp3").write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {os.path.join(out, f'{num:0{width}d}.mp3')}")
+        handle.check()  # the cancel arrives while the child is still draining
 
     monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
     monkeypatch.setattr(tts_batch, "run_worker", run_worker)
-
     h = _Handle()
     n = 0
 
     def check():
         nonlocal n
         n += 1
-        if n == 2:  # the boundary check before file 2
+        if n == 3:  # file 1 prep, file 2 prep, then the in-run check
             raise TaskCancelled()
 
     h.check = check
-
     with pytest.raises(TaskCancelled):
         tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
-    assert len(calls) == 1  # file 2 never spawned the engine
+    assert len(calls) == 1
     by = {e["index"]: e for e in json.loads(
         (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
     assert by[0]["ok"] and by[1]["ok"]  # file 1's finished work is kept
-    assert not (ws / "05_audio_chunk" / "t").exists()
+
+
+def test_synthesize_multi_cancel_flushes_all_manifests(workspace, monkeypatch):
+    """A cancel force-flushes EVERY pooled file's manifest — even a chapter whose rows the
+    child never reported (its manifest is written with all rows not-done)."""
+    ws = workspace
+    _seed_second_file(ws)
+    from backend.core.tasks import TaskCancelled
+
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        fallback = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:  # report ONLY s's rows before the cancel arrives
+            out = s.get("out_dir") or fallback
+            if Path(out).name != "s":
+                continue
+            local = s.get("file_index", s["index"])
+            num = int(local) + 1
+            (Path(out) / f"{num:04d}.mp3").write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {os.path.join(out, f'{num:04d}.mp3')}")
+        handle.check()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    n = 0
+
+    def check():
+        nonlocal n
+        n += 1
+        if n == 3:  # file 1 prep, file 2 prep, then the in-run check
+            raise TaskCancelled()
+
+    h.check = check
+    with pytest.raises(TaskCancelled):
+        tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    s = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert s[0]["ok"] and s[1]["ok"]
+    t = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "t" / "manifest.json").read_text("utf-8"))}
+    assert t[0]["ok"] is False and t[1]["ok"] is False  # written anyway (not-done rows)
+
+
+def test_synthesize_multi_resume_across_files(workspace, monkeypatch):
+    """A pre-done segment in one chapter is excluded from the pool (resume) and its
+    manifest path is preserved; the pool holds the rest — one engine spawn."""
+    ws = workspace
+    _seed_second_file(ws)
+    _seed_done_package(ws, "s", [(0, "A", "hello", "0001.mp3")])  # s: index 0 done
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+
+    assert len(calls) == 1
+    rows = json.loads(Path(calls[0][calls[0].index("--segments-file") + 1]).read_text("utf-8"))
+    # pool = s's remaining index-1 row + both of t's rows; file_index stays chapter-local
+    assert [(Path(r["out_dir"]).name, r["file_index"]) for r in rows] == [
+        ("s", 1), ("t", 0), ("t", 1)]
+    assert [r["index"] for r in rows] == [0, 1, 2]  # pool-global, consecutive
+    # the pre-done s/0001.mp3 keeps its original path (workspace-relative, forward-slash
+    # form — the pathio on-disk convention)
+    m = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert m[0]["ok"] and m[0]["path"].endswith("05_audio_chunk/s/0001.mp3")
+    assert m[1]["ok"] and m[1]["path"].endswith("05_audio_chunk/s/0002.mp3")
+    s, t = result["files"]
+    assert s["total"] == 1 and s["completed"] == 1  # only the pending row was pooled
+    assert s["done_count"] == 2 and s["all_count"] == 2
+    assert t["total"] == 2 and t["completed"] == 2
+
+
+def test_synthesize_multi_watchdog_pool_index_mapping(workspace, monkeypatch):
+    """A workers==1 strike targets the POOL index and lands on its owning chapter's
+    manifest (never a chapter-internal index): pool index 2 is t's local 0, so the
+    isolation lands in t's package only."""
+    ws = workspace
+    _seed_second_file(ws)
+    POISON = 2  # the pool index of the poison row (t's local 0)
+    kills = [1, 1]  # two whole-process watchdog kills, then a clean run
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        fallback = cmd[cmd.index("--out-dir") + 1]
+        width = max(4, len(str(len(segs))))
+        if kills:
+            # the hung sub-batch holds POISON: the worker names its POOL indices in the
+            # [watchdog] line, then the whole process dies (exit 124)
+            kills.pop(0)
+            on_line(f"[watchdog] timeout batch=1 indices=[{POISON}] elapsed=99s")
+            raise WorkerWatchdogTimeout()
+        for s in segs:
+            local = s.get("file_index", s["index"])
+            num = int(local) + 1
+            out = s.get("out_dir") or fallback
+            (Path(out) / f"{num:0{width}d}.mp3").write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {os.path.join(out, f'{num:0{width}d}.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 1)
+
+    # pool: s(0,1) then t(2,3) — the strike isolated pool index 2 = t's local 0
+    assert result["completed"] == 3 and len(result["failed"]) == 1
+    assert result["failed"][0] == {"index": 0, "speaker": "C",
+                                    "reason": "超时（已隔离）", "script": "t.json"}
+    t = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "t" / "manifest.json").read_text("utf-8"))}
+    assert t[0]["ok"] is False and "隔离" in t[0]["reason"]
+    assert t[1]["ok"] is True
+    s = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
+    assert s[0]["ok"] is True and s[1]["ok"] is True  # s's package untouched by the strike
+
+
+def test_synthesize_multi_one_file_engine_level_all_failed_isolated_in_failed_list(workspace, monkeypatch):
+    """Every pooled segment of ONE chapter fails: the task still succeeds; the chapter's
+    error stays None and its failures land in the top-level failed list + its manifest."""
+    ws = workspace
+    _seed_second_file(ws)
+    calls = []
+    _stub_engine_pool(monkeypatch, calls, errors={("t", 0), ("t", 1)})
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert result["completed"] == 2  # s.json's two rows
+    s, t = result["files"]
+    assert t["error"] is None and t["completed"] == 0 and t["failed"] == 2
+    assert all(f["script"] == "t.json" for f in result["failed"])
+    assert sorted(f["index"] for f in result["failed"]) == [0, 1]  # chapter-local indices
+    m = {e["index"]: e for e in json.loads(
+        (ws / "05_audio_chunk" / "t" / "manifest.json").read_text("utf-8"))}
+    assert m[0]["ok"] is False and m[1]["ok"] is False
+    assert h.progresses[-1] == (1.0, "完成")  # settled as a success
+
+
+def test_synthesize_multi_all_pool_segments_fail_raises(workspace, monkeypatch):
+    """Every pooled segment fails (engine-level) → the task fails; the manifests are still
+    written (all ok:false)."""
+    ws = workspace
+    _seed_second_file(ws)
+    calls = []
+    _stub_engine_pool(monkeypatch, calls, errors={("s", 0), ("s", 1), ("t", 0), ("t", 1)})
+    h = _Handle()
+    with pytest.raises(RuntimeError, match="段合成失败"):
+        tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    for pkg in ("s", "t"):
+        m = {e["index"]: e for e in json.loads(
+            (ws / "05_audio_chunk" / pkg / "manifest.json").read_text("utf-8"))}
+        assert all(v["ok"] is False for v in m.values())
+
+
+def test_synthesize_multi_result_shape_and_file_order(workspace, monkeypatch):
+    """The result dict's shape is pinned (top-level 7 keys; files entries 9 keys) and the
+    files order is the request order — including the prep-fatal placeholder."""
+    ws = workspace
+    _seed_second_file(ws)
+    (ws / "03_parsed_json" / "bad.json").write_text("{ not json", encoding="utf-8")
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "bad.json", "t.json"], 4)
+    assert set(result) == {"total", "completed", "failed", "output_dir", "manifest_path",
+                           "done_count", "all_count", "files"}
+    assert result["output_dir"] == "" and result["manifest_path"] == ""
+    assert [f["script"] for f in result["files"]] == ["s.json", "bad.json", "t.json"]
+    for f in result["files"]:
+        assert set(f) == {"script", "total", "completed", "failed", "output_dir",
+                          "manifest_path", "done_count", "all_count", "error"}
+    bad = result["files"][1]
+    assert bad["error"] and all(bad[k] == 0 for k in
+                                ("total", "completed", "failed", "done_count", "all_count"))
+    assert bad["output_dir"] == "" and bad["manifest_path"] == ""
+
+
+def test_synthesize_multi_cmd_shape_unchanged_for_pool(workspace, monkeypatch):
+    """The pooled run's worker command keeps the exact --flag value pairing (no new flags);
+    --concurrency is ONE pool-level value."""
+    ws = workspace
+    _seed_second_file(ws)
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    tts_batch.synthesize_multi(_Handle(), ["s.json", "t.json"], 4)
+    cmd = calls[0]
+    assert "--design-batch" not in " ".join(cmd)  # sanity: it is a batch command
+    assert cmd[cmd.index("--mode") + 1] == "batch"
+    # every flag token is paired with a value: walk tokens, --* always has a successor
+    tokens = cmd[2:]
+    i = 0
+    while i < len(tokens):
+        assert tokens[i].startswith("--") and i + 1 < len(tokens), f"unpaired flag {tokens[i]}"
+        i += 2
+    assert _cmd_flag(cmd, "--concurrency") == "4"
+    for flag in ("--segments-file", "--voice-config", "--out-dir", "--language", "--device",
+                 "--seed", "--workspace"):
+        assert flag in cmd
+
+
+def test_synthesize_multi_package_collision_guarded(workspace, monkeypatch):
+    """x.json + x_checked.json map to ONE package — the second is a prep fatal (clear
+    error), not a silent overwrite of the first's files/manifest."""
+    ws = workspace
+    # s_checked.json is a distinct script resolving to the same package "s"
+    (ws / "03_parsed_json" / "s_checked.json").write_text(
+        json.dumps([{"speaker": "Z", "text": "z1"}, {"speaker": "Z", "text": "z2"}]),
+        encoding="utf-8")
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "s_checked.json"], 4)
+    first, second = result["files"]
+    assert first["error"] is None and first["completed"] == 2
+    assert second["error"] and "s" in second["error"] and "冲突" in second["error"]
+    assert second["total"] == 0  # the colliding file never joined the pool
+    rows = json.loads(Path(calls[0][calls[0].index("--segments-file") + 1]).read_text("utf-8"))
+    assert all(Path(r["out_dir"]).name == "s" and r["file_index"] in (0, 1) for r in rows)
+    assert [r["file_index"] for r in rows] == [0, 1]  # only s.json's rows (its local lines)
 
 
 # --------------------------------------------------------------------------- #
