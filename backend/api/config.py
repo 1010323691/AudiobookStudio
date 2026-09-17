@@ -32,7 +32,7 @@ def put_config(patch: dict) -> dict:
     """Merge a (possibly partial) patch into the ACTIVE (workspace) config and
     persist it there. Requires a workspace (409 otherwise) — config travels with
     the project; the root template is never written. The request body *is* the
-    patch, e.g. ``{"book": {"target_chars": 120000}, "log": {"level": "DEBUG"}}``.
+    patch, e.g. ``{"log": {"level": "DEBUG"}, "tts": {"batch_concurrency": 6}}``.
     Returns the resulting full config.
     """
     _common.require_workspace()

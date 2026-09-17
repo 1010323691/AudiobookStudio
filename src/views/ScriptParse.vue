@@ -316,7 +316,7 @@ function downloadJob(row: JobRow) {
           </label>
         </div>
         <p v-else class="text-sm text-muted-foreground">
-          02_split_text/ 下暂无 .txt 文件——请先到「分册切割」生成分册。
+          02_split_text/ 下暂无 .txt 文件——请先到「排版与分册」生成分册。
         </p>
 
         <div class="flex flex-wrap items-center gap-2">

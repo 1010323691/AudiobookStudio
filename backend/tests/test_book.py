@@ -1,15 +1,13 @@
 """Invariant tests for the book-chunking engine (``backend/engines/book.py``).
 
 These are the Python port of BookChunker's behavioural contract (its CLAUDE.md
-invariants): chapters tile the whole text; cuts fall only on chapter boundaries;
-chapters are never renumbered; no chapters -> stop (no forced split); and
-concatenating all volumes reproduces the original exactly. Plus unit checks for
-encoding detection, character counting, volume-count choice, Chinese numerals and
-the exact output-file naming.
+invariants): chapters tile the whole text; each chapter is written as exactly one
+file (never split); chapters are never renumbered; no chapters -> stop (no forced
+split); and concatenating all per-chapter files reproduces the original exactly.
+Plus unit checks for encoding detection, character counting, Chinese numerals,
+the chapter-sequence report and the exact output-file naming.
 """
 from __future__ import annotations
-
-import re
 
 from backend.engines import book as B
 
@@ -20,12 +18,11 @@ from backend.engines import book as B
 
 def make_novel(num_chapters: int = 20, body_repeats: int = 40) -> str:
     """Build a synthetic novel: a preamble, then ``num_chapters`` numbered
-    chapters with bodies long enough to force several volumes at a modest target."""
+    chapters with fixed-length bodies (each "段。" line ends in a newline, so the
+    newline-exclusion counting path is exercised)."""
     lines = ["这是一部用于测试的分册小说。", "前言内容，若干行。", ""]
     for i in range(1, num_chapters + 1):
         lines.append(f"第{i}章 标题{i}")
-        # A body of fixed length with embedded newlines, so the newline-exclusion
-        # counting path is exercised (each "段。" line ends in a newline).
         for _ in range(body_repeats):
             lines.append(f"这是第{i}章的一段正文内容。")
     return "\n".join(lines)
@@ -88,43 +85,11 @@ def test_chapter_header_positions_are_real_headers():
         assert text[chs[i]["start"]].startswith("第")
 
 
-def test_no_chapters_yields_no_volumes():
+def test_no_chapters_yields_no_files():
     text = "这是一段没有任何章节标记的普通文本。\n它只是正文，没有第几章。"
     analysis = B.analyze_text(text)
     assert analysis["chapters"] == []
-    assert B.compute_volumes(analysis["chapters"], 1000) == []  # stop, never force-split
-
-
-# --------------------------------------------------------------------------- #
-# Volume computation
-# --------------------------------------------------------------------------- #
-
-def test_choose_volume_count():
-    # exact single volume
-    assert B.choose_volume_count(100, 100, 10) == 1
-    # total/target = 1.67 -> closer to 2
-    assert B.choose_volume_count(100, 60, 10) == 2
-    # total/target = 2.5 -> closer to 3
-    assert B.choose_volume_count(100, 40, 10) == 3
-    # clamped to N (can't exceed chapter count)
-    assert B.choose_volume_count(100, 30, 3) == 3
-    # tiny file -> one volume (kLo clamps to 1, kHi == 1)
-    assert B.choose_volume_count(50, 100, 10) == 1
-
-
-def test_volumes_partition_chapters_contiguously():
-    text = make_novel(30)
-    analysis = B.analyze_text(text)
-    vols = B.compute_volumes(analysis["chapters"], 1500)
-    N = len(analysis["chapters"])
-    assert len(vols) >= 2
-
-    assert vols[0]["firstChapter"] == 0
-    assert vols[-1]["lastChapter"] == N - 1
-    for a, b in zip(vols, vols[1:]):
-        assert a["lastChapter"] + 1 == b["firstChapter"]
-    for v in vols:
-        assert v["firstChapter"] <= v["lastChapter"]
+    assert B.make_chapter_filenames("书", analysis["chapters"]) == []  # stop, never force-split
 
 
 # --------------------------------------------------------------------------- #
@@ -134,27 +99,18 @@ def test_volumes_partition_chapters_contiguously():
 def test_round_trip_concatenation_equals_original():
     text = make_novel(40)
     analysis = B.analyze_text(text)
-    vols = B.compute_volumes(analysis["chapters"], 1200)
-    assert len(vols) >= 2
-
-    joined = "".join(B.volume_content(analysis, v) for v in vols)
-    assert joined == text  # no character lost, added, or reordered
-
-
-def test_round_trip_single_volume():
-    text = make_novel(5)
-    analysis = B.analyze_text(text)
-    vols = B.compute_volumes(analysis["chapters"], 10_000_000)  # huge target -> 1 volume
-    assert len(vols) == 1
-    assert B.volume_content(analysis, vols[0]) == text
+    # One file per chapter: concatenating the per-chapter slices reproduces the
+    # original exactly (no character lost, added, or reordered).
+    joined = "".join(B.chapter_content(analysis, ch) for ch in analysis["chapters"])
+    assert joined == text
 
 
 # --------------------------------------------------------------------------- #
 # Output-file naming (exact contract)
 # --------------------------------------------------------------------------- #
 
-def test_volume_filenames_format_and_padding():
-    # Chapters numbered 1..5 -> width max(3, 1) = 3; two volumes -> width 2.
+def test_chapter_filenames_format_and_padding():
+    # Chapters numbered 1..5 -> NN width max(2, 1) = 2; chapter width max(3, 1) = 3.
     chapters = [
         {"num": 1, "numStr": "1"},
         {"num": 2, "numStr": "2"},
@@ -162,47 +118,77 @@ def test_volume_filenames_format_and_padding():
         {"num": 4, "numStr": "4"},
         {"num": 5, "numStr": "5"},
     ]
-    volumes = [
-        {"firstChapter": 0, "lastChapter": 1},  # 第1章 ~ 第2章
-        {"firstChapter": 2, "lastChapter": 4},  # 第3章 ~ 第5章
-    ]
-    names = B.make_volume_filenames("测试小说", volumes, chapters)
+    names = B.make_chapter_filenames("测试小说", chapters)
     assert names == [
-        "测试小说 分册01 第001章 ~ 第002章.txt",
-        "测试小说 分册02 第003章 ~ 第005章.txt",
+        "测试小说 分册01 第001章.txt",
+        "测试小说 分册02 第002章.txt",
+        "测试小说 分册03 第003章.txt",
+        "测试小说 分册04 第004章.txt",
+        "测试小说 分册05 第005章.txt",
     ]
 
 
-def test_volume_filenames_widen_with_largest_number():
+def test_chapter_filenames_widen_with_largest_number():
     # Largest chapter number is 1234 -> width 4 (>= 3).
     chapters = [{"num": 1, "numStr": "1"}, {"num": 1234, "numStr": "1234"}]
-    volumes = [{"firstChapter": 0, "lastChapter": 1}]
-    names = B.make_volume_filenames("书", volumes, chapters)
-    assert names == ["书 分册01 第0001章 ~ 第1234章.txt"]
+    names = B.make_chapter_filenames("书", chapters)
+    assert names == ["书 分册01 第0001章.txt", "书 分册02 第1234章.txt"]
 
 
-def test_volume_filenames_keep_original_non_numeric_labels():
+def test_chapter_filenames_keep_original_non_numeric_labels():
     # A chapter whose number can't be parsed keeps its raw label, unpadded.
     chapters = [
         {"num": None, "numStr": "楔子"},
         {"num": 1, "numStr": "1"},
     ]
-    volumes = [{"firstChapter": 0, "lastChapter": 1}]
-    names = B.make_volume_filenames("书", volumes, chapters)
+    names = B.make_chapter_filenames("书", chapters)
     # 楔子 is unpadded; chapter 1 padded to width 3.
-    assert names == ["书 分册01 第楔子章 ~ 第001章.txt"]
+    assert names == ["书 分册01 第楔子章.txt", "书 分册02 第001章.txt"]
 
 
-def test_volume_filenames_never_renumber():
+def test_chapter_filenames_never_renumber():
     # A gap (1, 2, 5) must be preserved, not renumbered to 1,2,3.
     chapters = [
         {"num": 1, "numStr": "1"},
         {"num": 2, "numStr": "2"},
         {"num": 5, "numStr": "5"},
     ]
-    volumes = [{"firstChapter": 0, "lastChapter": 2}]
-    names = B.make_volume_filenames("书", volumes, chapters)
-    assert names == ["书 分册01 第001章 ~ 第005章.txt"]
+    names = B.make_chapter_filenames("书", chapters)
+    assert names == [
+        "书 分册01 第001章.txt",
+        "书 分册02 第002章.txt",
+        "书 分册03 第005章.txt",
+    ]
+
+
+def test_chapter_filenames_widen_with_count():
+    # 120 chapters -> NN width max(2, digits of 120) = 3; chapter-number width
+    # is driven by the largest NUMBER (120 -> 3), not by the count.
+    chapters = [{"num": i, "numStr": str(i)} for i in range(1, 121)]
+    names = B.make_chapter_filenames("书", chapters)
+    assert names[0] == "书 分册001 第001章.txt"
+    assert names[-1] == "书 分册120 第120章.txt"
+
+
+def test_chapter_filenames_unique_for_duplicate_numbers():
+    # Duplicated chapter numbers must not collide: the positional 分册NN disambiguates.
+    chapters = [{"num": 5, "numStr": "5"}, {"num": 5, "numStr": "5"}]
+    names = B.make_chapter_filenames("书", chapters)
+    assert names == ["书 分册01 第005章.txt", "书 分册02 第005章.txt"]
+
+
+def test_whole_book_filename():
+    assert B.make_whole_book_filename("书") == "书 全书.txt"
+    # Same sanitizing rules as chapter names.
+    assert B.make_whole_book_filename("a/b*c") == "a_b_c 全书.txt"
+
+
+def test_expected_format_string():
+    # The user-visible recognition rule, shipped with the analyze response.
+    fmt = B.EXPECTED_CHAPTER_FORMAT
+    assert "第N章" in fmt
+    assert "阿拉伯数字" in fmt
+    assert "中文数字" in fmt
 
 
 def test_base_name_and_sanitizing():

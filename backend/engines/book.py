@@ -1,7 +1,8 @@
 """Book chunker core — ported (behavior-preserving) from BookChunker/chunker.js.
 
 Pipeline: ``decode_buffer`` -> ``analyze_text`` (count + ``detect_chapters``) ->
-``compute_volumes`` -> ``volume_content`` / ``make_volume_filenames``.
+``make_chapter_filenames`` / ``chapter_content`` (one file per chapter;
+``make_whole_book_filename`` for the explicit whole-book fallback).
 
 The JS core was written to be Python-compatible (see BookChunker/CLAUDE.md):
 character count == Unicode code points excluding line breaks (matches Python
@@ -9,14 +10,16 @@ character count == Unicode code points excluding line breaks (matches Python
 surrogate halves), so the counting is a direct, simpler port — a single sorted
 list of line-break positions answered by binary search, exactly as the JS does.
 
-Preserved invariants: chapters tile the whole text; cuts fall only on chapter
-boundaries; chapters are never renumbered; no chapters -> stop; concatenating all
-volumes reproduces the original exactly.
+Invariants: chapters tile the whole text; each chapter is written as exactly one
+file (never split); chapters are never renumbered (the 分册NN index is a
+positional sequence number, 第XXX章 carries the original number); no chapters ->
+stop (only an explicit ``whole_book`` opt-in writes the single 全书 file);
+concatenating all per-chapter files (or the single 全书 file) reproduces the
+original exactly.
 """
 from __future__ import annotations
 
 import bisect
-import math
 import re
 import zipfile
 from pathlib import Path
@@ -135,6 +138,12 @@ BOOK_CHAPTER_RE = re.compile(
     re.MULTILINE,
 )
 
+# The only chapter-header shape the splitter recognizes (see BOOK_CHAPTER_RE:
+# 「第N章」+ optional <=50-char title, N = Arabic or Chinese numerals). Single
+# source of truth, kept next to the regex so the user-facing text can't drift.
+# Shipped with the analyze response so the UI shows the real recognition rule.
+EXPECTED_CHAPTER_FORMAT = "第N章（如 第1章、第2章；N 为阿拉伯数字或中文数字）"
+
 
 def detect_chapters(text: str) -> list[dict]:
     """Return contiguous chapter ranges. Chapters tile the whole text: chapter i
@@ -181,89 +190,6 @@ def filter_spurious_chapters(found: list[dict]) -> list[dict]:
         if cur <= prev and nxt > cur and nxt >= prev:  # isolated dip
             keep[i] = False
     return [f for i, f in enumerate(found) if keep[i]]
-
-
-# ======================= Volume computation =======================
-
-def choose_volume_count(total: int, target: int, N: int) -> int:
-    """Pick K so the average size (total/K) is closest to the target. K is one of
-    {floor, ceil}(total/target), clamped to [1, N]; on a tie the smaller K wins."""
-    def clamp(k: int) -> int:
-        return max(1, min(N, k))
-
-    r = total / target
-    k_lo = clamp(math.floor(r))
-    k_hi = clamp(math.ceil(r))
-    if k_lo == k_hi:
-        return k_lo
-    d_lo = abs(total / k_lo - target)
-    d_hi = abs(total / k_hi - target)
-    if d_hi < d_lo:
-        return k_hi
-    if d_lo < d_hi:
-        return k_lo
-    return min(k_lo, k_hi)
-
-
-def near_boundary(pref: list[int], x: float, lo: int, hi: int) -> int:
-    """Nearest chapter boundary index in [lo, hi] to the ideal char position x,
-    via binary search on the non-decreasing prefix sums."""
-    a, b = lo, hi
-    while a < b:
-        mid = (a + b) // 2
-        if pref[mid] < x:
-            a = mid + 1
-        else:
-            b = mid
-    best = a
-    for c in (a - 1, a, a + 1):
-        if c < lo or c > hi:
-            continue
-        if abs(pref[c] - x) < abs(pref[best] - x):
-            best = c
-    return best
-
-
-def compute_volumes(chapters: list[dict], target: int) -> list[dict]:
-    """Balanced split at chapter boundaries; a chapter larger than the target
-    simply rides in its own (oversized) group."""
-    N = len(chapters)
-    if N == 0:
-        return []
-
-    lens = [c["chars"] for c in chapters]
-    total = sum(lens)
-
-    K = choose_volume_count(total, target, N)
-
-    # Prefix sums: pref[c] = chars of chapters [0, c).
-    pref = [0] * (N + 1)
-    for i in range(N):
-        pref[i + 1] = pref[i] + lens[i]
-
-    # Place K-1 internal cuts near the ideal points, keeping them in order and
-    # leaving at least one chapter per volume.
-    cuts = [0]
-    for g in range(1, K):
-        x = total * g / K
-        lo = cuts[-1] + 1
-        hi = N - (K - g)
-        cuts.append(near_boundary(pref, x, lo, hi))
-    cuts.append(N)
-
-    volumes = []
-    for g in range(K):
-        first = cuts[g]
-        last = cuts[g + 1] - 1
-        volumes.append(
-            {
-                "index": g,
-                "firstChapter": first,
-                "lastChapter": last,
-                "chars": pref[last + 1] - pref[first],
-            }
-        )
-    return volumes
 
 
 # ======================= Chapter-number checks =======================
@@ -379,18 +305,28 @@ def sanitize_file_name(name: str) -> str:
     return name.strip()
 
 
-def make_volume_filenames(base: str, volumes: list[dict], chapters: list[dict]) -> list[str]:
-    """``原文件名 分册XX 第XXX章 ~ 第YYY章.txt`` — the range uses each volume's real
-    (original) first/last chapter numbers, never a renumbering."""
+def make_chapter_filenames(base: str, chapters: list[dict]) -> list[str]:
+    """``<base> 分册NN 第XXX章.txt`` — one file per chapter. ``NN`` is the 1-based
+    sequential volume index (width max(2, digits of the chapter count); it also
+    disambiguates duplicated chapter numbers); ``XXX`` is the chapter's ORIGINAL
+    number (width max(3, digits of the largest number), never renumbered); an
+    unparseable number keeps its raw ``numStr`` unpadded."""
     chap_width = chapter_number_width(chapters)
-    vol_width = max(2, len(str(len(volumes))))
+    nn_width = max(2, len(str(len(chapters))))
     out = []
-    for k, v in enumerate(volumes):
-        from_ = pad_chapter_number(chapter_number(chapters[v["firstChapter"]]), chap_width)
-        to_ = pad_chapter_number(chapter_number(chapters[v["lastChapter"]]), chap_width)
-        name = f"{base} 分册{str(k + 1).zfill(vol_width)} 第{from_}章 ~ 第{to_}章.txt"
+    for i, ch in enumerate(chapters):
+        name = (
+            f"{base} 分册{str(i + 1).zfill(nn_width)} "
+            f"第{pad_chapter_number(chapter_number(ch), chap_width)}章.txt"
+        )
         out.append(sanitize_file_name(name))
     return out
+
+
+def make_whole_book_filename(base: str) -> str:
+    """Whole-book fallback name (zero chapters detected, user chose to continue):
+    ``<base> 全书.txt`` (sanitized like chapter names)."""
+    return sanitize_file_name(f"{base} 全书.txt")
 
 
 # ======================= Analysis =======================
@@ -418,13 +354,10 @@ def analyze_text(
     }
 
 
-def volume_content(analysis: dict, volume: dict) -> str:
-    """A volume's content is a single slice of the original text. Concatenating all
-    volumes reproduces the original exactly."""
-    chs = analysis["chapters"]
-    return analysis["text"][
-        chs[volume["firstChapter"]]["start"]: chs[volume["lastChapter"]]["end"]
-    ]
+def chapter_content(analysis: dict, chapter: dict) -> str:
+    """One chapter's content = one slice of the original text. Concatenating the
+    per-chapter slices in order reproduces the original exactly."""
+    return analysis["text"][chapter["start"]: chapter["end"]]
 
 
 # ======================= ZIP (STORE) =======================

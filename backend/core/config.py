@@ -47,10 +47,6 @@ class TextConfig(BaseModel):
     live: bool = True  # UI-only: reformat immediately on change
 
 
-class BookConfig(BaseModel):
-    target_chars: int = 100000  # per-volume target (from BookChunker)
-
-
 class AudioConfig(BaseModel):
     target_duration: str = "10:00"
     naming_format: str = "第 {} 集"
@@ -180,9 +176,12 @@ class GenerationConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    # NOTE: the ``book`` section (target_chars) was removed with the switch to
+    # strict per-chapter splitting. Old config files may still carry it — the
+    # default ``extra='ignore'`` drops it on load; the next save removes it from
+    # disk. Reads therefore never fail on legacy configs.
     paths: PathsConfig = Field(default_factory=PathsConfig)
     text: TextConfig = Field(default_factory=TextConfig)
-    book: BookConfig = Field(default_factory=BookConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)

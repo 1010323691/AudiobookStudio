@@ -53,12 +53,6 @@ export interface BookChapter {
   title: string
   chars: number
 }
-export interface BookVolume {
-  index: number
-  firstChapter: number
-  lastChapter: number
-  chars: number
-}
 export interface BookSequenceReport {
   count: number
   parseable: number
@@ -74,13 +68,12 @@ export interface BookAnalyzeResult {
   source: string
   encoding: string
   base: string
-  target_chars: number
   total_chars: number
   chapters: BookChapter[]
   chapter_count: number
-  volume_count: number
-  volumes: BookVolume[]
   filenames: string[]
+  /** The chapter format the splitter actually recognizes (「第N章」) — user-facing. */
+  expected_format: string
   sequence: BookSequenceReport
   error: string | null
 }
@@ -432,7 +425,6 @@ export type TaskControl = 'cancel' | 'pause' | 'resume' | 'retry'
 export interface AppConfig {
   paths: { working_dir: string }
   text: TextToggles
-  book: { target_chars: number }
   audio: {
     target_duration: string
     naming_format: string

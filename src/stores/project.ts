@@ -3,18 +3,17 @@ import { computed, ref } from 'vue'
 import type {
   AudioCutResult,
   BatchResult,
-  BookSplitResult,
   MergeResult,
   PrepareFoundationsResult,
-  TextFormatResult,
 } from '@/types'
 
 /**
  * Pipeline handoff (requirement #3): each stage records the result it produced
  * so the dashboard can show per-stage completion and offer "前往下一步".
  *
- *   文本排版 output   →  分册切割 input
- *   分册切割 outputs  →  文本解析 input
+ *   排版与分册 files  →  文本解析 input   (the merged page keeps its state page-local;
+ *                                handoff is on disk — 02_split_text/, which the parse
+ *                                page lists directly)
  *   音频合并 output   →  音频分集 input
  *
  * The middle stages (文本解析 / 角色配音 / 音频合成 / 音频合并) all read fixed
@@ -22,12 +21,6 @@ import type {
  * path handoff — only a "done" marker for the dashboard.
  */
 export const useProjectStore = defineStore('project', () => {
-  const textOutput = ref<string | null>(null) // a formatted .txt path
-  const textResult = ref<TextFormatResult | null>(null)
-
-  const bookOutputs = ref<string[]>([]) // volume .txt paths
-  const bookResult = ref<BookSplitResult | null>(null)
-
   // Which parsed JSON (a file name in 03_parsed_json/) the downstream 角色配音 / 音频合成
   // stages should read. Shared by both pages so they operate on the same file.
   // Empty string → the backend falls back to the most recently written JSON.
@@ -39,20 +32,9 @@ export const useProjectStore = defineStore('project', () => {
   const audioOutputs = ref<string[]>([]) // cut .mp3 paths
   const audioResult = ref<AudioCutResult | null>(null)
 
-  // What the next stage would consume if the user hits "前往下一步".
-  const bookInput = computed(() => textOutput.value)
-  const scriptInput = computed(() => bookOutputs.value)
   // The audio stage consumes *audio* — the merged audiobook (or a user-picked file).
   const audioInput = computed(() => mergeResult.value?.path ?? null)
 
-  function recordText(r: TextFormatResult) {
-    textResult.value = r
-    textOutput.value = r.output_path
-  }
-  function recordBook(r: BookSplitResult) {
-    bookResult.value = r
-    bookOutputs.value = r.files.map((f) => f.path)
-  }
   function setActiveScript(name: string) {
     activeScript.value = name
   }
@@ -71,21 +53,13 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   return {
-    textOutput,
-    textResult,
-    bookOutputs,
-    bookResult,
     activeScript,
     voiceResult,
     batchResult,
     mergeResult,
     audioOutputs,
     audioResult,
-    bookInput,
-    scriptInput,
     audioInput,
-    recordText,
-    recordBook,
     setActiveScript,
     recordVoices,
     recordBatch,

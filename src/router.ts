@@ -22,13 +22,7 @@ const router = createRouter({
           path: 'text',
           name: 'text',
           component: () => import('@/views/TextFormat.vue'),
-          meta: { title: '文本排版' },
-        },
-        {
-          path: 'book',
-          name: 'book',
-          component: () => import('@/views/BookSplit.vue'),
-          meta: { title: '分册切割' },
+          meta: { title: '排版与分册' },
         },
         {
           path: 'script',

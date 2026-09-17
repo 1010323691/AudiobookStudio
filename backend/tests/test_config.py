@@ -151,9 +151,12 @@ def test_get_config_unset_returns_root_template(sandbox):
 
 
 def test_set_workspace_pointer_updates_only_pointer(sandbox):
-    # A distinct template value survives; only the pointer field changes.
+    # A distinct known template value survives the rewrite; the legacy ``book``
+    # section (removed with target-chars splitting) is dropped; only the pointer
+    # field changes.
     data = _read(sandbox / "app.json")
-    data["book"] = {"target_chars": 123456}
+    data["text"] = {"live": False}  # a known value distinct from the default
+    data["book"] = {"target_chars": 123456}  # legacy section from an old template
     (sandbox / "app.json").write_text(json.dumps(data), encoding="utf-8")
     core_config.reset_config_cache()
 
@@ -161,7 +164,8 @@ def test_set_workspace_pointer_updates_only_pointer(sandbox):
 
     after = _read(sandbox / "app.json")
     assert after["paths"]["working_dir"] == str(sandbox / "MyBook")
-    assert after["book"]["target_chars"] == 123456  # template value preserved
+    assert after["text"]["live"] is False  # known template value preserved
+    assert "book" not in after  # legacy section dropped on rewrite
 
 
 def test_get_config_set_reads_workspace_config(sandbox):
@@ -170,7 +174,7 @@ def test_get_config_set_reads_workspace_config(sandbox):
     # Give the workspace its own (distinct) config:
     ws_cfg = AppConfig()
     ws_cfg.paths.working_dir = str(ws)
-    ws_cfg.book.target_chars = 999999
+    ws_cfg.generation.check_batch_size = 777
     (ws / "config").mkdir(parents=True)
     (ws / "config" / "app.json").write_text(
         json.dumps(ws_cfg.model_dump()), encoding="utf-8"
@@ -179,12 +183,12 @@ def test_get_config_set_reads_workspace_config(sandbox):
 
     cfg = core_config.get_config()
     assert cfg.paths.working_dir == str(ws)
-    assert cfg.book.target_chars == 999999  # from the workspace config, not the template
+    assert cfg.generation.check_batch_size == 777  # from the workspace config, not the template
 
 
 def test_update_config_requires_workspace(sandbox):
     with pytest.raises(core_config.WorkspaceNotSetError):
-        core_config.update_config({"book": {"target_chars": 1}})
+        core_config.update_config({"log": {"level": "DEBUG"}})
 
 
 def test_update_config_writes_workspace_and_forces_pointer(sandbox):
@@ -192,12 +196,12 @@ def test_update_config_writes_workspace_and_forces_pointer(sandbox):
     core_config.init_workspace_config(ws)  # seeds ws/config/app.json
     core_config.set_workspace_pointer(str(ws))
 
-    cfg = core_config.update_config({"book": {"target_chars": 777}})
-    assert cfg.book.target_chars == 777
+    cfg = core_config.update_config({"tts": {"batch_concurrency": 5}})
+    assert cfg.tts.batch_concurrency == 5
     assert cfg.paths.working_dir == str(ws)  # forced to the workspace itself
 
     # The value landed in the workspace config; the ROOT template is untouched:
-    assert _read(ws / "config" / "app.json")["book"]["target_chars"] == 777
+    assert _read(ws / "config" / "app.json")["tts"]["batch_concurrency"] == 5
     assert _read(sandbox / "app.json")["paths"]["working_dir"] == str(ws)
 
 
@@ -212,12 +216,16 @@ def test_init_workspace_config_copies_template_and_sets_pointer(sandbox):
 def test_init_workspace_config_never_overwrites(sandbox):
     ws = sandbox / "NewBook"
     (ws / "config").mkdir(parents=True)
+    # The legacy ``book`` marker stays on disk (never rewritten here) — it is
+    # dropped only by an explicit settings save.
     marker = {"paths": {"working_dir": str(ws)}, "book": {"target_chars": 424242}}
     (ws / "config" / "app.json").write_text(json.dumps(marker), encoding="utf-8")
 
     core_config.init_workspace_config(ws)  # must NOT overwrite an existing config
 
-    assert _read(ws / "config" / "app.json")["book"]["target_chars"] == 424242
+    after = _read(ws / "config" / "app.json")
+    assert after["paths"]["working_dir"] == str(ws)
+    assert after["book"]["target_chars"] == 424242
 
 
 def test_template_seeded_from_defaults_when_missing(sandbox):
@@ -228,4 +236,4 @@ def test_template_seeded_from_defaults_when_missing(sandbox):
     assert (sandbox / "app.json").exists()
     data = _read(sandbox / "app.json")
     assert data["paths"]["working_dir"] == str(sandbox / "X")
-    assert "tts" in data and "book" in data  # the full model was seeded
+    assert "tts" in data and "book" not in data  # the full model was seeded (no book section)

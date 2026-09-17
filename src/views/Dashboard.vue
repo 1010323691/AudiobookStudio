@@ -22,7 +22,7 @@ const wsBusy = ref(false)
 const WS_DIR_LABELS: [string, string][] = [
   ['00_temp', '临时文件'],
   ['01_input', '原始输入 / 排版文本'],
-  ['02_split_text', '分册切割结果'],
+  ['02_split_text', '排版与分册结果'],
   ['03_parsed_json', '文本解析 JSON'],
   ['04_voice_profiles', '角色配音配置'],
   ['05_audio_chunk', '音频合成片段'],

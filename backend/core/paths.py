@@ -5,7 +5,7 @@ One root — the user's chosen workspace (``paths.working_dir`` in the root
 
     00_temp/           # scratch files for engine subprocesses
     01_input/          # raw uploads + formatted text
-    02_split_text/     # book-splitting (volume) results
+    02_split_text/     # per-chapter split files (one per chapter; or a single 全书 file)
     03_parsed_json/    # LLM-parsed script JSON
     04_voice_profiles/ # character voice configs / preview WAVs
     05_audio_chunk/    # per-segment batch audio (+ manifest)

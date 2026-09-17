@@ -29,7 +29,6 @@ import {
   Palette,
   FolderCog,
   Type,
-  BookOpen,
   Server,
   SlidersHorizontal,
   MessageSquareText,
@@ -182,18 +181,6 @@ async function save() {
               <Switch v-model="draft.text[t.key]" />
             </div>
           </div>
-        </CardContent>
-      </Card>
-
-      <!-- 分册切割 -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2"><BookOpen class="h-5 w-5" />分册切割</CardTitle>
-        </CardHeader>
-        <CardContent class="flex items-center gap-3">
-          <Label class="w-28 shrink-0">目标字数</Label>
-          <Input v-model.number="draft.book.target_chars" type="number" min="1" class="max-w-[180px]" />
-          <span class="text-xs text-muted-foreground">每分册约多少字</span>
         </CardContent>
       </Card>
 
