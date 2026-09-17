@@ -172,10 +172,21 @@ const speedCps = computed(() => {
   return secs > 0 ? chars / secs : 0
 })
 
+// 刷新恢复：页面重载后 fileJobs 为空，但后端任务仍在跑（store 的 refresh 已拉回全量任务）。
+// 按 module + label 重新挂接非终态解析任务——label 形如「文本解析（{文件名}）」（全角括号）。
+function reattachJobs() {
+  for (const t of taskStore.activeTasks('script')) {
+    if (fileJobs.value.some((j) => j.taskId === t.id)) continue
+    const m = t.label.match(/文本解析（(.+)）$/)
+    if (m) fileJobs.value.push({ name: m[1], taskId: t.id })
+  }
+}
+
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
   await loadFiles()
-  taskStore.refresh()
+  await taskStore.refresh()
+  reattachJobs()
 })
 
 async function loadFiles() {

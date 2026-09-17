@@ -6,6 +6,8 @@ import type {
   MakeClonesOptions,
   BatchRunOptions,
   BatchStatusFiles,
+  MergeSpeakersResult,
+  StressTestOptions,
 } from '@/types'
 
 /** Report whether TTS is implemented (ready vs. engine-not-installed). */
@@ -53,6 +55,30 @@ export function selectVoice(speaker: string, audioId: string | null): Promise<{
   )
 }
 
+/** 角色配音：合并角色 —— 把 source 的台词在 Parse 源数据里全部改为 target（直接改写
+ *  03_parsed_json/*.json，零 LLM 调用），删除 source 的声音配置（候选音频文件留盘），
+ *  指向 source 的别名改指 target。同步写（非任务）；script 语义同 listVoices
+ *  （''/undefined → 最近基文件，'__all__' → 所有基文件）。 */
+export function mergeSpeakers(source: string, target: string, script?: string): Promise<MergeSpeakersResult> {
+  return http.post<MergeSpeakersResult>('/api/tts/voices/merge-speakers', {
+    source,
+    target,
+    script: script || null,
+  })
+}
+
+/** 角色配音：记录用户对某角色性别的标记（人名旁的 ♂/♀ 徽章）。同步写（非任务）；
+ *  gender = 'male' | 'female' | ''（'' = 清除标记，回到未定）。 */
+export function setGender(speaker: string, gender: 'male' | 'female' | ''): Promise<{
+  ok: boolean
+  speaker: string
+  gender: string
+}> {
+  return http.post<{ ok: boolean; speaker: string; gender: string }>(
+    '/api/tts/voices/gender', { speaker, gender },
+  )
+}
+
 /** 音频合成：start a batch TTS Task (all lines, or the given line indices; for a script —
  *  or a whole selection of scripts, the 待合成 card's multi-select: one task synthesizes
  *  the files one by one, each in its own package). The run is a resume: it skips segments
@@ -84,6 +110,23 @@ export function batchStatusFiles(scripts: string[]): Promise<BatchStatusFiles> {
   const q = new URLSearchParams()
   for (const s of scripts) q.append('scripts', s)
   return http.get<BatchStatusFiles>(`/api/tts/batch-status?${q.toString()}`)
+}
+
+/** 压测（临时测试入口）：start a stress-test Task — machine-generated natural lines (no
+ *  LLM, no parsed script) rendered with an arbitrary existing CLONE voice: fixed 批内行数,
+ *  per-row char count grows by `step_chars` every round, one engine subprocess per round,
+ *  running until a round misses the throughput standard (10 chars/second), crashes, or the
+ *  engine errors. Per-round report (处理量 / 耗时 / 真实吞吐) is written to the workspace
+ *  stress_test/ dir; all per-round output is throwaway (00_temp/, deleted per round). */
+export function runStressTest(opts: StressTestOptions): Promise<{ task_id: string }> {
+  return http.post<{ task_id: string }>('/api/tts/stress-test', {
+    rows: opts.rows ?? 64,
+    start_chars: opts.start_chars ?? 10,
+    step_chars: opts.step_chars ?? 10,
+    max_rounds: opts.max_rounds ?? null,
+    speaker: opts.speaker || null,
+    seed: opts.seed ?? null,
+  })
 }
 
 /** 音频合并：start a merge Task for one package (MP3 now; M4B is a later phase).

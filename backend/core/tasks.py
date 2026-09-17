@@ -156,6 +156,11 @@ class Task:
     finished: float = 0.0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
+    # Manager-level broadcast hook (set by ``TaskManager.create``): every event emitted
+    # here is also forwarded to the process-wide bus that feeds the multiplexed
+    # ``GET /api/tasks/stream`` SSE endpoint (one connection per browser tab covers
+    # ALL tasks — see ``TaskManager._bus_event``). None for standalone tasks.
+    _broadcast: Optional[Callable[["Task", dict], None]] = field(default=None, repr=False)
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
     _func: Optional[Callable] = field(default=None, repr=False)
     _args: tuple = field(default=(), repr=False)
@@ -258,6 +263,8 @@ class Task:
                 q.put_nowait(event)
             except queue.Full:
                 pass
+        if self._broadcast is not None:
+            self._broadcast(self, event)
 
     # -- snapshot for the API ------------------------------------------------
     def snapshot(self) -> dict:
@@ -292,13 +299,30 @@ class Task:
 
 
 class TaskManager:
+    # Event types that are display-only and self-healing: a dropped slice is
+    # repaired by the next ``snapshot`` / ``snapshot_all`` / ``final`` (which
+    # replays the authoritative, backend-capped LLM stream). ``log`` / ``progress``
+    # / ``status`` / ``final`` are NOT in this set — they must survive queue
+    # pressure (see ``_bus_put_one``).
+    _DISPLAY_ONLY = ("llm_chunk", "llm_rate")
+
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
+        # Process-wide event bus feeding the multiplexed ``GET /api/tasks/stream``
+        # SSE endpoint. Browsers cap simultaneous HTTP/1.1 connections per host at
+        # ~6, so the UI holds exactly ONE such connection per tab (covering all
+        # tasks, every event carrying ``task_id``) instead of one per task — one
+        # connection per task is exhausted by a few parallel parses and every
+        # EventSource beyond the cap never connects (its window shows no logs
+        # while the backend runs fine).
+        self._bus: set = set()
+        self._bus_lock = threading.Lock()
 
     def create(self, module: str, label: str, func: Callable, *args, **kwargs) -> Task:
         task = Task(id=uuid.uuid4().hex[:12], module=module, label=label)
         task._func, task._args, task._kwargs = func, args, kwargs
+        task._broadcast = self._bus_event
         task.started = time.time()
         task._set_status(TaskStatus.RUNNING)
         with self._lock:
@@ -334,6 +358,51 @@ class TaskManager:
 
     def list(self) -> list[Task]:
         return sorted(self._tasks.values(), key=lambda t: t.created, reverse=True)
+
+    # -- process-wide bus (multiplexed SSE) ----------------------------------
+    def subscribe_all(self) -> queue.Queue:
+        """Subscribe to the events of ALL tasks (current and future).
+
+        Receives ``(task, event)`` tuples; larger ``maxsize`` than a per-task
+        listener because one consumer now drains every task's traffic.
+        """
+        q: queue.Queue = queue.Queue(maxsize=3000)
+        self._bus.add(q)
+        return q
+
+    def unsubscribe_all(self, q: queue.Queue) -> None:
+        self._bus.discard(q)
+
+    def _bus_event(self, task: Task, event: dict) -> None:
+        """Forward one task event to every bus subscriber (called from ``Task._emit``)."""
+        for q in list(self._bus):
+            self._bus_put_one(q, task, event)
+
+    def _bus_put_one(self, q: queue.Queue, task: Task, event: dict) -> None:
+        try:
+            q.put_nowait((task, event))
+            return
+        except queue.Full:
+            pass
+        # Queue full. A display-only event can simply be dropped (self-healing,
+        # see ``_DISPLAY_ONLY``); a critical one (log / progress / status /
+        # final) is kept — evict the oldest display-only items first, retry.
+        if event.get("type") in self._DISPLAY_ONLY:
+            return
+        with self._bus_lock:
+            items: list = []
+            while True:
+                try:
+                    items.append(q.get_nowait())
+                except queue.Empty:
+                    break
+            for t_old, e_old in items:
+                if e_old.get("type") not in self._DISPLAY_ONLY:
+                    q.put_nowait((t_old, e_old))
+            try:
+                q.put_nowait((task, event))
+            except queue.Full:
+                pass
 
     # -- controls ------------------------------------------------------------
     def control(self, task_id: str, action: str) -> Task:

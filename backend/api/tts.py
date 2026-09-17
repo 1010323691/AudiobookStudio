@@ -27,6 +27,7 @@ from ..core.tasks import TERMINAL, get_task_manager
 from ..engines import merge as Merge
 from ..engines import tts as T
 from ..engines import tts_batch as Batch
+from ..engines import tts_stress as Stress
 from ..engines import voices as V
 from . import _common
 
@@ -280,6 +281,9 @@ def list_voices(script: str | None = None) -> dict:
             "clone_status": _clone_status(entry),
             "type": vtype,
             "alias_of": alias_of,
+            # Gender badge: "male" / "female" / "" (unknown). Pre-filled by Phase 1's
+            # persona inference; the user's badge pick is the source of truth.
+            "gender": entry.get("gender", ""),
             "description": entry.get("description", ""),
             "preview": _preview_of(entry.get("ref_audio", "")),
             "candidates": [{"id": c["id"], "preview": _preview_of(c["ref_audio"]), "seed": c["seed"]}
@@ -358,6 +362,176 @@ def select_voice(req: SelectVoiceRequest) -> dict:
             "ref_audio": active["ref_audio"]}
 
 
+class SetGenderRequest(BaseModel):
+    speaker: str
+    # "male" / "female" — set the badge; "" / None = clear it (back to unknown).
+    gender: str = ""
+
+
+@router.post("/voices/gender")
+def set_gender(req: SetGenderRequest) -> dict:
+    """Record the user's gender pick for a character (the badge next to the name).
+
+    Synchronous (no Task): upserts ``gender`` on the character's ``voice_config.json``
+    entry — a character without any entry yet gets a minimal one (script-detected names
+    are valid targets too). A running phase task is refused (409): it rewrites the whole
+    file and would clobber the pick, same guard as the candidate selection.
+    """
+    _common.require_workspace()
+    if _phase_task_active():
+        raise HTTPException(409, "配音任务进行中，请待其结束后再设置性别。")
+    sp = (req.speaker or "").strip()
+    if not sp:
+        raise HTTPException(400, "角色名不能为空。")
+    g = (req.gender or "").strip()
+    if g not in ("male", "female", ""):
+        raise HTTPException(400, "无效的性别值。")
+    layout = get_layout()
+    vc_path = layout.voice_profiles / "voice_config.json"
+    voice_config: dict = {}
+    if vc_path.exists():
+        try:
+            loaded = json.loads(vc_path.read_text("utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError
+            voice_config = loaded
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "声音配置已损坏，无法设置性别。")
+        _n, migrated = pathio.migrate_entries_in(vc_path, layout.workspace, "dict", ("ref_audio",))
+        if isinstance(migrated, dict):
+            voice_config = migrated
+    entry = voice_config.get(sp)
+    if not isinstance(entry, dict):
+        entry = {}
+    if g:
+        entry["gender"] = g
+    else:
+        entry.pop("gender", None)
+    voice_config[sp] = entry
+    vc_path.parent.mkdir(parents=True, exist_ok=True)
+    pathio.rewrite_json_file(vc_path, voice_config)
+    return {"ok": True, "speaker": sp, "gender": g}
+
+
+class MergeSpeakersRequest(BaseModel):
+    # The character being merged away (its lines + voice-config entry disappear).
+    source: str
+    # The character every source line is re-assigned to.
+    target: str
+    # Same semantics as ``list_voices``' script: None/'' -> most recent base file; a file
+    # name -> only that file; "``__all__``" -> every base file (the whole-book view).
+    script: str | None = None
+
+
+@router.post("/voices/merge-speakers")
+def merge_speakers(req: MergeSpeakersRequest) -> dict:
+    """Merge one character into another by rewriting the parsed source data in place.
+
+    Synchronous (no Task): pure deterministic JSON surgery — every entry whose identity
+    is ``source`` (``speaker`` first, ``type`` as fallback — the ``_fold_script`` rule)
+    is re-assigned to ``target`` directly in ``03_parsed_json/*.json`` (no LLM call), the
+    ``source`` entry is removed from ``voice_config.json`` (its candidate WAVs stay on
+    disk — user data is never deleted), and aliases pointing at ``source`` are
+    redirected to ``target``. Only files that actually changed are rewritten (a rewrite
+    refreshes mtime, which would perturb the most-recent-file / ``__all__`` ordering).
+    """
+    _common.require_workspace()
+    if _phase_task_active():
+        raise HTTPException(409, "配音任务进行中，请待其结束后再合并角色。")
+    src = (req.source or "").strip()
+    tgt = (req.target or "").strip()
+    if not src or not tgt:
+        raise HTTPException(400, "角色名不能为空。")
+    if src == tgt:
+        raise HTTPException(400, "源角色与目标角色相同。")
+    layout = get_layout()
+
+    # Which script(s) to read/rewrite (mirrors list_voices' scope resolution).
+    if req.script == ALL_PARSED_JSON:
+        script_paths = [p for p in resolve_parsed_json_all() if p.exists()]
+    else:
+        script_paths = [resolve_parsed_json(req.script)]
+
+    # voice_config: absent is legal (nothing to clean up); corrupt is not.
+    vc_path = layout.voice_profiles / "voice_config.json"
+    voice_config: dict = {}
+    vc_exists = False
+    if vc_path.exists():
+        try:
+            loaded = json.loads(vc_path.read_text("utf-8"))
+            if isinstance(loaded, dict):
+                voice_config = loaded
+                vc_exists = True
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "声音配置已损坏，无法合并角色。")
+        # Lazy migration of legacy absolute ref_audio values (same as the other paths).
+        _n, migrated = pathio.migrate_entries_in(vc_path, layout.workspace, "dict", ("ref_audio",))
+        if isinstance(migrated, dict):
+            voice_config = migrated
+
+    # Collect the identity set across the scope files. A corrupt file is a hard error on
+    # this write endpoint (silently skipping it would leave the file unmerged).
+    file_speakers: set[str] = set()
+    for sp in script_paths:
+        if not sp.exists():
+            continue
+        try:
+            data = json.loads(sp.read_text("utf-8"))
+            if not isinstance(data, list):
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, f"解析文件已损坏，无法合并：{sp.name}")
+        for e in data:
+            if isinstance(e, dict):
+                name = (e.get("speaker") or e.get("type") or "").strip()
+                if name:
+                    file_speakers.add(name)
+
+    if src not in file_speakers and src not in voice_config:
+        raise HTTPException(404, f"未找到角色：{src}")
+    if tgt not in file_speakers and tgt not in voice_config:
+        raise HTTPException(400, f"目标角色不在当前范围：{tgt}")
+
+    # Rewrite the parsed source data: replace the source identity file by file.
+    replaced = 0
+    changed_files: list[str] = []
+    for sp in script_paths:
+        if not sp.exists():
+            continue
+        data = json.loads(sp.read_text("utf-8"))  # validity already checked above
+        changed = 0
+        for e in data:
+            if not isinstance(e, dict):
+                continue
+            spk = (e.get("speaker") or "").strip()
+            tp = (e.get("type") or "").strip()
+            if spk == src:
+                e["speaker"] = tgt
+                changed += 1
+            elif not spk and tp == src:
+                # ``type`` only stands in for the identity when ``speaker`` is absent.
+                e["type"] = tgt
+                changed += 1
+        if changed:
+            pathio.rewrite_json_file(sp, data)
+            changed_files.append(sp.name)
+            replaced += changed
+
+    # Sync voice_config: drop the merged-away entry; re-point aliases at the target.
+    if vc_exists:
+        voice_config.pop(src, None)
+        for name, e in voice_config.items():
+            if not isinstance(e, dict):
+                continue
+            if e.get("alias_of") == src:
+                e["alias_of"] = tgt
+            if e.get("alias") == src:  # legacy field (still recognised downstream)
+                e["alias"] = tgt
+        pathio.rewrite_json_file(vc_path, voice_config)
+
+    return {"ok": True, "source": src, "target": tgt, "replaced": replaced, "files": changed_files}
+
+
 # ---------------------------------------------------------------------------
 # 音频合成 + 音频合并
 # ---------------------------------------------------------------------------
@@ -407,6 +581,56 @@ def run_batch(req: BatchRequest) -> dict:
             Batch.synthesize, req.indices, scripts[0] if scripts else req.script,
             req.concurrency, req.seed,
         )
+    return {"task_id": task.id}
+
+
+class StressTestRequest(BaseModel):
+    # 批内行数（--concurrency 上限，钳 [1,64]）：每轮要垫成一个张量批的行数（固定不变）。
+    rows: int = 64
+    # 起始每行字数（1..2500）。
+    start_chars: int = 10
+    # 每轮递增的每行字数（≥1）：每轮 = 上一轮 + step，逐轮跑下去直到某轮失败。
+    step_chars: int = 10
+    # 轮数上限；None/0 = 不限（跑到失败为止，硬上限 Stress.MAX_STRESS_ROUNDS 防病态循环）。
+    max_rounds: int | None = None
+    # 压测用的克隆音色角色名；None = 自动取第一个可用克隆音色（任意克隆都可以）。
+    speaker: str | None = None
+    # 可复现 seed；None = 用持久默认（config.tts.batch_seed）。
+    seed: int | None = None
+
+
+def _engine_task_active() -> bool:
+    """Whether a task that spawns the .venv-tts engine is in flight (音频合成 / 音频合并 /
+    角色配音·克隆 / 压测). Two engine subprocesses would fight over the GPU, so the
+    stress-test entry refuses to start while one runs."""
+    for t in get_task_manager().list():
+        if t.module in ("tts-batch", "merge", "voices-clone", "tts-stress") and t.status not in TERMINAL:
+            return True
+    return False
+
+
+@router.post("/stress-test")
+def run_stress_test(req: StressTestRequest) -> dict:
+    """压测（临时测试入口）：机器自动生成自然语句（不借助 LLM、不需要解析脚本），固定批内
+    行数、每行字数从起点每轮递增，用任意一个已有克隆音色逐轮跑下去，直到某轮未达吞吐标准
+    （1 秒 10 字）/ 看门狗 / 引擎失败为止。逐轮报告（处理量 / 耗时 / 吞吐）写入工作空间
+    stress_test/ 目录；临时产物全在 00_temp/、每轮用完即删。"""
+    _common.require_workspace()
+    if not 1 <= req.start_chars <= Stress.MAX_STRESS_CHARS:
+        raise HTTPException(400, f"起始每行字数须为 1..{Stress.MAX_STRESS_CHARS}。")
+    if req.step_chars < 1:
+        raise HTTPException(400, "每轮递增须 ≥ 1。")
+    if req.max_rounds is not None and req.max_rounds < 1:
+        raise HTTPException(400, "轮数上限须 ≥ 1（留空 = 不限）。")
+    if _engine_task_active():
+        raise HTTPException(409, "引擎任务进行中（音频合成 / 合并 / 角色克隆 / 压测），请待其结束后再压测。")
+    rows = Batch.clamp_concurrency(req.rows)
+    label = f"压测（{rows} 行 · {req.start_chars}字 起 · 每轮 +{req.step_chars}）"
+    task = get_task_manager().create(
+        "tts-stress", label,
+        Stress.stress_test, rows, req.start_chars, req.step_chars, req.max_rounds,
+        req.speaker, req.seed,
+    )
     return {"task_id": task.id}
 
 

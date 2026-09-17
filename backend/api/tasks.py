@@ -26,6 +26,50 @@ def list_tasks() -> list[dict]:
     return [t.snapshot() for t in get_task_manager().list()]
 
 
+@router.get("/stream")
+def stream_all_tasks():
+    """Multiplexed SSE: ONE connection streams the events of ALL tasks.
+
+    Every event carries ``task_id``; the client dispatches on it. The UI holds
+    exactly one such stream per tab — browsers cap simultaneous HTTP/1.1
+    connections per host at ~6, so one connection *per task* (the
+    ``/{task_id}/stream`` endpoint below) is exhausted by a few parallel parses:
+    every EventSource beyond the cap never connects and its window shows no logs
+    at all while the backend runs fine.
+
+    On connect it replays ``snapshot_all`` (a snapshot of every task, so a late
+    or reconnecting client starts with the full picture — and a reconnect
+    self-heals anything missed), then forwards every event until the client
+    disconnects. The stream never ends on its own (tasks are created over time);
+    a 15 s ``ping`` keeps idle connections alive.
+    """
+
+    def gen():
+        mgr = get_task_manager()
+        # Subscribe AFTER snapshotting: an event emitted in between lands in the
+        # queue and is forwarded once (no replay/live overlap for the same event).
+        q = mgr.subscribe_all()
+        try:
+            yield _sse({"type": "snapshot_all", "tasks": [t.snapshot() for t in mgr.list()]})
+            while True:
+                try:
+                    task, event = q.get(timeout=15)
+                except _queue.Empty:
+                    yield _sse({"type": "ping"})  # keep-alive
+                    continue
+                payload = dict(event)
+                payload["task_id"] = task.id
+                yield _sse(payload)
+        finally:
+            mgr.unsubscribe_all(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/{task_id}")
 def get_task(task_id: str) -> dict:
     task = get_task_manager().get(task_id)

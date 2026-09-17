@@ -91,6 +91,21 @@ const cutTaskId = ref<string | null>(null)
 const planTask = computed(() => taskStore.tasks.find((t) => t.id === planTaskId.value))
 const cutTask = computed(() => taskStore.tasks.find((t) => t.id === cutTaskId.value))
 
+// 刷新恢复：页面重载后本地 taskId 丢失，但后端任务仍在跑（store 的 refresh 已拉回全量任务）。
+// 按 label 前缀区分两种在途任务重新挂接——进度 Alert 模板只依赖 planTask / cutTask，
+// 取消钮走 taskStore.control，故无需恢复 file / plan 即可显示进度并可控。
+function reattachTasks() {
+  for (const t of taskStore.activeTasks('audio')) {
+    if (t.label.startsWith('停顿检测：') && !planTaskId.value) {
+      planTaskId.value = t.id
+      busyPlan.value = true
+    } else if (t.label.startsWith('音频分集：') && !cutTaskId.value) {
+      cutTaskId.value = t.id
+      busyCut.value = true
+    }
+  }
+}
+
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
   const a = settings.config?.audio
@@ -101,6 +116,8 @@ onMounted(async () => {
     namingFormat.value = a.naming_format
     startNumber.value = a.start_number
   }
+  await taskStore.refresh()
+  reattachTasks()
 })
 
 // Capture the 06_audio_merge directory's absolute path from each picker scan, so a

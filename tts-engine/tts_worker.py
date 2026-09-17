@@ -87,6 +87,35 @@ SUPPORTED_TYPES = ("custom", "clone", "design")
 MAX_NEW_TOKENS = 2048  # per-row generation cap (the decode length the VRAM budget plans for)
 MAX_SEQ_CHARS = 2500   # a row longer than this never shares a batch with shorter rows
 
+# Length-proportional decode cap (``max_new_tokens_for_chars``). This qwen_tts build's
+# talker does NOT stop individual rows early in a multi-row tensor batch: the per-row
+# EOS is not emitted within the cap, so the whole batch runs the FULL max_new_tokens in
+# lockstep (observed 2026-09-17: a 31-row batch of 2-6-char lines ran 2048 steps,
+# 8-15 min, blowing the sub-batch watchdog budget and hanging one-click synthesis;
+# single-row calls DO stop at EOS). The cap therefore scales with the sub-batch's
+# longest row: a capped runaway still fails fast, and the model's own per-row EOS
+# truncation keeps any audio the model did stop clean, while long rows (which the
+# length bands already shrink to few-row batches) keep the full cap. Calibrated from
+# real probes at 12 frames/s: legitimate length is ~2.7 frames/char (4.5 chars/s);
+# 6/char leaves 2x headroom for slow delivery; the floor covers ultra-short lines.
+# A row of >= ~342 chars maps to the full 2048 (behaviour unchanged for long rows).
+FRAME_CAP_PER_CHAR = 6
+FRAME_CAP_FLOOR = 128
+
+
+def max_new_tokens_for_chars(chars: int) -> int:
+    """The decode cap for a sub-batch whose longest row is ``chars`` chars long."""
+    return min(MAX_NEW_TOKENS, max(FRAME_CAP_FLOOR, int(chars) * FRAME_CAP_PER_CHAR))
+
+# Length homogeneity inside one tensor batch (``plan_sub_batches``): longest/shortest may
+# differ by at most this factor. The decode cap scales with the batch's LONGEST row
+# (``max_new_tokens_for_chars``), and batch mode does not stop short rows at EOS — so every
+# row in a length-mixed batch runs the long row's full cap (the 2026-09-17 "几十字 + 几个字
+# 同批" slowdown). Tightened from 5 to 3: a 3x spread keeps the shared cap close to the
+# shorter rows' natural length (a 2-char line next to a 6-char one still batches; 2 next to
+# 7 splits), so per-character, length-sorted groups stay fast in practice.
+LENGTH_RATIO = 3
+
 # Fixed input tokens a row carries BEYOND its target text (role marker + codec prefill + tts
 # structural tokens). The O(L^2) attention term is sized by the row's FULL input length, so the
 # VRAM budget must count these or every sub-batch is under-sized (see ``plan_row_tokens``).
@@ -367,7 +396,7 @@ def _load_models_for(needed: set, device: str, args):
 # ---------------------------------------------------------------------------
 
 def plan_sub_batches(char_lens, *, max_batch, max_batch_chars, max_seq_chars=0,
-                     length_ratio=5, min_ratio_size=2, vram_ok=None, tokens=None,
+                     length_ratio=LENGTH_RATIO, min_ratio_size=2, vram_ok=None, tokens=None,
                      band_cap=None):
     """Split rows (sorted by length ASCENDING) into tensor sub-batches, greedily (pure).
 
@@ -384,8 +413,10 @@ def plan_sub_batches(char_lens, *, max_batch, max_batch_chars, max_seq_chars=0,
       * a row over ``max_seq_chars`` (if > 0) never mixes with the shorter rows already in the
         open batch (it opens its own batch; its size is then governed by ``vram_ok``);
       * length ratio: with ``>= min_ratio_size`` rows (default 2 — even a two-row batch must
-        stay within the ratio), longest/shortest ``> length_ratio`` splits (rows are
-        left-padded to the longest, so a wide spread wastes compute);
+        stay within the ratio), longest/shortest ``> length_ratio`` (default ``LENGTH_RATIO``
+        = 3 — the decode cap follows the batch's longest row, so a wider spread makes the
+        short rows run the long rows' full cap) splits (rows are left-padded to the longest,
+        so a wide spread wastes compute);
       * ``vram_ok(tokens)`` (optional callable) returns False for the candidate batch.
 
     ``tokens`` is the per-row *input* token count (aligned with ``char_lens``); it is what
@@ -495,6 +526,34 @@ def band_cap_for_chars(n_chars, manual_cap):
         if n_chars <= limit:
             return max(1, int(cap * frac))
     return 1
+
+
+def order_speaker_groups(classified):
+    """Per-character execution groups, ordered most-lines-first (pure).
+
+    ``classified`` maps ``key -> [row, ...]`` — in batch mode the key is
+    ``(vtype, speaker)`` (a speaker's rows all share one voice entry, so the vtype is
+    uniform within a key); in design-batch mode the key is the speaker — in the order each
+    key FIRST appears (dict insertion order). Returns ``[(key, rows), ...]``:
+
+      * groups are ordered by line count DESCENDING — the character with the most lines
+        runs first (the heaviest share of the run starts immediately: fastest visible
+        progress, and the governor's measured cap settles while most rows are still to
+        do); ties keep first-seen order (deterministic for a given input file);
+      * each group's rows are sorted by length ascending, so a sub-batch drawn from them
+        stays length-homogeneous (``LENGTH_RATIO``) and the decode cap (longest row x
+        ``FRAME_CAP_PER_CHAR``) hugs the rows' true length instead of some other character's
+        longer lines.
+
+    One character's rows never mix with another character's: the old cross-character pools
+    (ALL custom rows in one group, ALL design rows in another) are exactly how a 2-char
+    line ended up batched with a 40-char one — and every row then ran the 40-char cap
+    (batch mode does not stop short rows at EOS).
+    """
+    groups = [(key, sorted(rows, key=lambda r: r["chars"]))
+              for key, rows in classified.items() if rows]
+    groups.sort(key=lambda g: -len(g[1]))  # stable: ties keep first-seen order
+    return groups
 
 
 class VramGovernor:
@@ -1188,24 +1247,29 @@ def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed, *, force
 
         torch.manual_seed(batch_seed)
     texts = [r["text"] for r in rows]
+    # The decode cap scales with the batch's longest row (see max_new_tokens_for_chars):
+    # in batch mode the model does not stop individual rows at EOS, so a fixed 2048 cap
+    # turned short-row batches into full-cap runs (multi-minute hangs); rows that DO emit
+    # EOS are truncated at it anyway, so a smaller cap only bounds the runaways.
+    cap = max_new_tokens_for_chars(max((len(t) for t in texts), default=0))
     if vtype == "custom":
         speakers = [(r["vd"].get("voice") or args.speaker or DEFAULT_SPEAKER) for r in rows]
         instructs = [_effective_instruct(r, "custom") for r in rows]
         wavs, _sr = model.generate_custom_voice(
             text=texts, language=args.language, speaker=speakers, instruct=instructs,
-            non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS)
+            non_streaming_mode=True, max_new_tokens=cap)
     elif vtype == "clone":
         # a clone sub-batch is single-speaker; the per-speaker length-1 prompt broadcasts to N
         prompt = clone_prompts[rows[0]["speaker"]]
         wavs, _sr = model.generate_voice_clone(
             text=texts, voice_clone_prompt=prompt,
-            non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS)
+            non_streaming_mode=True, max_new_tokens=cap)
     else:  # design: each row carries its own description (a per-row instruct list —
         # batch mode's design sub-batches are size 1, where this is equivalent to the
         # old scalar; design-batch packs several rows per call, one shared forward)
         wavs, _sr = model.generate_voice_design(
             text=texts, instruct=[_effective_instruct(r, "design") for r in rows],
-            language=args.language, non_streaming_mode=True, max_new_tokens=MAX_NEW_TOKENS,
+            language=args.language, non_streaming_mode=True, max_new_tokens=cap,
             **({"do_sample": True} if force_do_sample else {}))
     if not wavs:
         return [(False, "模型未返回音频")] * len(rows)
@@ -1403,9 +1467,12 @@ def _run_batch(args) -> int:
     ``--concurrency`` is only a ceiling: the real per-batch size follows the length bands
     (short rows run at the full cap, long rows step down, extreme rows run solo) and a measured
     VramGovernor that shrinks / grows it batch by batch from the GPU's actual VRAM consumption
-    and throughput (never chasing 100% VRAM). Rows run ascending by length (short first: early
-    progress + crash resilience); files are still named by segment index, so the generation
-    order never affects the assembled audiobook. Each sub-batch runs under a watchdog that kills
+    and throughput (never chasing 100% VRAM). Rows run PER CHARACTER — the characters are
+    processed in line-count descending order (the most-line character, usually NARRATOR,
+    first), and within a character the rows run ascending by length (short first: early
+    progress + crash resilience; a sub-batch never mixes lengths beyond ``LENGTH_RATIO``);
+    files are still named by segment index, so the generation order never affects the
+    assembled audiobook. Each sub-batch runs under a watchdog that kills
     the process on a hang (exit 124) so the backend can shrink and restart. A per-segment fault
     (missing config, model error) is a recorded ``[segment]`` line, never a run abort.
     """
@@ -1472,18 +1539,24 @@ def _run_batch(args) -> int:
         + f" · >{LENGTH_BANDS[-1][0]}字→单独")
     # An honest note about the attention backend (no flash-attn / SDPA path in this qwen_tts).
     log("注意力：手写 O(L²)（本环境无 flash-attn / SDPA；峰值已计入显存预算与字符上限）")
+    log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
+        f"顶格 {MAX_NEW_TOKENS} 帧）——批量模式模型不按行提前停，短行批不再跑满全程")
+    log(f"分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序，"
+        f"批内长度比 ≤{LENGTH_RATIO} —— 同批字数接近，解码上限不再被混入的长行抬高")
     if seed >= 0:
         log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
 
-    # -- classify every segment: immediate errors, then the three generation groups --
+    # -- classify every segment: immediate errors, then per-character groups --
+    # One group PER CHARACTER: (vtype, canonical) — a speaker's rows all share one voice
+    # config entry (one vtype), and the decode cap scales with a sub-batch's LONGEST row,
+    # so a character's short rows must never be pooled with another character's long ones
+    # (the 2026-09-17 slowdown: cross-character pools mixed 2-char and 40-char lines, and
+    # every row ran the 40-char cap — batch mode does not stop short rows at EOS).
     total = len(segments)
     width = max(4, len(str(total)))
     counts = {"completed": 0, "failed": 0}
     clone_prompts: dict = {}
-
-    custom_rows = []
-    clone_rows_by_speaker: dict = {}
-    design_rows = []
+    classified: dict = {}  # (vtype, canonical) -> [row, ...], first-seen order
 
     def report_result(index, ok, detail):
         """Emit the ``[segment]`` line + progress (single-threaded, monotonic)."""
@@ -1520,52 +1593,49 @@ def _run_batch(args) -> int:
 
         row = {"seg": seg, "index": index, "speaker": canonical, "vd": vd,
                "text": text, "instruct": instruct, "chars": len(text)}
-        if vtype == "custom":
-            custom_rows.append(row)
-        elif vtype == "clone":
-            clone_rows_by_speaker.setdefault(canonical, []).append(row)
-        else:  # design
-            design_rows.append(row)
+        classified.setdefault((vtype, canonical), []).append(row)
 
-    # -- build the execution groups: one entry per (model, vtype, rows) — planned lazily --
-    # Rows are sorted ascending by length within a group (short first: early progress + crash
-    # resilience), and each group's rows are planned into sub-batches LAZILY at run time (one
-    # sub-batch per planning round, the remainder re-planned after each round) so the governor's
+    # -- build the execution groups: per character, most lines first, rows length-ascending --
+    # Characters run in line-count DESCENDING order (the heaviest character starts
+    # immediately), rows are length-ascending within a character (see order_speaker_groups),
+    # and each group's rows are planned into sub-batches LAZILY at run time (one sub-batch
+    # per planning round, the remainder re-planned after each round) so the governor's
     # measured adjustments reshape every batch that follows.
-    groups = []  # each: {"model", "vtype", "rows" (ascending by length), "overhead"}
+    groups = []  # each: {"key", "model", "vtype", "rows" (ascending by length), "overhead"}
 
-    if custom_rows:
-        groups.append({"model": models.get("custom"), "vtype": "custom",
-                       "rows": sorted(custom_rows, key=lambda r: r["chars"]),
-                       "overhead": ROW_STRUCTURAL_OVERHEAD})
-    for canonical, rows in clone_rows_by_speaker.items():
-        # each speaker's clone prompt is built once and reused across that speaker's sub-batches
-        model = models.get("clone")
-        if model is None:
-            for r in rows:
-                report_result(r["index"], False, "Base 模型未加载")
-            continue
-        try:
-            # ``voice_config[canonical]["ref_audio"]`` is workspace-relative in the new
-            # format — resolve it against the workspace root the backend handed us.
-            clone_prompts[canonical] = _build_clone_prompt(
-                model, voice_config[canonical], _workspace_root(args), canonical)
-        except Exception as e:  # noqa: BLE001 — a bad reference poisons only this speaker's rows
-            for r in rows:
-                report_result(r["index"], False, f"克隆提示构建失败：{e}")
-            continue
-        # Measure this speaker's fixed per-row input overhead (reference frames + ref_text +
-        # structural) from the prompt just built, so the VRAM budget sizes this group's
-        # sub-batches against the rows' TRUE sequence length (not just the target text).
-        groups.append({"model": model, "vtype": "clone",
-                       "rows": sorted(rows, key=lambda r: r["chars"]),
-                       "overhead": _clone_input_overhead(clone_prompts[canonical],
-                                                         voice_config[canonical])})
-    if design_rows:
-        # each design row is unique (its own description) -> one row per sub-batch
-        groups.append({"model": models.get("design"), "vtype": "design",
-                       "rows": sorted(design_rows, key=lambda r: r["chars"]),
-                       "overhead": ROW_STRUCTURAL_OVERHEAD})
+    for (vtype, canonical), rows in order_speaker_groups(classified):
+        if vtype == "custom":
+            groups.append({"key": (vtype, canonical), "model": models.get("custom"),
+                           "vtype": "custom", "rows": rows,
+                           "overhead": ROW_STRUCTURAL_OVERHEAD})
+        elif vtype == "clone":
+            # each speaker's clone prompt is built once and reused across that speaker's sub-batches
+            model = models.get("clone")
+            if model is None:
+                for r in rows:
+                    report_result(r["index"], False, "Base 模型未加载")
+                continue
+            try:
+                # ``voice_config[canonical]["ref_audio"]`` is workspace-relative in the new
+                # format — resolve it against the workspace root the backend handed us.
+                clone_prompts[canonical] = _build_clone_prompt(
+                    model, voice_config[canonical], _workspace_root(args), canonical)
+            except Exception as e:  # noqa: BLE001 — a bad reference poisons only this speaker's rows
+                for r in rows:
+                    report_result(r["index"], False, f"克隆提示构建失败：{e}")
+                continue
+            # Measure this speaker's fixed per-row input overhead (reference frames + ref_text +
+            # structural) from the prompt just built, so the VRAM budget sizes this group's
+            # sub-batches against the rows' TRUE sequence length (not just the target text).
+            groups.append({"key": (vtype, canonical), "model": model, "vtype": "clone",
+                           "rows": rows,
+                           "overhead": _clone_input_overhead(clone_prompts[canonical],
+                                                             voice_config[canonical])})
+        else:  # design
+            # each design row is unique (its own description) -> one row per sub-batch
+            groups.append({"key": (vtype, canonical), "model": models.get("design"),
+                           "vtype": "design", "rows": rows,
+                           "overhead": ROW_STRUCTURAL_OVERHEAD})
 
     if not groups:
         # nothing to generate (every segment was an immediate error) — report and finish
@@ -1637,10 +1707,11 @@ def _run_design_batch(args) -> int:
     tensor sub-batches — unlike batch mode's design rows (book segments, one per sub-batch),
     candidates DO share a sub-batch (``force_rows_cap`` = the governor's cap), which is the
     point of this mode. The per-batch size follows the length bands + the measured
-    VramGovernor; ``--concurrency`` is only the ceiling. Rows run ascending by length (early
-    progress + crash resilience); each row keeps its backend identity (``index`` = position in
-    the jobs file) so the ``[design]`` lines and the watchdog's ``indices=`` map back after
-    the sort.
+    VramGovernor; ``--concurrency`` is only the ceiling. Candidates run PER CHARACTER — the
+    characters are processed in candidate-count descending order, and within a character the
+    rows run ascending by length (early progress + crash resilience); each row keeps its
+    backend identity (``index`` = position in the jobs file) so the ``[design]`` lines and
+    the watchdog's ``indices=`` map back after the grouping.
 
     Every candidate is seeded ``--seed + sub-batch#`` (rows in one sub-batch share the seed;
     the backend records it per candidate — the same layout-conditioned reproducibility as
@@ -1730,10 +1801,22 @@ def _run_design_batch(args) -> int:
     seed = int(args.seed)
     max_batch_chars = max(1000, int(args.max_batch_chars))
     log(f"批内行数上限 {max_batch}（仅上限；实际每批行数 = min(行长按分档, 动态调节, 显存估算, 字符上限)）")
+    log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
+        f"顶格 {MAX_NEW_TOKENS} 帧）")
+    log("分组：按角色分组、候选数降序处理（候选最多的角色先跑）；角色内按长度升序 —— "
+        "同角色候选输入相同，同批长度一致")
     if seed >= 0:
         log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
 
-    gen_rows.sort(key=lambda r: r["chars"])  # short first: early progress + crash resilience
+    # Per-character sub-batch groups, most candidates first (mirrors _run_batch's grouping):
+    # a character's candidates share identical inputs, so their lengths are equal and the
+    # sub-batch's decode cap reflects the true length; mixing characters in one batch would
+    # charge every row at the longest character's ref-text length (batch mode does not stop
+    # short rows at EOS).
+    by_speaker: dict = {}  # speaker -> [row, ...], first-seen order
+    for r in gen_rows:
+        by_speaker.setdefault(r["sp"], []).append(r)
+    groups = [rows for _sp, rows in order_speaker_groups(by_speaker)]
 
     gov = VramGovernor(max_batch, device=device, total_vram=_total_vram(device))
     params = _talker_vram_params(model)
@@ -1744,39 +1827,40 @@ def _run_design_batch(args) -> int:
     # of sub-batches any earlier attempt could have run) keeps every seed run-unique.
     sub_counter = [offset]
 
-    remaining = gen_rows
-    while remaining:
-        budget = _free_vram_budget(device) if params is not None else None  # fresh per round
-        rows_b, remaining = plan_next_sub_batch(
-            remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
-            budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
-            force_rows_cap=gov.cap)
-        log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
-        free_before = _free_vram(device)
-        t0 = time.monotonic()
-        _synth_sub_batch(
-            model, "design", rows_b,
-            args=args, clone_prompts={}, device=device, seed=seed,
-            sub_counter=sub_counter, out_dir=out_dir, width=max(4, len(str(total))),
-            report=report_result, gov=gov, save=_save_and_report_design,
-            force_do_sample=True)
-        _clear_gpu_cache(device)
-        elapsed = time.monotonic() - t0
-        free_after = _free_vram(device)
-        static_est = 0
-        if params is not None:
-            static_est = estimate_batch_vram(
-                len(rows_b), params["heads"], params["kv_per_token"],
-                plan_row_tokens([r["text"] for r in rows_b],
-                                [_effective_instruct(r, "design") for r in rows_b],
-                                ROW_STRUCTURAL_OVERHEAD),
-                MAX_NEW_TOKENS)
-        action = gov.observe_success(
-            free_before=free_before, free_after=free_after, rows=len(rows_b),
-            chars=sum(r["chars"] for r in rows_b), elapsed=elapsed, static_est=static_est)
-        if action:
-            _what, _detail = gov.events[-1]
-            log(f"动态并发{action}（{_detail}）→ 批内上限 {gov.cap}")
+    for g in groups:
+        remaining = g
+        while remaining:
+            budget = _free_vram_budget(device) if params is not None else None  # fresh per round
+            rows_b, remaining = plan_next_sub_batch(
+                remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
+                budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
+                force_rows_cap=gov.cap)
+            log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
+            free_before = _free_vram(device)
+            t0 = time.monotonic()
+            _synth_sub_batch(
+                model, "design", rows_b,
+                args=args, clone_prompts={}, device=device, seed=seed,
+                sub_counter=sub_counter, out_dir=out_dir, width=max(4, len(str(total))),
+                report=report_result, gov=gov, save=_save_and_report_design,
+                force_do_sample=True)
+            _clear_gpu_cache(device)
+            elapsed = time.monotonic() - t0
+            free_after = _free_vram(device)
+            static_est = 0
+            if params is not None:
+                static_est = estimate_batch_vram(
+                    len(rows_b), params["heads"], params["kv_per_token"],
+                    plan_row_tokens([r["text"] for r in rows_b],
+                                    [_effective_instruct(r, "design") for r in rows_b],
+                                    ROW_STRUCTURAL_OVERHEAD),
+                    MAX_NEW_TOKENS)
+            action = gov.observe_success(
+                free_before=free_before, free_after=free_after, rows=len(rows_b),
+                chars=sum(r["chars"] for r in rows_b), elapsed=elapsed, static_est=static_est)
+            if action:
+                _what, _detail = gov.events[-1]
+                log(f"动态并发{action}（{_detail}）→ 批内上限 {gov.cap}")
 
     progress(1.0, f"完成（共 {total} 候选）")
     log(f"候选渲染结束：{offset + done}/{total} 候选已落定。输出目录：{out_dir}")

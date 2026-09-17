@@ -162,6 +162,7 @@ export interface VoiceItem {
   clone_status: 'none' | 'done' | 'failed' // Phase 2 (克隆音频) state
   type: string // clone | design | custom | foundation | ''
   alias_of: string // non-empty -> this label points at another character's voice
+  gender: 'male' | 'female' | '' // '' = unknown; pre-filled by Phase 1, the badge pick wins
   description: string
   preview: string // path relative to 04_voice_profiles/ (playable via downloadUrl('04_voice_profiles', preview)); '' if none
   /** The character's clone candidates (new format; a legacy single-take entry synthesises
@@ -175,6 +176,15 @@ export interface VoicesListResult {
   script_path: string
   voice_config_path: string
   speakers: VoiceItem[]
+}
+/** 角色配音 · 合并角色：source 的全部台词在 Parse 源数据中改为 target，source 的
+ *  声音配置被删除（候选音频文件留盘）。``files`` = 实际被改写的解析 JSON 文件名。 */
+export interface MergeSpeakersResult {
+  ok: boolean
+  source: string
+  target: string
+  replaced: number
+  files: string[]
 }
 export interface PrepareFoundationsOptions {
   speakers?: string[]
@@ -214,6 +224,67 @@ export interface BatchRunOptions {
   /** Reproducible seed for the run: >=0 seeds each sub-batch (seed + sub-batch seq);
    *  undefined → the persisted default (config.tts.batch_seed); -1 → random. */
   seed?: number
+}
+/** 压测（临时测试入口）· 单轮结果行（每行字数从起点每轮递增，跑到失败为止）。 */
+export interface StressTestResultRow {
+  /** 轮次（1 起）。 */
+  round: number
+  /** 本轮每行字数。 */
+  chars_per_line: number
+  /** 批内行数（--concurrency 上限）。 */
+  rows: number
+  /** 处理量（行数 × 字数）。 */
+  total_chars: number
+  /** 成功行数。 */
+  ok: number
+  /** 失败行数。 */
+  failed: number
+  /** 合成耗时（秒，「模型就绪」→ 进程退出，不含模型加载）；null = 超时被杀 / 无法测得。 */
+  synth_seconds: number | null
+  /** 限时（秒）= 处理量 / 10（吞吐标准：1 秒必须出 10 个字）。 */
+  deadline_seconds: number
+  /** 真实吞吐量（字/秒）；未通过 / 无法测得为 null。 */
+  throughput_chars_per_sec: number | null
+  /** 是否通过（限时内完成且无崩溃）。 */
+  passed: boolean
+  /** 失败原因（通过为空串）。 */
+  reason: string
+}
+/** 压测（临时测试入口）启动参数（``POST /api/tts/stress-test``）。 */
+export interface StressTestOptions {
+  /** 批内行数（--concurrency 上限，后端钳 1..64）；undefined → 64。 */
+  rows?: number
+  /** 起始每行字数（1..2500）；undefined → 10。 */
+  start_chars?: number
+  /** 每轮递增的每行字数（≥1）；undefined → 10。 */
+  step_chars?: number
+  /** 轮数上限；undefined → 不限（跑到失败为止）。 */
+  max_rounds?: number
+  /** 压测用的克隆音色角色名；undefined/'' → 后端自动取第一个可用克隆音色。 */
+  speaker?: string
+  /** 可复现 seed；undefined → 持久默认（config.tts.batch_seed）。 */
+  seed?: number
+}
+/** 压测任务结果（``POST /api/tts/stress-test``）。 */
+export interface StressTestResult {
+  ts: string
+  /** 实际使用的克隆音色角色名。 */
+  speaker: string
+  rows: number
+  start_chars: number
+  step_chars: number
+  /** 吞吐标准（字/秒，= 10）。 */
+  min_throughput_chars_per_sec: number
+  seed: number
+  /** 逐轮明细，按运行顺序。 */
+  results: StressTestResultRow[]
+  /** 失败轮的每行字数（无失败为 null）。 */
+  failed_at_chars: number | null
+  stopped_reason: string
+  /** 结果文件（工作空间 stress_test/ 目录）。 */
+  result_path: string
+  /** 运行日志（排障用）。 */
+  run_log: string
 }
 export interface PrepareFoundationsResult {
   count: number

@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
-import { listVoices, makeClones, prepareFoundations, selectVoice, ttsStatus } from '@/api/tts'
+import { listVoices, makeClones, mergeSpeakers, prepareFoundations, selectVoice, setGender, ttsStatus } from '@/api/tts'
 import { downloadUrl } from '@/utils/fileops'
 import type { MakeClonesResult, PrepareFoundationsResult, TTSStatus, VoiceItem } from '@/types'
 
@@ -28,7 +28,6 @@ import {
   Users,
   Sparkles,
   AudioWaveform,
-  Ear,
   Loader2,
   X,
   XCircle,
@@ -36,6 +35,9 @@ import {
   RefreshCw,
   ArrowRight,
   FolderOpen,
+  Merge,
+  Search,
+  HelpCircle,
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -89,6 +91,77 @@ const pickerTarget = computed(
 watch(pickerTarget, (t) => {
   if (!t && pickerName.value) closePicker()
 })
+
+// 合并角色 sub-window state: which row launched it, the search filter, the staged target,
+// the confirm step, and the in-flight write. Every row's 合并 button shares this one state —
+// only the source name differs.
+const mergeSource = ref<string | null>(null)
+const mergeQuery = ref('')
+const mergeTarget = ref<string | null>(null)
+const mergeConfirm = ref(false)
+const mergeBusy = ref(false)
+const mergeError = ref('')
+// Like pickerTarget: always read the LATEST list (a refresh removes the merged-away row →
+// the window closes itself).
+const mergeSourceItem = computed(
+  () => (mergeSource.value ? speakers.value.find((s) => s.name === mergeSource.value) ?? null : null),
+)
+watch(mergeSourceItem, (t) => {
+  if (!t && mergeSource.value) closeMerge()
+})
+// Searchable target list: every character except the source itself (auto-filter).
+const mergeOptions = computed(() => {
+  const q = mergeQuery.value.trim().toLowerCase()
+  return speakers.value.filter(
+    (s) => s.name !== mergeSource.value && (!q || s.name.toLowerCase().includes(q)),
+  )
+})
+
+// 性别徽章（人名旁 ♂/♀）：阶段 1 预填、点击纠正的小菜单。菜单用 fixed 定位（表格外层
+// overflow-x-auto 会裁剪 absolute 下拉），坐标在打开时按按钮 rect 快照。
+const genderMenu = ref<{ name: string; x: number; y: number } | null>(null)
+const genderBusy = ref(false)
+function openGenderMenu(v: VoiceItem, el: HTMLElement) {
+  if (genderMenu.value?.name === v.name) {
+    genderMenu.value = null
+    return
+  }
+  const r = el.getBoundingClientRect()
+  genderMenu.value = {
+    name: v.name,
+    x: Math.min(r.left, window.innerWidth - 104),
+    y: Math.min(r.bottom + 4, window.innerHeight - 132),
+  }
+}
+function closeGenderMenu() {
+  genderMenu.value = null
+}
+// Direction A badge styling: muted 10% fill + 30% border + 600/300 text (dark mode aware).
+function genderBadgeClass(g: VoiceItem['gender']): string {
+  const base = 'inline-flex h-5 select-none items-center gap-1 rounded-full border px-1.5 text-[11px] leading-none transition-opacity'
+  if (g === 'male') return `${base} cursor-pointer border-indigo-500/30 bg-indigo-500/10 text-indigo-600 hover:opacity-80 dark:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40`
+  if (g === 'female') return `${base} cursor-pointer border-rose-500/30 bg-rose-500/10 text-rose-600 hover:opacity-80 dark:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40`
+  return `${base} cursor-pointer border-border bg-transparent text-muted-foreground opacity-70 hover:opacity-90 disabled:cursor-not-allowed`
+}
+async function applyGender(v: VoiceItem, g: 'male' | 'female' | '') {
+  if (genderBusy.value) return
+  genderBusy.value = true
+  try {
+    await setGender(v.name, g)
+    v.gender = g
+    closeGenderMenu()
+    toast({
+      title: g ? `性别已标记为「${g === 'male' ? '男' : '女'}」` : '已清除性别标记',
+      variant: 'success',
+      description: v.name,
+    })
+    loadVoices()
+  } catch (e: any) {
+    toast({ title: '性别标记失败', variant: 'destructive', description: e?.message || '保存失败' })
+  } finally {
+    genderBusy.value = false
+  }
+}
 
 // Which characters the in-flight phase task targets: null = 全部（批量）; a list = the specific
 // row(s) of a single-character run. Lets the per-row 生成中/制作中 overlay light up ONLY the rows
@@ -168,6 +241,22 @@ watch(() => project.activeScript, (v) => {
   if (scope.value !== ALL_SCRIPT && v !== scope.value) scope.value = v
 })
 
+// 刷新恢复：页面重载后本地 taskId 丢失，但后端任务仍在跑（store 的 refresh 已拉回全量任务）。
+// 按 module 重新挂接在途的阶段 1 / 阶段 2 任务——恢复日志面板绑定、按钮门控与完成 watcher
+//（行内「生成中/制作中」overlay 本就是 module 派生，刷新后已自行恢复）。
+function reattachTasks() {
+  const f = taskStore.activeTasks('voices-foundation')[0]
+  if (f) {
+    foundationTaskId.value = f.id
+    foundationBusy.value = true
+  }
+  const c = taskStore.activeTasks('voices-clone')[0]
+  if (c) {
+    cloneTaskId.value = c.id
+    cloneBusy.value = true
+  }
+}
+
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
   cloneConcurrency.value = settings.config?.tts.batch_concurrency ?? 4
@@ -177,7 +266,8 @@ onMounted(async () => {
     status.value = { implemented: false, message: '后端未连接' }
   }
   await loadVoices()
-  taskStore.refresh()
+  await taskStore.refresh()
+  reattachTasks()
 })
 
 async function doFoundations(opts: {
@@ -294,6 +384,46 @@ async function confirmPick() {
     pickerError.value = e?.message || '保存失败'
   } finally {
     pickerBusy.value = false
+  }
+}
+
+// 合并角色：把 source 角色的全部台词直接改写进 Parse 源数据（零 LLM 调用），删除其声音
+// 配置。流程 = 选人子窗口（搜索筛选）→ 二次确认 → 同步写 → 刷新角色列表。
+function openMerge(v: VoiceItem) {
+  mergeError.value = ''
+  mergeQuery.value = ''
+  mergeTarget.value = null
+  mergeConfirm.value = false
+  mergeSource.value = v.name
+}
+
+function closeMerge() {
+  mergeSource.value = null
+  mergeQuery.value = ''
+  mergeTarget.value = null
+  mergeConfirm.value = false
+  mergeError.value = ''
+}
+
+async function confirmMerge() {
+  const src = mergeSource.value
+  const tgt = mergeTarget.value
+  if (!src || !tgt || mergeBusy.value) return
+  mergeBusy.value = true
+  mergeError.value = ''
+  try {
+    const r = await mergeSpeakers(src, tgt, script.value || undefined)
+    toast({
+      title: '角色已合并',
+      variant: 'success',
+      description: `已将 ${r.source} 的 ${r.replaced} 条台词并入 ${r.target}${r.files.length ? `（${r.files.join('、')}）` : ''}`,
+    })
+    closeMerge()
+    loadVoices()
+  } catch (e: any) {
+    mergeError.value = e?.message || '合并失败'
+  } finally {
+    mergeBusy.value = false
   }
 }
 
@@ -559,8 +689,38 @@ watch(
               <tbody>
                 <tr v-for="v in speakers" :key="v.name" class="border-b align-top last:border-0">
                   <td class="py-2 pr-3 font-medium">
-                    {{ v.name }}
-                    <span v-if="v.alias_of" class="ml-1 text-xs text-muted-foreground">→ {{ v.alias_of }}</span>
+                    <div class="whitespace-nowrap">
+                      {{ v.name }}
+                      <span v-if="v.alias_of" class="ml-1 text-xs text-muted-foreground">→ {{ v.alias_of }}</span>
+                      <!-- 性别徽章：阶段 1 预填、点击纠正（alias 行借用目标音色，不单独标记） -->
+                      <button
+                        v-else
+                        type="button"
+                        class="ml-1.5 align-middle"
+                        :class="genderBadgeClass(v.gender)"
+                        :title="v.gender ? '点击修改性别标记' : '标记性别（阶段 1 自动推断，可点击纠正）'"
+                        :disabled="genderBusy || foundationRunning || cloneRunning"
+                        @click.stop="openGenderMenu(v, $event.currentTarget as HTMLElement)"
+                      >
+                        <!-- ♂/♀ = Unicode 性别符号（lucide 0.468 无 Mars/Venus 图标） -->
+                        <span v-if="v.gender === 'male'" class="text-xs leading-none">♂</span>
+                        <span v-else-if="v.gender === 'female'" class="text-xs leading-none">♀</span>
+                        <HelpCircle v-else class="h-3 w-3" />
+                        {{ v.gender === 'male' ? '男' : v.gender === 'female' ? '女' : '未定' }}
+                      </button>
+                    </div>
+                    <div class="mt-1 flex items-center">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        class="h-6 w-6 p-0"
+                        title="将该角色合并到其他角色（直接修改解析源数据）"
+                        :disabled="foundationRunning || cloneRunning || speakers.length < 2"
+                        @click="openMerge(v)"
+                      >
+                        <Merge class="h-3 w-3" />
+                      </Button>
+                    </div>
                   </td>
                   <td class="py-2 pr-3 text-muted-foreground">{{ v.line_count }}</td>
                   <td class="py-2 pr-3">
@@ -576,15 +736,18 @@ watch(
                     </Badge>
                   </td>
                   <td class="py-2 pr-3">
-                    <div class="max-w-xs truncate text-xs text-muted-foreground" :title="v.description">
-                      {{ v.description || '—' }}
+                    <!-- 固定列宽：描述/提示词列不再被操作列挤窄（表格整体可横向滚动兜底） -->
+                    <div class="w-60 min-w-60">
+                      <div class="truncate text-xs text-muted-foreground" :title="v.description">
+                        {{ v.description || '—' }}
+                      </div>
+                      <Input
+                        v-model="prompts[v.name]"
+                        class="mt-1.5 h-8 w-full text-xs"
+                        placeholder="可选：自定义声音描述（阶段 1 重新生成时生效）"
+                        :disabled="foundationBusy"
+                      />
                     </div>
-                    <Input
-                      v-model="prompts[v.name]"
-                      class="mt-1.5 h-8 text-xs"
-                      placeholder="可选：自定义声音描述（阶段 1 重新生成时生效）"
-                      :disabled="foundationBusy"
-                    />
                   </td>
                   <td class="py-2">
                     <div class="flex items-center justify-end gap-2">
@@ -593,13 +756,13 @@ watch(
                         {{ pickLabel(v) }}
                       </span>
                       <Button variant="outline" size="sm" :disabled="pickDisabled(v)" @click="openPicker(v)">
-                        <Ear class="h-3.5 w-3.5" />选择音色
+                        选择音色
                       </Button>
                       <Button variant="outline" size="sm" :disabled="foundationBlocked" @click="regenFoundation(v)">
-                        <RefreshCw class="h-3.5 w-3.5" />重新生成
+                        重新生成
                       </Button>
                       <Button variant="outline" size="sm" :disabled="cloneBlocked || v.foundation_status !== 'done'" @click="remakeClone(v)">
-                        <AudioWaveform class="h-3.5 w-3.5" />重新制作
+                        重新制作
                       </Button>
                     </div>
                   </td>
@@ -685,6 +848,138 @@ watch(
           <Button :disabled="pickerBusy || !pickerTarget.candidates.length" @click="confirmPick">
             <Loader2 v-if="pickerBusy" class="h-4 w-4 animate-spin" />
             确认
+          </Button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 性别标记菜单：fixed 定位（表格外层 overflow-x-auto 会裁剪 absolute 下拉），点外部即关 -->
+    <template v-if="genderMenu">
+      <div class="fixed inset-0 z-40" @click="closeGenderMenu"></div>
+      <div
+        class="fixed z-50 w-24 rounded-md border bg-background p-1 shadow-md"
+        :style="{ left: genderMenu!.x + 'px', top: genderMenu!.y + 'px' }"
+      >
+        <button
+          type="button"
+          class="flex w-full items-center gap-1.5 rounded px-2 py-1 text-xs hover:bg-accent/60"
+          :class="{ 'bg-accent/60': speakers.find((s) => s.name === genderMenu!.name)?.gender === 'male' }"
+          :disabled="genderBusy"
+          @click="applyGender(speakers.find((s) => s.name === genderMenu!.name)!, 'male')"
+        >
+          <span class="text-xs leading-none text-indigo-600 dark:text-indigo-300">♂</span>男
+        </button>
+        <button
+          type="button"
+          class="flex w-full items-center gap-1.5 rounded px-2 py-1 text-xs hover:bg-accent/60"
+          :class="{ 'bg-accent/60': speakers.find((s) => s.name === genderMenu!.name)?.gender === 'female' }"
+          :disabled="genderBusy"
+          @click="applyGender(speakers.find((s) => s.name === genderMenu!.name)!, 'female')"
+        >
+          <span class="text-xs leading-none text-rose-600 dark:text-rose-300">♀</span>女
+        </button>
+        <button
+          type="button"
+          class="flex w-full items-center gap-1.5 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent/60"
+          :disabled="genderBusy"
+          @click="applyGender(speakers.find((s) => s.name === genderMenu!.name)!, '')"
+        >
+          <HelpCircle class="h-3 w-3" />清除标记
+        </button>
+      </div>
+    </template>
+
+    <!-- 合并角色子窗口：把源角色的全部台词并入所选角色（直接改写解析源数据，零 LLM 调用） -->
+    <div
+      v-if="mergeSourceItem"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      @click.self="closeMerge"
+    >
+      <div class="max-h-[80vh] w-full max-w-lg space-y-4 overflow-y-auto rounded-lg border bg-background p-5 shadow-lg">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold">合并角色 · {{ mergeSourceItem.name }}</h2>
+            <p class="mt-1 text-xs text-muted-foreground">
+              将其全部台词并入所选角色，并删除该角色的声音配置（候选音频文件保留在磁盘上）。
+            </p>
+          </div>
+          <Button variant="ghost" size="icon" :disabled="mergeBusy" @click="closeMerge">
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
+
+        <div class="relative">
+          <Search class="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            v-model="mergeQuery"
+            class="h-9 pl-8 text-sm"
+            placeholder="搜索目标角色…"
+            :disabled="mergeBusy"
+          />
+        </div>
+
+        <div class="max-h-80 space-y-1.5 overflow-y-auto">
+          <label
+            v-for="s in mergeOptions"
+            :key="s.name"
+            class="flex cursor-pointer items-center gap-3 rounded px-2 py-1.5 hover:bg-accent/50"
+            :class="{ 'bg-accent/60': mergeTarget === s.name }"
+          >
+            <input
+              type="radio"
+              class="h-4 w-4 shrink-0 accent-primary"
+              name="merge-target"
+              :checked="mergeTarget === s.name"
+              :disabled="mergeBusy"
+              @change="mergeTarget = s.name"
+            />
+            <span class="min-w-0 flex-1 truncate text-sm">
+              {{ s.name }}
+              <span v-if="s.alias_of" class="ml-1 text-xs text-muted-foreground">→ {{ s.alias_of }}</span>
+            </span>
+            <span class="shrink-0 text-xs text-muted-foreground">{{ s.line_count }} 条</span>
+          </label>
+          <p v-if="!mergeOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">
+            没有匹配的目标角色。
+          </p>
+        </div>
+
+        <Alert v-if="mergeError" variant="destructive">{{ mergeError }}</Alert>
+
+        <div class="flex items-center justify-end gap-2">
+          <Button variant="outline" size="sm" :disabled="mergeBusy" @click="closeMerge">取消</Button>
+          <Button :disabled="mergeBusy || !mergeTarget" @click="mergeConfirm = true">
+            下一步：确认合并
+          </Button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 合并角色 · 二次确认（盖在子窗口之上，保留目标选择上下文） -->
+    <div
+      v-if="mergeConfirm && mergeTarget"
+      class="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+      @click.self="mergeConfirm = false"
+    >
+      <div class="w-full max-w-md space-y-4 rounded-lg border bg-background p-5 shadow-lg">
+        <h2 class="text-lg font-semibold">确认合并？</h2>
+        <p class="flex items-center gap-2 text-sm">
+          <span class="font-medium">{{ mergeSourceItem?.name }}</span>
+          <ArrowRight class="h-3.5 w-3.5" />
+          <span class="font-medium">{{ mergeTarget }}</span>
+        </p>
+        <ul class="list-disc space-y-1 pl-4 text-xs text-muted-foreground">
+          <li>替换 {{ mergeSourceItem?.name }} 的 {{ mergeSourceItem?.line_count ?? 0 }} 条台词（当前范围：
+            {{ scope === ALL_SCRIPT ? '全部文件' : (scope || '最近文件') }}）。</li>
+          <li>删除 {{ mergeSourceItem?.name }} 的声音配置；指向它的别名将改指向目标角色。</li>
+          <li>其候选音频文件保留在磁盘上，不会被删除。</li>
+        </ul>
+        <Alert v-if="mergeError" variant="destructive">{{ mergeError }}</Alert>
+        <div class="flex items-center justify-end gap-2">
+          <Button variant="outline" size="sm" :disabled="mergeBusy" @click="mergeConfirm = false">取消</Button>
+          <Button :disabled="mergeBusy" @click="confirmMerge">
+            <Loader2 v-if="mergeBusy" class="h-4 w-4 animate-spin" />
+            确认合并
           </Button>
         </div>
       </div>

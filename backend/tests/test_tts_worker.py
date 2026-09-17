@@ -50,7 +50,7 @@ def test_plan_sub_batches_char_cap_limits_batch():
 
 def test_plan_sub_batches_length_ratio_splits():
     tw = _load_worker()
-    # once a batch holds >= 4 rows, a row > 5x the shortest opens a new batch
+    # a row > 3x (LENGTH_RATIO) the batch's shortest row opens a new batch
     assert tw.plan_sub_batches([10, 11, 12, 100], max_batch=8, max_batch_chars=10000) == [[0, 1, 2], [3]]
 
 
@@ -353,6 +353,15 @@ def test_plan_sub_batches_ratio_splits_even_two_row_batches():
     assert tw.plan_sub_batches([10, 100], max_batch=8, max_batch_chars=10000) == [[0], [1]]
 
 
+def test_plan_sub_batches_ratio_three_boundaries():
+    tw = _load_worker()
+    # exactly 3x (the tightened LENGTH_RATIO) still shares a batch; just over 3x splits —
+    # the decode cap scales with the batch's longest row, so a 5x spread (the old ratio)
+    # made a 2-char line run a 10-char line's full cap
+    assert tw.plan_sub_batches([2, 6], max_batch=8, max_batch_chars=10000) == [[0, 1]]
+    assert tw.plan_sub_batches([2, 7], max_batch=8, max_batch_chars=10000) == [[0], [1]]
+
+
 # ---------------------------------------------------------------------------
 # plan_next_sub_batch — the lazy planning round the run loop drives
 # ---------------------------------------------------------------------------
@@ -407,6 +416,65 @@ def test_lazy_rounds_shrink_and_replan_under_pressure():
     # the first round planned at the old cap; every re-plan used the halved cap
     assert sizes[:5] == [16, 16, 8, 4, 2]
     assert all(s == 1 for s in sizes[5:])
+
+
+# --------------------------------------------------------------------------- #
+# order_speaker_groups — per-character grouping, most lines first
+# --------------------------------------------------------------------------- #
+
+def test_order_speaker_groups_most_lines_first():
+    tw = _load_worker()
+    classified = {
+        ("clone", "龙套"): [_row(5)] * 2,
+        ("clone", "主角"): [_row(8)] * 5,
+        ("custom", "旁白"): [_row(30)] * 9,
+    }
+    groups = tw.order_speaker_groups(classified)
+    # the most-line character (旁白, 9 lines) runs first, then 5, then 2
+    assert [key for key, _rows in groups] == [
+        ("custom", "旁白"), ("clone", "主角"), ("clone", "龙套")]
+
+
+def test_order_speaker_groups_ties_keep_first_seen():
+    tw = _load_worker()
+    classified = {
+        ("clone", "甲"): [_row(4)],
+        ("clone", "乙"): [_row(6), _row(2)],
+        ("clone", "丙"): [_row(3), _row(7)],
+    }
+    groups = tw.order_speaker_groups(classified)
+    # equal counts -> first-seen (insertion) order, deterministic for a given input
+    assert [key for key, _rows in groups] == [
+        ("clone", "乙"), ("clone", "丙"), ("clone", "甲")]
+
+
+def test_order_speaker_groups_rows_length_ascending():
+    tw = _load_worker()
+    classified = {("custom", "旁白"): [_row(40), _row(3), _row(200), _row(12)]}
+    _key, rows = tw.order_speaker_groups(classified)[0]
+    # rows come back length-ascending so a sub-batch drawn from them stays homogeneous
+    assert [r["chars"] for r in rows] == [3, 12, 40, 200]
+
+
+def test_order_speaker_groups_never_mix_characters():
+    tw = _load_worker()
+    classified = {
+        ("custom", "A"): [_row(5), _row(9)],
+        ("custom", "B"): [_row(50)],
+        ("clone", "C"): [_row(2), _row(3), _row(4)],
+    }
+    groups = tw.order_speaker_groups(classified)
+    # each group is exactly one character's rows — all of them, length-ascending,
+    # no cross-character pooling
+    for key, rows in groups:
+        assert [r["chars"] for r in rows] == \
+            sorted(r["chars"] for r in classified[key])
+    assert {key for key, _rows in groups} == set(classified)
+
+
+def test_order_speaker_groups_empty():
+    tw = _load_worker()
+    assert tw.order_speaker_groups({}) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -641,6 +709,72 @@ def test_generate_rows_design_uses_per_row_instruct_and_do_sample_switch():
     assert model.calls[1].get("do_sample") is True
 
 
+class TestLengthProportionalDecodeCap:
+    """In a multi-row tensor batch the model does not stop individual rows at EOS
+    (model-side behaviour), so the decode cap scales with the sub-batch's longest row
+    instead of always being MAX_NEW_TOKENS — a short-row batch must no longer be able
+    to run the full 2048-step cap (the 2026-09-17 one-click-synthesis hang: 31 rows of
+    2-6 chars ran the full cap and blew the sub-batch watchdog budget)."""
+
+    def test_short_rows_get_the_floor(self):
+        tw = _load_worker()
+        assert tw.max_new_tokens_for_chars(0) == tw.FRAME_CAP_FLOOR
+        for chars in (1, 2, 6, 21):
+            assert tw.max_new_tokens_for_chars(chars) == tw.FRAME_CAP_FLOOR
+
+    def test_proportional_mid_range(self):
+        tw = _load_worker()
+        per_char = tw.FRAME_CAP_PER_CHAR
+        for chars in (30, 50, 100, 200):
+            assert tw.max_new_tokens_for_chars(chars) == chars * per_char
+
+    def test_long_rows_keep_the_full_cap(self):
+        tw = _load_worker()
+        # the floor of proportionality: 341*6 = 2046 < 2048; 342*6 = 2052 clamps to 2048
+        assert tw.max_new_tokens_for_chars(341) == 341 * tw.FRAME_CAP_PER_CHAR
+        for chars in (342, 1000, 2500):
+            assert tw.max_new_tokens_for_chars(chars) == tw.MAX_NEW_TOKENS
+
+    def test_monotonic(self):
+        tw = _load_worker()
+        caps = [tw.max_new_tokens_for_chars(c) for c in range(0, 400)]
+        assert caps == sorted(caps)
+
+    def test_generate_rows_passes_the_proportional_cap(self):
+        tw = _load_worker()
+
+        class _Model:
+            def __init__(self):
+                self.calls = []
+
+            def generate_voice_clone(self, **kw):
+                self.calls.append(kw)
+                return [[1.0] * 8] * len(kw["text"]), 24000
+
+        model = _Model()
+        args = SimpleNamespace(language="chinese")
+        # The incident shape: a few ultra-short rows in one sub-batch.
+        rows = [
+            {"index": 0, "speaker": "NARRATOR", "text": "啪！", "instruct": "", "vd": {}},
+            {"index": 1, "speaker": "NARRATOR", "text": "侍女抱了拳。", "instruct": "", "vd": {}},
+        ]
+        tw._generate_rows(model, "clone", rows, args, {"NARRATOR": "prompt"}, None)
+        # 6-char longest row -> the floor, NOT the full 2048 cap (the hang signature)
+        assert model.calls[0]["max_new_tokens"] == tw.max_new_tokens_for_chars(6)
+        assert model.calls[0]["max_new_tokens"] < tw.MAX_NEW_TOKENS
+
+        # A ~105-char row -> proportional, still under the full cap.
+        long_rows = [{
+            "index": 2, "speaker": "NARRATOR",
+            "text": "风从街口穿过来，带着一股淡淡的柴火气味。" * 5,
+            "instruct": "", "vd": {},
+        }]
+        tw._generate_rows(model, "clone", long_rows, args, {"NARRATOR": "prompt"}, None)
+        cap = model.calls[1]["max_new_tokens"]
+        assert cap == tw.max_new_tokens_for_chars(len(long_rows[0]["text"]))
+        assert tw.FRAME_CAP_FLOOR < cap < tw.MAX_NEW_TOKENS
+
+
 def test_save_and_report_design_protocol_and_fault_tolerance(tmp_path, monkeypatch):
     tw = _load_worker()
 
@@ -712,7 +846,8 @@ def test_worker_module_loads_without_torch():
     # The worker's top level is stdlib-only, so it imports in the lean 3.14 suite (no torch).
     tw = _load_worker()
     # The batch planner / bands / governor / watchdog / VRAM-budget helpers are all present...
-    for name in ("plan_sub_batches", "estimate_batch_vram", "sub_batch_timeout_seconds",
+    for name in ("plan_sub_batches", "order_speaker_groups", "estimate_batch_vram",
+                 "sub_batch_timeout_seconds",
                  "run_with_watchdog", "_clear_gpu_cache", "_talker_vram_params",
                  "_free_vram_budget", "_free_vram", "_total_vram", "_warmup",
                  "_synth_sub_batch", "plan_next_sub_batch", "plan_row_tokens",
@@ -722,7 +857,8 @@ def test_worker_module_loads_without_torch():
                  "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac"):
         assert callable(getattr(tw, name)), f"missing {name}"
     for const in ("ROW_STRUCTURAL_OVERHEAD", "CLONE_FALLBACK_OVERHEAD",
-                  "CHAR_TOKENS_PER_CHAR", "PEAK_PRESSURE_FRAC", "PEAK_GROW_FRAC",
+                  "CHAR_TOKENS_PER_CHAR", "LENGTH_RATIO", "PEAK_PRESSURE_FRAC",
+                  "PEAK_GROW_FRAC",
                   "FREE_FLOOR_GB", "VRAM_SCALE_MIN", "VRAM_SCALE_MAX"):
         assert getattr(tw, const) > 0, f"missing {const}"
     # the length bands: non-empty, ascending ceilings, fractions in (0, 1]

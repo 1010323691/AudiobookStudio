@@ -214,7 +214,28 @@ def pick_ref_text(lines):
 def _fallback_persona(speaker, lines):
     """A minimal, always-valid persona if the LLM is unavailable or unparseable."""
     description = f"{speaker} has a clear, natural audiobook voice."
-    return description, pick_ref_text(lines)
+    return description, pick_ref_text(lines), ""
+
+
+def _normalize_gender(value) -> str:
+    """Coerce an LLM gender answer to ``"male"`` / ``"female"`` / ``""`` (unknown)."""
+    v = str(value or "").strip().lower()
+    if v in ("male", "男", "男人", "男性"):
+        return "male"
+    if v in ("female", "女", "女人", "女性"):
+        return "female"
+    return ""
+
+
+def _gender_from_description(description: str) -> str:
+    """Gender fallback for prompts that don't emit a ``gender`` key: the description
+    itself is required to state the voice's gender ("青年男性" / "少女女声"), so scan it."""
+    d = str(description or "")
+    if re.search(r"女性|女声", d):
+        return "female"
+    if re.search(r"男性|男声", d):
+        return "male"
+    return ""
 
 
 def _sanitize(name):
@@ -233,7 +254,9 @@ def _llm_persona(handle, llm, system, user_template, speaker, script, bands):
     ±window local context (see :func:`_select_target_bands` / :func:`_window_block`), so
     the model judges the voice from the character's full range of delivery, not just the
     intro. One retry, then the caller falls back to :func:`_fallback_persona`. Returns
-    ``(description, ref_text)``.
+    ``(description, ref_text, gender)`` — ``gender`` is ``"male"`` / ``"female"`` / ``""``
+    (unknown): the explicit ``gender`` key wins, else the description's own gender words
+    (a prompt without the key still states it there).
     """
     from .script import _llm_chat_completion
 
@@ -286,9 +309,10 @@ def _llm_persona(handle, llm, system, user_template, speaker, script, bands):
             desc = str(parsed.get("description", "") or "").strip()
             ref = str(parsed.get("ref_text", "") or "").strip()
             if desc:
-                return desc, ref
+                gender = _normalize_gender(parsed.get("gender")) or _gender_from_description(desc)
+                return desc, ref, gender
         handle.log(f"  LLM 响应无法解析为 persona（第 {attempt + 1} 次）", "WARNING")
-    return "", ""
+    return "", "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -574,22 +598,28 @@ def prepare_foundations(handle, speakers=None, new_only=False, overrides=None, s
         lines = [t for _i, t in pairs]  # texts only, for ref-text selection / fallback
         bands = _select_target_bands(pairs)
         # Description + ref text: an override wins, else the LLM, else a fallback.
+        # ``gender`` (male/female/"") is a PRE-FILL only — the user's badge pick is the
+        # source of truth, so an existing value is never overwritten (the coordinator
+        # applies it only when the entry has none yet).
         description = (overrides.get(sp) or "").strip()
         ref_text = ""
+        gender = ""
         if description:
             handle.log(f"  [{sp}] 使用自定义提示词：{description[:60]}")
             ref_text = pick_ref_text(lines)
+            gender = _gender_from_description(description)
         else:
             try:
-                description, ref_text = _llm_persona(
+                description, ref_text, gender = _llm_persona(
                     handle, llm, persona_system, persona_user, sp, script, bands,
                 )
             except Exception as e:  # noqa: BLE001
                 handle.log(f"  [{sp}] LLM 生成描述失败：{e}（改用兜底）", "WARNING")
-                description, ref_text = "", ""
+                description, ref_text, gender = "", "", ""
         if not description:
-            description, ref_text = _fallback_persona(sp, lines)
+            description, ref_text, _g = _fallback_persona(sp, lines)
             handle.log(f"  [{sp}] 使用兜底描述。", "WARNING")
+            gender = gender or _g
         if not ref_text:
             ref_text = pick_ref_text(lines) or f"{sp} speaks in a clear, natural voice."
         return {
@@ -598,6 +628,7 @@ def prepare_foundations(handle, speakers=None, new_only=False, overrides=None, s
             "type": "foundation",
             "description": description,
             "ref_text": ref_text,
+            "gender": gender,
             "foundation_status": "done" if description else "failed",
         }
 
@@ -629,6 +660,9 @@ def prepare_foundations(handle, speakers=None, new_only=False, overrides=None, s
                 "foundation_status": r.get("foundation_status") or ("failed" if not r["ok"] else "done"),
                 "seed": entry.get("seed", -1),
             })
+            # Gender pre-fill only: never clobber a value the badge (or an earlier run) set.
+            if r.get("gender") and not entry.get("gender"):
+                entry["gender"] = r["gender"]
             voice_config[sp] = entry
             persist()
             results.append({"speaker": r["speaker"], "ok": r["ok"], "type": r["type"],

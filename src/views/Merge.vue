@@ -107,6 +107,17 @@ function onScanned(r: DirListResult) {
   checkManifest()
 }
 
+// 刷新恢复：页面重载后本地 taskId 丢失，但后端合并任务仍在跑（store 的 refresh 已拉回全量
+// 任务）。按 module 重新挂接在途任务，并从 label 尾部「：{package}」还原所选包。
+function reattachTask() {
+  const t = taskStore.activeTasks('merge')[0]
+  if (!t || taskId.value) return
+  taskId.value = t.id
+  busy.value = true
+  const m = t.label.match(/：(.+)$/)
+  if (m) pkg.value = m[1]
+}
+
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
   try {
@@ -114,7 +125,8 @@ onMounted(async () => {
   } catch {
     status.value = { implemented: false, message: '后端未连接' }
   }
-  taskStore.refresh()
+  await taskStore.refresh()
+  reattachTask()
 })
 
 watch(pkg, checkManifest)

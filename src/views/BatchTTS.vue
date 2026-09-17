@@ -6,8 +6,8 @@ import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
 import { listDir } from '@/api/files'
-import { batchStatusFiles, resetBatch, runBatch, ttsStatus } from '@/api/tts'
-import type { BatchFileStatus, BatchResult, FileItem, TTSStatus } from '@/types'
+import { batchStatusFiles, listVoices, resetBatch, runBatch, runStressTest, ttsStatus } from '@/api/tts'
+import type { BatchFileStatus, BatchResult, FileItem, StressTestResult, TTSStatus, VoiceItem } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -29,6 +29,8 @@ import {
   RefreshCw,
   RotateCcw,
   ArrowRight,
+  FlaskConical,
+  X,
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -252,6 +254,27 @@ function stopStatusPolling(final = true) {
 // Lifecycle (the page is keep-alive cached: onUnmounted does NOT fire on
 // navigation, so the poller follows onActivated/onDeactivated)
 // ---------------------------------------------------------------------------
+// 刷新恢复：页面重载后本地 taskId 丢失，但后端合成任务仍在跑（store 的 refresh 已拉回全量
+// 任务）。按 module 重新挂接在途任务（后端守卫保证至多一个在途）——每文件行由 refreshRows()
+//（03_parsed_json 目录列表）自行恢复，这里只恢复任务级状态（日志面板 / 取消钮 / 完成 watcher）。
+function reattachTask() {
+  if (taskId.value) return
+  const t = taskStore.activeTasks('tts-batch')[0]
+  if (t) {
+    taskId.value = t.id
+    busy.value = true
+    startStatusPolling()
+  }
+}
+
+// 压测任务的挂接（F5 恢复）：后端至多一个在途压测任务；子窗口保持关闭，只恢复任务引用
+// （压测按钮转为「压测中…」，重新打开子窗口即可看到日志 / 取消 / 结果）。
+function reattachStressTask() {
+  if (stressTaskId.value) return
+  const t = taskStore.activeTasks('tts-stress')[0]
+  if (t) stressTaskId.value = t.id
+}
+
 onMounted(async () => {
   // On a cold start settings may still be loading when onActivated runs (it fires right
   // after mounted, before this await resolves) — remember whether WE had to load it.
@@ -264,7 +287,9 @@ onMounted(async () => {
   } catch {
     status.value = { implemented: false, message: '后端未连接' }
   }
-  taskStore.refresh()
+  await taskStore.refresh()
+  reattachTask()
+  reattachStressTask()
   if (needLoad) void refreshRows() // the initial onActivated run was skipped (no workspace yet)
 })
 
@@ -273,6 +298,8 @@ onMounted(async () => {
 // on a cold start (settings still loading) it defers to onMounted's post-load refresh.
 onActivated(() => {
   if (settings.loaded) void refreshRows()
+  reattachTask()
+  reattachStressTask()
   const st = task.value?.status
   if (task.value && (st === 'pending' || st === 'running' || st === 'paused')) startStatusPolling()
 })
@@ -363,6 +390,127 @@ watch(
       taskId.value = null
       busy.value = false
       stopStatusPolling()
+    }
+  },
+)
+
+// ---------------------------------------------------------------------------
+// 压测（临时测试入口）：子窗口 + 独立任务跟踪
+// ---------------------------------------------------------------------------
+// 机器自动生成的自然语句（不借助 LLM、不需要解析脚本）+ 任意一个已有克隆音色：固定批内
+// 行数（--concurrency 上限），每行字数从起点每轮递增（步长可设），一轮一次引擎子进程，
+// 无限跑到失败为止。失败 = 未达吞吐标准（1 秒必须出 10 个字：限时 = 处理量 / 10 秒，
+// 计时自 worker「模型就绪」起，不含模型加载）/ 看门狗 124 / 引擎失败。逐轮报告（处理量 /
+// 耗时 / 真实吞吐）写入工作空间 stress_test/ 目录；临时产物在 00_temp/ 每轮用完即删。
+const stressOpen = ref(false)
+const stressRows = ref(64)
+const stressStartChars = ref(10)
+const stressStepChars = ref(10)
+const stressMaxRounds = ref('') // '' = 不限（跑到失败为止）
+const stressSpeaker = ref('') // '' = 自动取第一个可用克隆音色
+const cloneSpeakers = ref<VoiceItem[]>([])
+const cloneSpeakersLoaded = ref(false)
+const stressTaskId = ref<string | null>(null)
+const stressResult = ref<StressTestResult | null>(null)
+const stressError = ref('')
+
+const stressTask = computed(() => taskStore.tasks.find((t) => t.id === stressTaskId.value) ?? null)
+const stressActive = computed(() => {
+  const st = stressTask.value?.status
+  return st === 'pending' || st === 'running' || st === 'paused'
+})
+
+function clampStressRows(n: number): number {
+  const v = Math.trunc(n)
+  if (!Number.isFinite(v)) return 64
+  return Math.max(1, Math.min(64, v))
+}
+
+async function openStress() {
+  stressOpen.value = true
+  stressError.value = ''
+  if (stressTaskId.value) return // a reattached / running task: just show it
+  // 音色下拉：列出全部克隆音色（任意一个都可以压测）；自动档排在最前。
+  if (!cloneSpeakersLoaded.value) {
+    try {
+      const r = await listVoices()
+      cloneSpeakers.value = r.speakers.filter((s) => s.type === 'clone')
+      cloneSpeakersLoaded.value = true
+    } catch {
+      cloneSpeakers.value = [] // backend down — auto pick still works server-side
+    }
+  }
+}
+
+function closeStress() {
+  if (stressActive.value && !window.confirm('压测任务仍在进行。关闭窗口后任务会继续运行（重新打开可看日志 / 取消）。确定关闭？')) return
+  stressOpen.value = false
+}
+
+async function doStressTest() {
+  if (stressActive.value) return
+  const start = Math.trunc(Number(stressStartChars.value))
+  const step = Math.trunc(Number(stressStepChars.value))
+  if (!Number.isFinite(start) || start < 1 || start > 2500) {
+    stressError.value = '起始每行字数须为 1..2500 的整数。'
+    return
+  }
+  if (!Number.isFinite(step) || step < 1) {
+    stressError.value = '每轮递增须为 ≥ 1 的整数。'
+    return
+  }
+  const maxRoundsRaw = stressMaxRounds.value.trim()
+  let maxRounds: number | undefined
+  if (maxRoundsRaw !== '') {
+    maxRounds = Math.trunc(Number(maxRoundsRaw))
+    if (!Number.isFinite(maxRounds) || maxRounds < 1) {
+      stressError.value = '轮数上限须为 ≥ 1 的整数（留空 = 不限）。'
+      return
+    }
+  }
+  stressError.value = ''
+  stressResult.value = null
+  try {
+    const { task_id } = await runStressTest({
+      rows: clampStressRows(stressRows.value),
+      start_chars: start,
+      step_chars: step,
+      max_rounds: maxRounds,
+      speaker: stressSpeaker.value || undefined,
+    })
+    stressTaskId.value = task_id
+    await taskStore.refresh()
+  } catch (e: any) {
+    stressError.value = e?.message || '启动压测失败'
+  }
+}
+
+function cancelStress() {
+  if (stressTask.value) taskStore.control(stressTask.value.id, 'cancel')
+}
+
+watch(
+  () => stressTask.value?.status,
+  (st) => {
+    const t = stressTask.value
+    if (!st || !t) return
+    if (st === 'succeeded') {
+      const res = t.result as StressTestResult
+      stressResult.value = res
+      stressTaskId.value = null
+      toast({
+        title: res.failed_at_chars ? '压测停止 · 找到边界' : '压测完成',
+        variant: res.failed_at_chars ? 'default' : 'success',
+        description: res.failed_at_chars
+          ? `第 ${res.results.length} 轮（${res.rows} 行 × ${res.failed_at_chars} 字/行）未达标 → 边界 · 共 ${res.results.length} 轮 · 结果：${res.result_path.split(/[\\/]/).pop()}`
+          : `共 ${res.results.length} 轮 · ${res.stopped_reason}`,
+      })
+    } else if (st === 'failed') {
+      stressError.value = t.error || '压测失败'
+      stressTaskId.value = null
+      toast({ title: '压测失败', variant: 'destructive', description: stressError.value })
+    } else if (st === 'cancelled') {
+      stressTaskId.value = null
     }
   },
 )
@@ -498,18 +646,28 @@ watch(
         </CardHeader>
         <CardContent class="space-y-4">
           <div class="flex flex-wrap items-center gap-3">
-            <Button :disabled="busy || !workspaceSet || !selectedNames.length" @click="doRun">
+            <Button :disabled="busy || stressActive || !workspaceSet || !selectedNames.length" @click="doRun">
               <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
               <Layers v-else class="h-4 w-4" />
               {{ busy ? '合成中…' : `开始音频合成${selectedNames.length ? `（${selectedNames.length} 个文件）` : ''}` }}
             </Button>
             <Button
               variant="outline"
-              :disabled="busy || !workspaceSet || !selectedNames.length"
+              :disabled="busy || stressActive || !workspaceSet || !selectedNames.length"
               title="删除选中文件已合成的音频与进度，随后从头重新合成全部段落"
               @click="doRunAll"
             >
               <RotateCcw class="h-4 w-4" />重新全部合成
+            </Button>
+            <Button
+              variant="outline"
+              :disabled="!workspaceSet || busy || stressActive"
+              title="临时测试入口：自动生成自然语句、任意克隆音色，逐字数档探测批内跑满 / 崩溃边界"
+              @click="openStress"
+            >
+              <Loader2 v-if="stressActive" class="h-4 w-4 animate-spin" />
+              <FlaskConical v-else class="h-4 w-4" />
+              {{ stressActive ? '压测中…' : '压测' }}
             </Button>
             <label class="flex items-center gap-2 text-sm text-muted-foreground">
               批内段数
@@ -606,5 +764,164 @@ watch(
       <template #icon><XCircle class="h-4 w-4 shrink-0" /></template>
       {{ error }}
     </Alert>
+
+    <!-- 压测子窗口（临时测试入口）：机器自动生成的自然语句（不借助 LLM）+ 任意一个已有克隆
+         音色，逐「每行字数」档各跑一次引擎子进程，探测批内跑满 / 崩溃边界。产物全在
+         00_temp/ 临时目录、每档用完即删。 -->
+    <div
+      v-if="stressOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      @click.self="closeStress"
+    >
+      <div class="max-h-[90vh] w-full max-w-2xl space-y-4 overflow-y-auto rounded-lg border bg-background p-5 shadow-lg">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h2 class="flex items-center gap-2 text-lg font-semibold">
+              <FlaskConical class="h-5 w-5" />压测 · 批处理边界（临时测试入口）
+            </h2>
+            <p class="mt-1 text-xs text-muted-foreground">
+              程序自动生成自然语句（不借助 LLM、不需要解析脚本），用任意一个已有克隆音色：
+              固定批内行数（上限；实际每批条数按段长分档，与正式合成同一规则），
+              每行字数从起点每轮递增，一轮一次引擎子进程（模型逐轮加载一次），
+              无限跑到失败为止。失败标准：1 秒必须出 10 个字（限时 = 处理量 ÷ 10 秒，
+              计时自「模型就绪」起、不含模型加载）/ 看门狗超时 / 引擎失败。
+              逐轮报告（处理量 / 耗时 / 真实吞吐）写入工作空间 stress_test/ 目录；
+              临时产物在 00_temp/ 每轮用完即删。
+            </p>
+          </div>
+          <Button variant="ghost" size="icon" :disabled="stressActive" @click="closeStress">
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-x-5 gap-y-3 rounded-md border p-3 text-sm">
+          <label class="flex items-center gap-2 text-muted-foreground">
+            批内行数
+            <Input
+              :modelValue="stressRows"
+              type="number"
+              min="1"
+              max="64"
+              step="1"
+              class="h-8 w-20"
+              :disabled="stressActive"
+              @update:modelValue="stressRows = clampStressRows(Number($event))"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-muted-foreground">
+            起始每行字数
+            <Input
+              :modelValue="stressStartChars"
+              type="number"
+              min="1"
+              max="2500"
+              step="1"
+              class="h-8 w-20"
+              :disabled="stressActive"
+              @update:modelValue="stressStartChars = Math.trunc(Number($event))"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-muted-foreground" title="每轮 = 上一轮 + 该值，逐轮跑下去直到失败">
+            每轮递增
+            <Input
+              :modelValue="stressStepChars"
+              type="number"
+              min="1"
+              step="1"
+              class="h-8 w-20"
+              :disabled="stressActive"
+              @update:modelValue="stressStepChars = Math.trunc(Number($event))"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-muted-foreground" title="留空 = 不限（跑到失败为止）">
+            轮数上限
+            <Input
+              v-model="stressMaxRounds"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="不限"
+              class="h-8 w-20"
+              :disabled="stressActive"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-muted-foreground">
+            音色
+            <select
+              v-model="stressSpeaker"
+              class="h-8 max-w-44 rounded-md border bg-background px-2 text-sm"
+              :disabled="stressActive"
+            >
+              <option value="">自动（第一个克隆音色）</option>
+              <option v-for="s in cloneSpeakers" :key="s.name" :value="s.name">{{ s.name }}</option>
+            </select>
+          </label>
+        </div>
+
+        <Alert v-if="stressError" variant="destructive">
+          <template #icon><XCircle class="h-4 w-4 shrink-0" /></template>
+          {{ stressError }}
+        </Alert>
+
+        <div class="flex items-center gap-2">
+          <Button :disabled="stressActive || !workspaceSet" @click="doStressTest">
+            <Loader2 v-if="stressActive" class="h-4 w-4 animate-spin" />
+            <FlaskConical v-else class="h-4 w-4" />
+            {{ stressActive ? '压测中…' : '开始压测' }}
+          </Button>
+          <Button v-if="stressTask" variant="outline" size="sm" @click="cancelStress">
+            <XCircle class="h-3.5 w-3.5" />取消
+          </Button>
+        </div>
+
+        <LiveLogPanel :task="stressTask" :max-height-class="'h-64'" />
+
+        <!-- 结果：每轮一行（字数 | 处理量 | 成功/行数 | 耗时 | 真实吞吐 | 判定） -->
+        <div v-if="stressResult" class="space-y-2">
+          <div class="text-xs text-muted-foreground">
+            压测结果 · 音色：{{ stressResult.speaker }} · 批内行数 {{ stressResult.rows }}
+            · 标准 {{ stressResult.min_throughput_chars_per_sec }} 字/秒
+            <span v-if="stressResult.seed >= 0">· seed {{ stressResult.seed }}</span>
+            <span class="block">停止：{{ stressResult.stopped_reason }}</span>
+            <span v-if="stressResult.failed_at_chars" class="block text-amber-600 dark:text-amber-400">
+              边界：每行 {{ stressResult.failed_at_chars }} 字（{{ stressResult.rows }} × {{ stressResult.failed_at_chars }}
+              = {{ stressResult.rows * stressResult.failed_at_chars }} 字）未达标
+            </span>
+            <span class="block">结果文件：{{ stressResult.result_path }}</span>
+          </div>
+          <div class="overflow-hidden rounded-md border">
+            <table class="w-full text-xs">
+              <thead class="bg-accent/40 text-muted-foreground">
+                <tr>
+                  <th class="px-2 py-1.5 text-right font-medium">轮</th>
+                  <th class="px-2 py-1.5 text-right font-medium">每行字数</th>
+                  <th class="px-2 py-1.5 text-right font-medium">处理量（字）</th>
+                  <th class="px-2 py-1.5 text-right font-medium">成功 / 行数</th>
+                  <th class="px-2 py-1.5 text-right font-medium">耗时</th>
+                  <th class="px-2 py-1.5 text-right font-medium">吞吐（字/秒）</th>
+                  <th class="px-2 py-1.5 text-left font-medium">判定</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in stressResult.results" :key="r.round" class="border-t">
+                  <td class="px-2 py-1.5 text-right tabular-nums">{{ r.round }}</td>
+                  <td class="px-2 py-1.5 text-right font-medium tabular-nums">{{ r.chars_per_line }} 字</td>
+                  <td class="px-2 py-1.5 text-right tabular-nums">{{ r.total_chars }}</td>
+                  <td class="px-2 py-1.5 text-right tabular-nums">{{ r.ok }} / {{ r.rows }}</td>
+                  <td class="px-2 py-1.5 text-right tabular-nums">{{ r.synth_seconds === null ? '—' : `${r.synth_seconds}s` }}</td>
+                  <td class="px-2 py-1.5 text-right tabular-nums">{{ r.throughput_chars_per_sec === null ? '—' : r.throughput_chars_per_sec }}</td>
+                  <td class="px-2 py-1.5">
+                    <span v-if="r.passed" class="text-emerald-600 dark:text-emerald-400">通过</span>
+                    <span v-else class="text-destructive" :title="r.reason">
+                      失败<span v-if="r.reason">（{{ r.reason }}）</span>
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

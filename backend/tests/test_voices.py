@@ -23,10 +23,12 @@ from types import SimpleNamespace
 import pytest
 
 from backend.api.tts import (
+    MergeSpeakersRequest,
     SelectVoiceRequest,
     _clone_status,
     _foundation_status,
     list_voices,
+    merge_speakers,
     select_voice,
 )
 import backend.api.tts as tts_api
@@ -284,9 +286,10 @@ def test_ref_text_empty():
 # --------------------------------------------------------------------------- #
 
 def test_fallback_persona_shape():
-    desc, ref = _fallback_persona("Bob", ["a long enough line here"])
+    desc, ref, gender = _fallback_persona("Bob", ["a long enough line here"])
     assert desc == "Bob has a clear, natural audiobook voice."
     assert ref == "a long enough line here"
+    assert gender == ""  # the fallback carries no gender (the badge stays 未定)
 
 
 # --------------------------------------------------------------------------- #
@@ -1147,6 +1150,353 @@ def test_select_voice_refused_while_phase_task_active(clone_ws, monkeypatch):
     monkeypatch.setattr(tts_api, "get_task_manager", lambda: _ClearedManager())
     out = select_voice(SelectVoiceRequest(speaker="A", audio_id="2"))
     assert out["ok"] is True and out["selected_audio_id"] == "2"
+
+
+# --------------------------------------------------------------------------- #
+# the merge-speakers endpoint  (POST /api/tts/voices/merge-speakers, called in-process)
+# --------------------------------------------------------------------------- #
+
+def _read_script(ws, name="s.json"):
+    return json.loads((ws / "03_parsed_json" / name).read_text("utf-8"))
+
+
+def test_merge_speakers_single_file(clone_ws):
+    _seed_script(clone_ws, {"A": 3, "B": 2})
+    _seed_foundations(clone_ws, ["A", "B", "C"])
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out == {"ok": True, "source": "A", "target": "B", "replaced": 3, "files": ["s.json"]}
+    data = _read_script(clone_ws)
+    assert {e["speaker"] for e in data} == {"B"} and len(data) == 5
+    vc = _load_vc(clone_ws)
+    assert "A" not in vc
+    # The untouched characters keep their entries byte-for-byte.
+    assert vc["B"]["foundation_status"] == "done"
+    assert vc["C"]["description"].startswith("C ")
+
+
+def test_merge_speakers_all_scope(clone_ws):
+    _seed_script(clone_ws, {"A": 2, "B": 1})
+    (clone_ws / "03_parsed_json" / "s2.json").write_text(
+        json.dumps([{"speaker": "A", "text": "x"}, {"speaker": "C", "text": "y"}],
+                   ensure_ascii=False), encoding="utf-8")
+    _seed_foundations(clone_ws, ["A", "B", "C"])
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B",
+                                              script=core_paths.ALL_PARSED_JSON))
+    assert out["replaced"] == 3 and out["files"] == ["s.json", "s2.json"]
+    assert {e["speaker"] for e in _read_script(clone_ws)} == {"B"}
+    s2 = _read_script(clone_ws, "s2.json")
+    assert [e["speaker"] for e in s2] == ["B", "C"]  # C's line is untouched
+
+
+def test_merge_speakers_partial_files(clone_ws):
+    # A file without the source is NOT rewritten (a rewrite would refresh its mtime and
+    # perturb the most-recent-file / __all__ ordering).
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    s3 = clone_ws / "03_parsed_json" / "s3.json"
+    s3.write_text(json.dumps([{"speaker": "C", "text": "x"}], ensure_ascii=False),
+                  encoding="utf-8")
+    before = s3.read_bytes()
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B",
+                                              script=core_paths.ALL_PARSED_JSON))
+    assert out["files"] == ["s.json"]
+    assert s3.read_bytes() == before
+
+
+def test_merge_speakers_zero_lines_removes_vc_entry(clone_ws):
+    # The source has no lines in scope but a voice-config entry: the merge still cleans it.
+    _seed_script(clone_ws, {"B": 2})
+    _seed_foundations(clone_ws, ["A", "B"])
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out == {"ok": True, "source": "A", "target": "B", "replaced": 0, "files": []}
+    assert "A" not in _load_vc(clone_ws)
+
+
+def test_merge_speakers_redirects_aliases(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    _seed_foundations(clone_ws, ["A", "B", "C", "D"], extra={
+        "C": {"alias_of": "A"},
+        "D": {"alias": "A"},  # legacy field (still recognised downstream)
+    })
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out["replaced"] == 1
+    vc = _load_vc(clone_ws)
+    assert "A" not in vc
+    assert vc["C"]["alias_of"] == "B"
+    assert vc["D"]["alias"] == "B"
+
+
+def test_merge_speakers_type_fallback_only(clone_ws):
+    # ``type`` stands in for the identity ONLY when ``speaker`` is absent — a line whose
+    # speaker is someone else must not have its ``type`` field clobbered.
+    (clone_ws / "03_parsed_json" / "s.json").write_text(
+        json.dumps([
+            {"type": "A", "text": "narration"},                 # type-only identity -> merged
+            {"speaker": "B", "type": "A", "text": "dialogue"},  # identity is B -> untouched
+        ], ensure_ascii=False), encoding="utf-8")
+    _seed_foundations(clone_ws, ["A", "B"])
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out["replaced"] == 1
+    data = _read_script(clone_ws)
+    assert data[0]["type"] == "B" and "speaker" not in data[0]
+    assert data[1]["speaker"] == "B" and data[1]["type"] == "A"
+
+
+def test_merge_speakers_no_voice_config(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out["replaced"] == 1
+    # Absent voice_config is legal: the merge must not create one.
+    assert not (clone_ws / "04_voice_profiles" / "voice_config.json").exists()
+
+
+def test_merge_speakers_wav_kept_on_disk(clone_ws):
+    dv = clone_ws / "04_voice_profiles" / "designed_voices"
+    dv.mkdir(parents=True, exist_ok=True)
+    wav = dv / "a_c1.wav"
+    wav.write_bytes(b"RIFF-fake")
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    _seed_foundations(clone_ws, ["A", "B"], extra={
+        "A": {"ref_audio": "04_voice_profiles/designed_voices/a_c1.wav"},
+    })
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out["replaced"] == 1
+    assert "A" not in _load_vc(clone_ws)
+    assert wav.exists() and wav.read_bytes() == b"RIFF-fake"  # user data is never deleted
+
+
+def test_merge_speakers_source_equals_target(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="A", target="A", script="s.json"))
+    assert ex.value.status_code == 400
+
+
+def test_merge_speakers_empty_names(clone_ws):
+    _seed_script(clone_ws, {"A": 1})
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="  ", target="B", script="s.json"))
+    assert ex.value.status_code == 400
+
+
+def test_merge_speakers_unknown_source(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    _seed_foundations(clone_ws, ["A", "B"])
+    before = (clone_ws / "03_parsed_json" / "s.json").read_bytes()
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="Z", target="B", script="s.json"))
+    assert ex.value.status_code == 404
+    assert (clone_ws / "03_parsed_json" / "s.json").read_bytes() == before
+    assert set(_load_vc(clone_ws)) == {"A", "B"}  # nothing was written
+
+
+def test_merge_speakers_unknown_target(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    before = (clone_ws / "03_parsed_json" / "s.json").read_bytes()
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="A", target="Z", script="s.json"))
+    assert ex.value.status_code == 400
+    assert (clone_ws / "03_parsed_json" / "s.json").read_bytes() == before
+
+
+def test_merge_speakers_requires_workspace(tmp_path, monkeypatch):
+    # No workspace pointer: the guard fires before anything is read or written.
+    monkeypatch.setattr(core_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
+    (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
+    core_config.reset_config_cache()
+    try:
+        with pytest.raises(HTTPException) as ex:
+            merge_speakers(MergeSpeakersRequest(source="A", target="B"))
+        assert ex.value.status_code == 409
+    finally:
+        core_config.reset_config_cache()
+
+
+def test_merge_speakers_refused_while_phase_task_active(clone_ws, monkeypatch):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    _seed_foundations(clone_ws, ["A", "B"])
+
+    class _RunningManager:
+        def list(self):
+            return [SimpleNamespace(module="voices-clone", status=TaskStatus.RUNNING)]
+
+    monkeypatch.setattr(tts_api, "get_task_manager", lambda: _RunningManager())
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert ex.value.status_code == 409
+    assert set(_load_vc(clone_ws)) == {"A", "B"}
+    assert {e["speaker"] for e in _read_script(clone_ws)} == {"A", "B"}
+
+    # A finished voices task (or an unrelated running one) does not block the merge.
+    class _ClearedManager:
+        def list(self):
+            return [SimpleNamespace(module="voices-foundation", status=TaskStatus.SUCCEEDED),
+                    SimpleNamespace(module="tts-batch", status=TaskStatus.RUNNING)]
+
+    monkeypatch.setattr(tts_api, "get_task_manager", lambda: _ClearedManager())
+    out = merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert out["ok"] is True and out["replaced"] == 1
+
+
+def test_merge_speakers_corrupt_script(clone_ws):
+    (clone_ws / "03_parsed_json" / "s.json").write_text("not json at all", encoding="utf-8")
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert ex.value.status_code == 400
+
+
+def test_merge_speakers_corrupt_voice_config(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    (clone_ws / "04_voice_profiles" / "voice_config.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(HTTPException) as ex:
+        merge_speakers(MergeSpeakersRequest(source="A", target="B", script="s.json"))
+    assert ex.value.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# gender badge  (Phase-1 pre-fill + user pick; POST /api/tts/voices/gender)
+# --------------------------------------------------------------------------- #
+
+def test_set_gender_creates_updates_clears(clone_ws):
+    _seed_script(clone_ws, {"A": 1, "B": 1})
+    # A script-only character (no voice_config entry yet) gets a minimal one.
+    out = tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender="male"))
+    assert out == {"ok": True, "speaker": "A", "gender": "male"}
+    assert _load_vc(clone_ws)["A"]["gender"] == "male"
+    # Update, then clear back to unknown.
+    tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender="female"))
+    assert _load_vc(clone_ws)["A"]["gender"] == "female"
+    out = tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender=""))
+    assert out["gender"] == ""
+    assert "gender" not in _load_vc(clone_ws)["A"]
+    # Other characters are untouched.
+    assert "A" == next(iter(_load_vc(clone_ws))) and "B" not in _load_vc(clone_ws)
+
+
+def test_set_gender_preserves_other_entry_fields(clone_ws):
+    _seed_script(clone_ws, {"A": 1})
+    _seed_foundations(clone_ws, ["A"])
+    tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender="male"))
+    e = _load_vc(clone_ws)["A"]
+    assert e["gender"] == "male" and e["foundation_status"] == "done"
+    assert e["description"].startswith("A ")
+
+
+def test_set_gender_rejects_bad_values(clone_ws):
+    _seed_script(clone_ws, {"A": 1})
+    _seed_foundations(clone_ws, ["A"])
+    before = (clone_ws / "04_voice_profiles" / "voice_config.json").read_bytes()
+    for req in (tts_api.SetGenderRequest(speaker="  ", gender="male"),
+                tts_api.SetGenderRequest(speaker="A", gender="unknown"),
+                tts_api.SetGenderRequest(speaker="A", gender="andro")):
+        with pytest.raises(HTTPException) as ex:
+            tts_api.set_gender(req)
+        assert ex.value.status_code == 400
+    assert (clone_ws / "04_voice_profiles" / "voice_config.json").read_bytes() == before
+
+
+def test_set_gender_requires_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
+    (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
+    core_config.reset_config_cache()
+    try:
+        with pytest.raises(HTTPException) as ex:
+            tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender="male"))
+        assert ex.value.status_code == 409
+    finally:
+        core_config.reset_config_cache()
+
+
+def test_set_gender_refused_while_phase_task_active(clone_ws, monkeypatch):
+    _seed_script(clone_ws, {"A": 1})
+    _seed_foundations(clone_ws, ["A"])
+
+    class _RunningManager:
+        def list(self):
+            return [SimpleNamespace(module="voices-foundation", status=TaskStatus.RUNNING)]
+
+    monkeypatch.setattr(tts_api, "get_task_manager", lambda: _RunningManager())
+    with pytest.raises(HTTPException) as ex:
+        tts_api.set_gender(tts_api.SetGenderRequest(speaker="A", gender="male"))
+    assert ex.value.status_code == 409
+    assert "gender" not in _load_vc(clone_ws)["A"]
+
+
+def test_list_voices_includes_gender(clone_ws):
+    _seed_script(clone_ws, {"A": 2, "B": 1})
+    _seed_foundations(clone_ws, ["A", "B"], extra={"A": {"gender": "female"}})
+    out = list_voices("s.json")
+    by_name = {s["name"]: s for s in out["speakers"]}
+    assert by_name["A"]["gender"] == "female"
+    assert by_name["B"]["gender"] == ""
+
+
+def _stub_persona_llm(monkeypatch, reply):
+    """Point the persona LLM channel at a canned reply (``_llm_persona`` imports the
+    function at call time, so patching the module attribute is enough)."""
+    from backend.engines import script as script_eng
+
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(kwargs)
+        return reply, "stop", {}
+
+    monkeypatch.setattr(script_eng, "_llm_chat_completion", fake)
+    return calls
+
+
+def test_llm_persona_gender_explicit_key_wins(clone_ws, monkeypatch):
+    reply = json.dumps({"description": "青年男性，音色清亮。", "ref_text": "你好，我是A。",
+                        "gender": "female"}, ensure_ascii=False)
+    _stub_persona_llm(monkeypatch, reply)
+    llm = SimpleNamespace(model_name="m", base_url="b", api_key="k")
+    script = [{"speaker": "A", "text": "line"} for _ in range(3)]
+    desc, ref, gender = V._llm_persona(_Handle(), llm, "sys", "user {speaker}", "A", script,
+                                       ([0], [1], [2]))
+    # The explicit gender key beats the description's own words (here on purpose).
+    assert (desc, ref, gender) == ("青年男性，音色清亮。", "你好，我是A。", "female")
+
+
+def test_llm_persona_gender_from_description(clone_ws, monkeypatch):
+    # Prompts without the gender key still state it in the description ("少女女声").
+    reply = json.dumps({"description": "少女女声，音色软糯。", "ref_text": "你好，我是B。"},
+                       ensure_ascii=False)
+    _stub_persona_llm(monkeypatch, reply)
+    llm = SimpleNamespace(model_name="m", base_url="b", api_key="k")
+    script = [{"speaker": "B", "text": "line"} for _ in range(3)]
+    _desc, _ref, gender = V._llm_persona(_Handle(), llm, "sys", "user {speaker}", "B", script,
+                                         ([0], [1], [2]))
+    assert gender == "female"
+
+
+def test_llm_persona_gender_unknown(clone_ws, monkeypatch):
+    reply = json.dumps({"description": "A mature, clear voice.", "ref_text": "Hello."},
+                       ensure_ascii=False)
+    _stub_persona_llm(monkeypatch, reply)
+    llm = SimpleNamespace(model_name="m", base_url="b", api_key="k")
+    script = [{"speaker": "C", "text": "line"} for _ in range(3)]
+    _desc, _ref, gender = V._llm_persona(_Handle(), llm, "sys", "user {speaker}", "C", script,
+                                         ([0], [1], [2]))
+    assert gender == ""
+
+
+def test_prepare_foundations_gender_prefill_respects_existing(clone_ws):
+    # A's stored pick (badge) survives a foundation (re)generation even when the new
+    # description says the opposite; B (no gender yet) gets the description-derived pre-fill.
+    _seed_script(clone_ws, {"A": 3, "B": 3})
+    _seed_foundations(clone_ws, ["A", "B"], extra={"A": {"gender": "female"}})
+    h = _Handle()
+    V.prepare_foundations(h, overrides={
+        "A": "青年男性，音色清亮，语速偏快。",
+        "B": "少女女声，音色软糯，语速偏慢。",
+    })
+    vc = _load_vc(clone_ws)
+    assert vc["A"]["gender"] == "female"  # never clobbered
+    assert vc["B"]["gender"] == "female"  # pre-filled from the description text
 
 
 # --------------------------------------------------------------------------- #

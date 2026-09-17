@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { controlTask, listTasks, streamTask } from '@/api/tasks'
+import { controlTask, listTasks, streamAllTasks } from '@/api/tasks'
 import type { TaskControl, TaskSnapshot, TaskStatus } from '@/types'
 
 const ACTIVE: TaskStatus[] = ['pending', 'running', 'paused']
@@ -14,11 +14,28 @@ export const useTaskStore = defineStore('task', () => {
   const tasks = ref<TaskSnapshot[]>([])
   const loading = ref(false)
 
-  // One live SSE stream per in-flight task; keyed by task id.
-  const streams = new Map<string, () => void>()
+  // ONE multiplexed SSE stream for the whole app (every event carries `task_id`).
+  // Browsers cap simultaneous HTTP/1.1 connections per host at ~6 and this console
+  // is routinely open in several windows/tabs, so the app must hold exactly one
+  // long-lived connection per tab — the old one-EventSource-per-task design was
+  // exhausted by a few parallel parses and every window beyond the cap showed no
+  // logs at all (the backend ran fine). The stream is held only while at least one
+  // task is non-terminal (closed on the last task's terminal event so idle tabs
+  // release their connection) and is (re)opened by refresh() / control() / init
+  // whenever work starts.
+  let allStream: (() => void) | null = null
 
   function isActive(s: TaskStatus) {
     return ACTIVE.includes(s)
+  }
+
+  function hasActive() {
+    return tasks.value.some((t) => isActive(t.status))
+  }
+
+  /** 非终态任务（可选按 module 过滤）——供各页在页面刷新后重新挂接在途任务。 */
+  function activeTasks(module?: string): TaskSnapshot[] {
+    return tasks.value.filter((t) => isActive(t.status) && (!module || t.module === module))
   }
 
   function upsert(t: TaskSnapshot) {
@@ -28,10 +45,17 @@ export const useTaskStore = defineStore('task', () => {
   }
 
   function applyEvent(id: string, e: { type: string; [k: string]: any }) {
+    if (e.type === 'snapshot_all') {
+      // Connect / reconnect replay: the authoritative full task list — replace
+      // wholesale so live events that follow apply to the fresh objects.
+      tasks.value = Array.isArray(e.tasks) ? e.tasks : []
+      return
+    }
     const t = tasks.value.find((x) => x.id === id)
     if (!t) {
       // A late snapshot/final carries the full task — add it if unknown.
       if ((e.type === 'snapshot' || e.type === 'final') && e.task) upsert(e.task)
+      if (allStream && !hasActive()) closeStream()
       return
     }
     switch (e.type) {
@@ -68,7 +92,7 @@ export const useTaskStore = defineStore('task', () => {
         // Cumulative original-text chars (处理速度 numerator) + cumulative processing
         // seconds up to this chunk's completion (denominator). Both step together per
         // chunk, so the gauge updates per segment and stays stable in between (the time
-        // base is frozen at each chunk's end, not a live clock).
+        // base is frozen at this chunk's completion, reported by the backend).
         t.llm_chars = typeof e.chars === 'number' ? e.chars : 0
         t.llm_secs = typeof e.secs === 'number' ? e.secs : 0
         break
@@ -82,29 +106,39 @@ export const useTaskStore = defineStore('task', () => {
         if (e.task) tasks.value[tasks.value.indexOf(t)] = e.task
         break
     }
+    // The stream is only worth holding while some task is live: the last task's
+    // terminal event releases the tab's connection (idle tabs shouldn't occupy
+    // one of the browser's ~6 per-host slots); refresh() / control() reopen it
+    // when work starts.
+    if (allStream && !hasActive()) closeStream()
   }
 
-  function startStream(id: string) {
-    if (streams.has(id)) return
-    const stop = streamTask(
-      id,
-      (e) => applyEvent(id, e),
+  function ensureStream() {
+    if (allStream) return
+    allStream = streamAllTasks(
+      (e) => applyEvent(String(e.task_id ?? ''), e),
       () => {
-        streams.delete(id)
+        // The connection ended (server closed / abort): resync the list and, if
+        // work is still in flight, reopen the stream.
+        allStream = null
         refresh()
       },
     )
-    streams.set(id, stop)
+  }
+
+  function closeStream() {
+    if (allStream) {
+      allStream()
+      allStream = null
+    }
   }
 
   async function refresh() {
     loading.value = true
     try {
       tasks.value = await listTasks()
-      // Keep a live stream on every task that hasn't reached a terminal state.
-      tasks.value.forEach((t) => {
-        if (isActive(t.status)) startStream(t.id)
-      })
+      // Keep the (single, multiplexed) live stream up while any task is in flight.
+      if (hasActive()) ensureStream()
     } finally {
       loading.value = false
     }
@@ -113,15 +147,21 @@ export const useTaskStore = defineStore('task', () => {
   /** Issue a control; the SSE stream confirms the resulting state. */
   async function control(id: string, action: TaskControl): Promise<void> {
     await controlTask(id, action)
-    if (action === 'retry') startStream(id)
+    // A retry flips the task back to running — make sure the live stream is up.
+    ensureStream()
   }
 
   function stopAll() {
-    streams.forEach((s) => s())
-    streams.clear()
+    closeStream()
+  }
+
+  // Legacy alias (the per-task stream design): the multiplexed stream already
+  // covers every task, so opening "a stream for id" just ensures the app stream.
+  function startStream(_id: string) {
+    ensureStream()
   }
 
   refresh()
 
-  return { tasks, loading, refresh, startStream, control, stopAll }
+  return { tasks, loading, refresh, startStream, control, stopAll, activeTasks }
 })
