@@ -55,7 +55,7 @@ from ..core.config import get_config
 from ..core.paths import ALL_PARSED_JSON, get_layout, resolve_parsed_json, resolve_parsed_json_all
 from .persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT
 from .tts import WorkerWatchdogTimeout, resolve_engine, run_worker
-from .tts_batch import _parse_watchdog_indices, clamp_concurrency
+from .tts_batch import _parse_watchdog_indices, clamp_concurrency, disabled_planner_checks
 
 IMPLEMENTED = True
 
@@ -1018,6 +1018,9 @@ def make_clones(handle, speakers=None, new_only=False, concurrency=None, script_
             cmd += ["--design-model", t.design_model]
         if cfg.ffmpeg.ffmpeg_path:
             cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
+        disabled_checks = disabled_planner_checks(t)
+        if disabled_checks:
+            cmd += ["--disabled-checks", disabled_checks]
 
         in_flight.clear()  # a fresh child starts with an empty in-flight set
         try:

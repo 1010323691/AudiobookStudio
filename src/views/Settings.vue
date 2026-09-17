@@ -33,6 +33,7 @@ import {
   Server,
   SlidersHorizontal,
   MessageSquareText,
+  AudioWaveform,
   AudioLines,
 } from 'lucide-vue-next'
 
@@ -301,6 +302,51 @@ async function save() {
           <div class="space-y-1.5">
             <Label>User Prompt（模板，含 <code class="text-xs">context</code> / <code class="text-xs">chunk</code> 占位符）</Label>
             <Textarea v-model="draft.prompts.user_prompt" rows="8" class="font-mono text-xs" />
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- TTS 子批规划 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><AudioWaveform class="h-5 w-5" />TTS 子批规划</CardTitle>
+          <CardDescription>音频合成与角色配音·克隆共用的张量批规划检查（默认全开 = 现有行为不变）。关闭某项 = 规划子批时跳过该约束，运行日志留一行「…已关闭（配置）」；实测显存的动态调节（VramGovernor）不受开关影响、始终生效。「批内行数」上限不在此列（合成页手动输入）。</CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">段长分档</Label>
+              <Switch v-model="draft.tts.planner_length_bands" />
+            </div>
+            <p class="text-xs text-muted-foreground">短段跑满上限、长段自动降档、&gt;2048 字单独成批（O(L²) 注意力峰值随批内最长行二次增长）。</p>
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">单批字符上限</Label>
+              <Switch v-model="draft.tts.planner_batch_chars" />
+            </div>
+            <p class="text-xs text-muted-foreground">一个子批的总字数 ≤ 上限（防超大 prefill / TDR 挂起）。</p>
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">超长行独批</Label>
+              <Switch v-model="draft.tts.planner_seq_chars" />
+            </div>
+            <p class="text-xs text-muted-foreground">&gt;2500 字的行不与短行混批（独批；独批大小仍受显存约束）。</p>
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">批内长度比</Label>
+              <Switch v-model="draft.tts.planner_length_ratio" />
+            </div>
+            <p class="text-xs text-muted-foreground">批内最长/最短 ≤3（防短行按混入长行的解码上限跑全程）。</p>
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">显存静态估算</Label>
+              <Switch v-model="draft.tts.planner_vram" />
+            </div>
+            <p class="text-xs text-muted-foreground">静态 L² 显存估算门（对短行偏保守）；关闭后实测显存的动态调节仍生效。</p>
           </div>
         </CardContent>
       </Card>

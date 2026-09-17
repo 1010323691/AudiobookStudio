@@ -1044,6 +1044,52 @@ def test_make_clones_batched_layout_shares_seed(clone_ws, monkeypatch):
     assert f1 != f2  # same seed, still distinct renders (per-row sampling)
 
 
+def test_make_clones_disabled_checks_in_cmd(clone_ws, monkeypatch):
+    # The design-batch cmd carries --disabled-checks only when a planner check is closed
+    # in the config; the value lists the closed check(s) in canonical order. run_worker is
+    # stubbed to record the cmd and fail every row, so the run still settles.
+    _seed_script(clone_ws, {"A": 3})
+    _seed_foundations(clone_ws, ["A"])
+    _stub_design_engine(monkeypatch, clone_ws)
+    cmds = []
+
+    def _record(cmd, handle, on_line, **_kw):
+        cmds.append(list(cmd))
+        rows = json.loads(Path(cmd[cmd.index("--segments-file") + 1]).read_text("utf-8"))
+        for i in range(len(rows)):
+            on_line(f"[design] {i} error 测试桩（未渲染）")
+
+    monkeypatch.setattr(V, "run_worker", _record)
+    h = _Handle()
+    res = V.make_clones(h, concurrency=1, candidate_count=2)
+    assert res["ok"] == 0 and res["failed"] == 1  # the stubbed run settles as failed
+    assert "--disabled-checks" not in cmds[0]  # all checks on (default) -> flag omitted
+
+    core_config.update_config({"tts": {"planner_vram": False}})
+    res = V.make_clones(h, concurrency=1, candidate_count=2)
+    assert res["ok"] == 0 and res["failed"] == 1
+    assert cmds[1][cmds[1].index("--disabled-checks") + 1] == "vram"
+
+
+def test_make_clones_disabled_checks_survive_fake_worker(clone_ws, monkeypatch):
+    # One check closed in the config: the REAL run_worker spawns the fake design worker
+    # with the paired --disabled-checks flag — the run settles fully ok, and the on-disk
+    # run log proves the flag reached the child's command line. (Worker cmds must stay
+    # strictly `--flag value` pairs: the fake worker's generic pair parser would swallow
+    # the next token if a flag ever arrived value-less.)
+    _seed_script(clone_ws, {"A": 3, "B": 2})
+    _seed_foundations(clone_ws, ["A", "B"])
+    core_config.update_config({"tts": {"planner_vram": False}})
+    _stub_design_engine(monkeypatch, clone_ws)
+    h = _Handle()
+    res = V.make_clones(h, concurrency=2, candidate_count=2)
+    assert res["ok"] == 2 and res["failed"] == 0
+    logs = sorted((clone_ws / "logs").glob("tts_clone_*.log"))
+    assert logs  # the run mirrored its transcript to disk
+    transcript = "\n".join(p.read_text("utf-8") for p in logs)
+    assert "--disabled-checks vram" in transcript
+
+
 # --------------------------------------------------------------------------- #
 # the select endpoint  (PUT /api/tts/voices/select, called in-process)
 # --------------------------------------------------------------------------- #

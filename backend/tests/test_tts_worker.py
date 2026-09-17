@@ -418,6 +418,141 @@ def test_lazy_rounds_shrink_and_replan_under_pressure():
     assert all(s == 1 for s in sizes[5:])
 
 
+# ---------------------------------------------------------------------------
+# --disabled-checks — the settings-page planner switches
+# ---------------------------------------------------------------------------
+
+def test_parse_disabled_checks_empty_and_valid():
+    tw = _load_worker()
+    assert tw.parse_disabled_checks("") == frozenset()
+    assert tw.parse_disabled_checks(None) == frozenset()
+    assert tw.parse_disabled_checks("vram") == frozenset({"vram"})
+    # whitespace-tolerant, order-insensitive, duplicates collapse
+    assert tw.parse_disabled_checks(" vram , length_bands ,vram") == \
+        frozenset({"vram", "length_bands"})
+    assert tw.parse_disabled_checks("length_bands,batch_chars,seq_chars,length_ratio,vram") \
+        == frozenset(tw.PLANNER_CHECK_NAMES)
+
+
+def test_parse_disabled_checks_unknown_name_raises():
+    tw = _load_worker()
+    with pytest.raises(ValueError) as exc:
+        tw.parse_disabled_checks("vram,bogus")
+    # the error names the offender AND the valid set (the caller surfaces it as
+    # TTS_WORKER_ERROR + exit 2 — a typo must never silently close a gate)
+    assert "bogus" in str(exc.value)
+    assert "length_bands" in str(exc.value)
+
+
+def test_plan_next_sub_batch_disabled_vram_user_scenario():
+    tw = _load_worker()
+    # The real 2026-09-17 stress case: 32 x 50-char rows, manual cap 32. The static
+    # VRAM estimate prices every row at the worst-case 2048-frame decode (per row =
+    # 8 heads x 2124^2 x 4 + 2124 x 1000 x 1.5 = 147,550,032 B), so a 400 MB budget
+    # fits exactly 2 rows; with the estimate closed the manual cap governs -> all 32
+    # in one batch. Bands (50 chars -> full cap), ratio (1:1) and char caps (1600 <=
+    # 12000) are non-binding in both arms, so the VRAM gate is the sole constraint.
+    rows = [_row(50) for _ in range(32)]
+    params = {"heads": 8, "kv_per_token": 1000}
+    budget = 400_000_000
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=params, budget=budget,
+        gov=tw.VramGovernor(32, device="cuda", total_vram=8 * GB),
+        max_batch=32, max_batch_chars=12000)
+    assert len(rows_b) == 2 and len(remaining) == 30
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=params, budget=budget,
+        gov=tw.VramGovernor(32, device="cuda", total_vram=8 * GB),
+        max_batch=32, max_batch_chars=12000, disabled=frozenset({"vram"}))
+    assert len(rows_b) == 32 and remaining == []
+
+
+def test_plan_next_sub_batch_disabled_bands():
+    tw = _load_worker()
+    # 300-char rows: the length band (8 of 16) binds while on; closed, the manual
+    # cap (16) governs — 16 x 300 = 4800 chars still fits the batch char cap.
+    rows = [_row(300) for _ in range(20)]
+    rows_b, _rem = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(16, device="cuda", total_vram=8 * GB),
+        max_batch=16, max_batch_chars=120000)
+    assert len(rows_b) == 8
+    rows_b, _rem = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(16, device="cuda", total_vram=8 * GB),
+        max_batch=16, max_batch_chars=120000, disabled=frozenset({"length_bands"}))
+    assert len(rows_b) == 16
+
+
+def test_plan_next_sub_batch_disabled_batch_chars():
+    tw = _load_worker()
+    rows = [_row(50) for _ in range(30)]
+    rows_b, _rem = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(32, device="cuda", total_vram=8 * GB),
+        max_batch=32, max_batch_chars=60)
+    assert len(rows_b) == 1  # 2 x 50 = 100 > 60 -> one row per batch
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(32, device="cuda", total_vram=8 * GB),
+        max_batch=32, max_batch_chars=60, disabled=frozenset({"batch_chars"}))
+    # 30 x 50 = 1500 chars; the bands are the full cap for 50-char rows, so the
+    # manual cap (32) admits every row in one batch
+    assert len(rows_b) == 30 and remaining == []
+
+
+def test_plan_next_sub_batch_disabled_seq_chars_interaction():
+    tw = _load_worker()
+    rows = [_row(30), _row(30), _row(3000)]
+    # Only seq_chars closed: the 3000-char row is STILL solo — the >2048 band forces
+    # size 1 and the 100x ratio splits it from its 30-char neighbours. The checks
+    # interact: closing one does not guarantee the expected merge while a neighbour
+    # still forces splits (pinned so this is never misread as a regression).
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(8, device="cuda", total_vram=8 * GB),
+        max_batch=8, max_batch_chars=120000, disabled=frozenset({"seq_chars"}))
+    assert len(rows_b) == 2 and len(remaining) == 1
+    # All three closed: nothing splits the rows -> one batch of 3.
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(8, device="cuda", total_vram=8 * GB),
+        max_batch=8, max_batch_chars=120000,
+        disabled=frozenset({"length_bands", "seq_chars", "length_ratio"}))
+    assert len(rows_b) == 3 and remaining == []
+
+
+def test_plan_next_sub_batch_disabled_ratio():
+    tw = _load_worker()
+    rows = [_row(10), _row(100)]
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(8, device="cuda", total_vram=8 * GB),
+        max_batch=8, max_batch_chars=120000)
+    assert len(rows_b) == 1 and len(remaining) == 1  # 10x spread > 3 -> split
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=tw.VramGovernor(8, device="cuda", total_vram=8 * GB),
+        max_batch=8, max_batch_chars=120000, disabled=frozenset({"length_ratio"}))
+    assert len(rows_b) == 2 and remaining == []
+
+
+def test_plan_next_sub_batch_disabled_all_governed_by_manual_cap():
+    tw = _load_worker()
+    rows = [_row(50) for _ in range(32)]
+    params = {"heads": 8, "kv_per_token": 1000}
+    budget = 400_000_000
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=params, budget=budget,
+        gov=tw.VramGovernor(32, device="cuda", total_vram=8 * GB),
+        max_batch=32, max_batch_chars=12000,
+        disabled=frozenset(tw.PLANNER_CHECK_NAMES))
+    # The VRAM estimate alone would cap this at 2 rows; every static check closed ->
+    # the manual cap (32) is the only constraint left (the VramGovernor's measured
+    # cap starts at the manual cap, so it agrees).
+    assert len(rows_b) == 32 and remaining == []
+
+
 # --------------------------------------------------------------------------- #
 # order_speaker_groups — per-character grouping, most lines first
 # --------------------------------------------------------------------------- #

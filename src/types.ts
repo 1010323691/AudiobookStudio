@@ -447,6 +447,17 @@ export interface AppConfig {
      *  垫成一个 GPU 张量批一次并行推理（1 = 逐行串行；范围 1..64）。实际每批条数按行长自动
      *  分档（短行跑满、长行自动降低、超长单独），并按实测显存余量实时升降。 */
     batch_concurrency: number
+    /** 子批规划检查开关（默认全开 = 行为不变；关闭 = 规划跳过该约束并留日志）。
+     *  段长分档：短段跑满上限、长段自动降档、>2048 字单独成批。 */
+    planner_length_bands: boolean
+    /** 单批字符上限：一个子批的总字数 ≤ 上限（防超大 prefill / TDR 挂起）。 */
+    planner_batch_chars: boolean
+    /** 超长行独批：>2500 字的行不与短行混批。 */
+    planner_seq_chars: boolean
+    /** 批内长度比：批内最长/最短 ≤3（防短行按混入长行的解码上限跑全程）。 */
+    planner_length_ratio: boolean
+    /** 显存静态估算门（对短行偏保守）；只关静态门——实测显存的动态调节恒生效。 */
+    planner_vram: boolean
   }
   llm: {
     base_url: string

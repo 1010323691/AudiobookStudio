@@ -1422,8 +1422,58 @@ def _synth_sub_batch(model, vtype, rows, *, args, clone_prompts, device, seed, s
     save_fn(rows, results, out_dir, width, report, batch_seed)
 
 
+PLANNER_CHECK_NAMES = ("length_bands", "batch_chars", "seq_chars",
+                       "length_ratio", "vram")
+
+
+def parse_disabled_checks(raw: str) -> frozenset:
+    """``--disabled-checks`` -> frozenset of canonical planner check names (pure).
+
+    Empty / omitted = every check on (the default). Whitespace-tolerant, order-insensitive,
+    duplicates collapse. An unknown name raises ``ValueError`` (the caller turns it into
+    ``TTS_WORKER_ERROR`` + exit 2) — a typo must never silently run a whole book with the
+    wrong gate closed.
+    """
+    names = {n.strip() for n in (raw or "").split(",") if n.strip()}
+    unknown = names - set(PLANNER_CHECK_NAMES)
+    if unknown:
+        raise ValueError(
+            f"unknown check(s) in --disabled-checks: {', '.join(sorted(unknown))}"
+            f" (valid: {', '.join(PLANNER_CHECK_NAMES)})")
+    return frozenset(names)
+
+
+def _plan_cap_terms(disabled, band_label):
+    """The still-active static caps for the '实际每批条数 = min(…)' log line: one term per
+    check that is on. 动态调节 (the measured VramGovernor cap) is never closable, so it is
+    always listed. A single remaining term should print bare (no ``min(…)`` wrapper)."""
+    terms = []
+    if "length_bands" not in disabled:
+        terms.append(band_label)  # 段长分档 (batch) / 行长按分档 (design-batch)
+    terms.append("动态调节")
+    if "vram" not in disabled:
+        terms.append("显存估算")
+    if "batch_chars" not in disabled or "seq_chars" not in disabled:
+        terms.append("字符上限")
+    return terms
+
+
+def _log_disabled_checks(disabled) -> None:
+    """One '…已关闭（配置）' line per closed check (the 解析内三阶段 logging convention) —
+    a silently skipped gate would be misread as a missing stage."""
+    for name, label in (("length_bands", "段长分档"),
+                        ("batch_chars", "单批字符上限"),
+                        ("seq_chars", "超长行独批"),
+                        ("length_ratio", "批内长度比限制")):
+        if name in disabled:
+            log(f"{label}已关闭（配置）")
+    if "vram" in disabled:
+        log("显存静态估算已关闭（配置）——实测显存的动态调节（VramGovernor）仍生效")
+
+
 def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
-                        max_batch, max_batch_chars, force_rows_cap=None):
+                        max_batch, max_batch_chars, force_rows_cap=None,
+                        disabled: frozenset = frozenset()):
     """One lazy planning round (pure): the next sub-batch + the rows left after it.
 
     The round's row cap is the governor's current adaptive cap (1 for design rows in batch
@@ -1431,14 +1481,16 @@ def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
     overrides it — the design-batch mode passes the governor's cap so its candidates (each
     with its own description) DO share a tensor sub-batch, which is the point of that mode.
     The length bands apply on top (a batch may never exceed the band of its longest row),
-    as do the char caps and the (trust-scaled) VRAM estimate. The planner's first batch is
+    as do the char caps and the (trust-scaled) VRAM estimate. A ``disabled`` check name
+    (see ``PLANNER_CHECK_NAMES``) drops its constraint out of the round; the measured
+    VramGovernor cap is never closable and always applies. The planner's first batch is
     always a prefix of the (ascending) rows, so the remainder is well defined. Returns
     ``(batch_rows, remaining_rows)``.
     """
     tokens = plan_row_tokens([r["text"] for r in remaining],
                              [_effective_instruct(r, vtype) for r in remaining], overhead)
     vram_ok = None
-    if params is not None and budget is not None:
+    if "vram" not in disabled and params is not None and budget is not None:
         heads, kvt = params["heads"], params["kv_per_token"]
 
         def vram_ok(toks, _h=heads, _k=kvt, _b=budget):
@@ -1450,8 +1502,11 @@ def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
     batches = plan_sub_batches(
         [r["chars"] for r in remaining],
         max_batch=rows_cap,
-        band_cap=lambda c: band_cap_for_chars(c, max_batch),
-        max_batch_chars=max_batch_chars, max_seq_chars=MAX_SEQ_CHARS,
+        band_cap=None if "length_bands" in disabled
+        else (lambda c: band_cap_for_chars(c, max_batch)),
+        max_batch_chars=10 ** 9 if "batch_chars" in disabled else max_batch_chars,
+        max_seq_chars=0 if "seq_chars" in disabled else MAX_SEQ_CHARS,
+        length_ratio=float("inf") if "length_ratio" in disabled else LENGTH_RATIO,
         vram_ok=vram_ok, tokens=tokens)
     pos = batches[0]  # always a prefix of the ascending rows
     pos_set = set(pos)
@@ -1527,22 +1582,38 @@ def _run_batch(args) -> int:
     # -- batch parameters ---------------------------------------------------------
     # ``--concurrency`` is only the MANUAL CEILING (the most rows that may EVER share one tensor
     # batch); the real per-batch size is set at runtime by min(length band, the measured
-    # VramGovernor cap, the VRAM estimate, the char caps). Clamped to [1, 64] (the backend
-    # already clamps; defence in depth).
+    # VramGovernor cap, the VRAM estimate, the char caps) — the five static checks are
+    # individually closable via ``--disabled-checks`` (the VramGovernor's measured cap is not).
+    # Clamped to [1, 64] (the backend already clamps; defence in depth).
     max_batch = max(1, min(64, int(args.concurrency)))
     seed = int(args.seed)
     max_batch_chars = max(1000, int(args.max_batch_chars))
-    log(f"批内段数上限 {max_batch}（仅上限；实际每批条数 = min(段长分档, 动态调节, 显存估算, 字符上限)）· "
-        f"单批 ≤{max_batch_chars} 字 · 单行 ≤{MAX_SEQ_CHARS} 字")
-    log("段长分档：" + " · ".join(
-        f"≤{limit}字→{band_cap_for_chars(limit, max_batch)}段" for limit, _f in LENGTH_BANDS)
-        + f" · >{LENGTH_BANDS[-1][0]}字→单独")
+    disabled = args.disabled
+    terms = _plan_cap_terms(disabled, "段长分档")
+    line = (f"批内段数上限 {max_batch}（仅上限；实际每批条数 = "
+            f"{terms[0] if len(terms) == 1 else 'min(' + ', '.join(terms) + ')'}）")
+    tails = []
+    if "batch_chars" not in disabled:
+        tails.append(f"单批 ≤{max_batch_chars} 字")
+    if "seq_chars" not in disabled:
+        tails.append(f"单行 ≤{MAX_SEQ_CHARS} 字")
+    if tails:
+        line += " · " + " · ".join(tails)
+    log(line)
+    _log_disabled_checks(disabled)
+    if "length_bands" not in disabled:
+        log("段长分档：" + " · ".join(
+            f"≤{limit}字→{band_cap_for_chars(limit, max_batch)}段" for limit, _f in LENGTH_BANDS)
+            + f" · >{LENGTH_BANDS[-1][0]}字→单独")
     # An honest note about the attention backend (no flash-attn / SDPA path in this qwen_tts).
     log("注意力：手写 O(L²)（本环境无 flash-attn / SDPA；峰值已计入显存预算与字符上限）")
     log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
         f"顶格 {MAX_NEW_TOKENS} 帧）——批量模式模型不按行提前停，短行批不再跑满全程")
-    log(f"分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序，"
-        f"批内长度比 ≤{LENGTH_RATIO} —— 同批字数接近，解码上限不再被混入的长行抬高")
+    if "length_ratio" not in disabled:
+        log(f"分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序，"
+            f"批内长度比 ≤{LENGTH_RATIO} —— 同批字数接近，解码上限不再被混入的长行抬高")
+    else:
+        log("分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序")
     if seed >= 0:
         log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
 
@@ -1664,7 +1735,8 @@ def _run_batch(args) -> int:
             budget = _free_vram_budget(device) if params is not None else None  # fresh per round
             rows_b, remaining = plan_next_sub_batch(
                 remaining, vtype=vtype, overhead=g["overhead"], params=params, budget=budget,
-                gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars)
+                gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
+                disabled=disabled)
 
             rows_cap = 1 if vtype == "design" else gov.cap
             log(f"子批（{vtype}）：{len(rows_b)} 段（批内上限 {rows_cap}）")
@@ -1800,7 +1872,11 @@ def _run_design_batch(args) -> int:
     max_batch = max(1, min(64, int(args.concurrency)))
     seed = int(args.seed)
     max_batch_chars = max(1000, int(args.max_batch_chars))
-    log(f"批内行数上限 {max_batch}（仅上限；实际每批行数 = min(行长按分档, 动态调节, 显存估算, 字符上限)）")
+    disabled = args.disabled
+    terms = _plan_cap_terms(disabled, "行长按分档")
+    log(f"批内行数上限 {max_batch}（仅上限；实际每批行数 = "
+        f"{terms[0] if len(terms) == 1 else 'min(' + ', '.join(terms) + ')'}）")
+    _log_disabled_checks(disabled)
     log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
         f"顶格 {MAX_NEW_TOKENS} 帧）")
     log("分组：按角色分组、候选数降序处理（候选最多的角色先跑）；角色内按长度升序 —— "
@@ -1834,7 +1910,7 @@ def _run_design_batch(args) -> int:
             rows_b, remaining = plan_next_sub_batch(
                 remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
                 budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
-                force_rows_cap=gov.cap)
+                force_rows_cap=gov.cap, disabled=disabled)
             log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
             free_before = _free_vram(device)
             t0 = time.monotonic()
@@ -2268,6 +2344,10 @@ def main() -> int:
                          "the length bands + measured VRAM governor set the actual size (1 = sequential)")
     ap.add_argument("--max-batch-chars", type=int, default=12000,
                     help="max total chars in one sub-batch (batch / design-batch; guards an oversized prefill)")
+    ap.add_argument("--disabled-checks", default="",
+                    help="comma list of sub-batch planning checks to disable (batch / design-batch): "
+                         "length_bands, batch_chars, seq_chars, length_ratio, vram "
+                         "(empty = all on; an unknown name is a setup error)")
     ap.add_argument("--seed", type=int, default=-1,
                     help="reproducible seed offset per sub-batch (batch / design / design-batch; -1 = random)")
     ap.add_argument("--done-offset", type=int, default=0,
@@ -2284,6 +2364,17 @@ def main() -> int:
     ap.add_argument("--merge-batch-size", type=int, default=100,
                     help="segments per part WAV in the two-stage merge (merge)")
     args = ap.parse_args()
+
+    # The planner-check switches are only meaningful to the two tensor-batch modes; the other
+    # modes synthesize per segment and never plan sub-batches, so the flag is ignored there
+    # (same convention as the other mode-specific flags).
+    args.disabled = frozenset()
+    if args.mode in ("batch", "design-batch"):
+        try:
+            args.disabled = parse_disabled_checks(args.disabled_checks)
+        except ValueError as e:
+            print(f"TTS_WORKER_ERROR: {e}", file=sys.stderr, flush=True)
+            return 2
 
     if args.mode == "custom":
         return _run_custom(args)

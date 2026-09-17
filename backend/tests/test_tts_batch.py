@@ -226,6 +226,36 @@ def test_synthesize_reports_effective_concurrency_in_log(workspace, monkeypatch)
     assert any("批内上限 3 段" in msg for _lvl, msg in h.logs)
 
 
+def test_synthesize_omits_disabled_checks_flag_by_default(workspace, monkeypatch):
+    # All planner checks on (the default) -> the flag is absent, byte-identical cmd.
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    tts_batch.synthesize(_Handle(), None, "s.json", 4)
+    assert "--disabled-checks" not in captured["cmd"]
+
+
+def test_synthesize_disabled_checks_in_cmd(workspace, monkeypatch):
+    # Two checks closed in the config -> the flag carries them in CANONICAL
+    # PLANNER_CHECKS order, independent of the order they were closed in.
+    core_config.update_config({"tts": {"planner_vram": False, "planner_length_ratio": False}})
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    tts_batch.synthesize(_Handle(), None, "s.json", 4)
+    assert _cmd_flag(captured["cmd"], "--disabled-checks") == "length_ratio,vram"
+
+
+def test_disabled_planner_checks_mapping():
+    # all on -> "" (flag omitted); one off -> that name; all off -> canonical five
+    t = core_config.TTSConfig()
+    assert tts_batch.disabled_planner_checks(t) == ""
+    t.planner_vram = False
+    assert tts_batch.disabled_planner_checks(t) == "vram"
+    for _name, field in tts_batch.PLANNER_CHECKS:
+        setattr(t, field, False)
+    assert tts_batch.disabled_planner_checks(t) == \
+        "length_bands,batch_chars,seq_chars,length_ratio,vram"
+
+
 # --------------------------------------------------------------------------- #
 # the watchdog / restart loop — shrink, isolate, and the attempt cap
 # --------------------------------------------------------------------------- #

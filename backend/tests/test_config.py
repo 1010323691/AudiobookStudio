@@ -53,6 +53,17 @@ def test_tts_config_keeps_legacy_fields():
     assert t.concurrency == 1
 
 
+def test_tts_config_planner_check_defaults():
+    # The five sub-batch planner checks default ON (settings-page switches; all-on =
+    # existing behaviour, byte-identical worker command).
+    t = TTSConfig()
+    assert t.planner_length_bands is True
+    assert t.planner_batch_chars is True
+    assert t.planner_seq_chars is True
+    assert t.planner_length_ratio is True
+    assert t.planner_vram is True
+
+
 # --------------------------------------------------------------------------- #
 # GenerationConfig: in-parse check toggles (migrated off the retired check sections)
 # --------------------------------------------------------------------------- #

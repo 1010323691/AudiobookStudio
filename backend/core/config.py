@@ -86,6 +86,18 @@ class TTSConfig(BaseModel):
     # 音频合成 batch 的可复现 seed：>=0 时每子批用 ``seed + 子批序号`` 播种（同输入 + 同 seed +
     # 同批布局 → 可复现，便于定位某段特定输入导致的异常）；-1 = 随机（默认）。
     batch_seed: int = -1
+    # 子批规划的 5 道静态检查开关（设置页可切换，默认全开 = 现有行为不变）：音频合成（含压测）
+    # 与角色配音·克隆共用的惰性子批规划（worker ``plan_sub_batches``）除「批内行数」上限（合成页
+    # 手动）外还强制这些检查；关闭某项 = 规划时跳过该约束，worker 运行日志各留一行「…已关闭（配置）」，
+    # 后端据此拼 ``--disabled-checks``（全开时整体省略）。字段名 = ``planner_`` + worker 检查名
+    # （见 ``tts_batch.PLANNER_CHECKS`` 映射表）。
+    planner_length_bands: bool = True  # 段长分档：短段跑满上限、长段降档、>2048 字单独成批
+    planner_batch_chars: bool = True  # 单批字符上限（--max-batch-chars，防超大 prefill / TDR 挂起）
+    planner_seq_chars: bool = True  # 超长行独批：>2500 字的行不与短行混批
+    planner_length_ratio: bool = True  # 批内长度比：批内最长/最短 ≤3（防短行按长行解码上限跑全程）
+    # 显存静态估算门（O(L²) 峰值 + KV 缓存的静态估算，对短行系统性偏保守）；只关这一道门——
+    # 实测显存的动态调节（VramGovernor 缩批/隔离）恒生效、不可关。
+    planner_vram: bool = True
     # Legacy API-provider fields, unused by the local engine, kept so an existing
     # config/app.json still loads (and round-trips) cleanly.
     api_base: str = ""

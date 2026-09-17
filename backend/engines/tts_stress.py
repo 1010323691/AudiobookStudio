@@ -26,7 +26,7 @@ from ..core import pathio
 from ..core.config import get_config
 from ..core.paths import get_layout
 from ..engines.tts import WorkerWatchdogTimeout, resolve_engine, run_worker
-from .tts_batch import _build_cmd, clamp_concurrency
+from .tts_batch import _build_cmd, clamp_concurrency, disabled_planner_checks
 
 # 吞吐标准：1 秒必须出 10 个字（每轮限时 = 总字数 / 10 秒）。
 MIN_THROUGHPUT_CHARS_PER_SEC = 10
@@ -275,7 +275,7 @@ def stress_test(handle, rows, start_chars, step_chars, max_rounds=None,
             language=t.language, device=t.device,
             model=t.model, base_model=t.base_model, design_model=t.design_model,
             ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=rows, seed=seed,
-            workspace=ws,
+            workspace=ws, disabled_checks=disabled_planner_checks(t),
         )
 
         synth_secs: float | None = None

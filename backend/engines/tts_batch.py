@@ -56,9 +56,34 @@ def clamp_concurrency(n) -> int:
     return max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, v))
 
 
+# 子批规划检查的规范映射表：(worker ``--disabled-checks`` 里的名字, config.tts 开关字段)。
+# 规范序固定 → 拼出的 flag 值确定（与用户开关顺序无关，测试据此钉死）。五个静态检查均可由
+# 设置页单独关闭（默认全开 = 现有行为不变）；「批内行数」上限不在其中（合成页手动，恒生效），
+# 实测显存的动态调节（VramGovernor）也不可关。
+PLANNER_CHECKS = (
+    ("length_bands", "planner_length_bands"),
+    ("batch_chars", "planner_batch_chars"),
+    ("seq_chars", "planner_seq_chars"),
+    ("length_ratio", "planner_length_ratio"),
+    ("vram", "planner_vram"),
+)
+
+
+def disabled_planner_checks(tts_cfg) -> str:
+    """The config-closed planner checks as the worker's ``--disabled-checks`` value (pure).
+
+    Comma list in canonical ``PLANNER_CHECKS`` order; ``""`` when every check is on (the
+    flag is then omitted from the command entirely — default behaviour, byte-identical cmd).
+    ``getattr(..., True)`` tolerates a partial config object missing the fields (they default
+    to on, exactly like a fresh ``TtsConfig``).
+    """
+    return ",".join(name for name, field in PLANNER_CHECKS
+                    if not getattr(tts_cfg, field, True))
+
+
 def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
                model, base_model, design_model, ffmpeg_path, concurrency, seed,
-               workspace=None) -> list:
+               workspace=None, disabled_checks: str = "") -> list:
     """The one-shot ``.venv-tts`` batch command (pure; factored out for testing).
 
     ``--concurrency`` is always present (a clamped int) — the worker's *per-batch ceiling*
@@ -66,7 +91,9 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
     makes a run reproducible. Empty model ids are omitted so the worker falls back to its own
     (identical) defaults. ``--workspace`` hands the worker the workspace root so the
     workspace-relative ``ref_audio`` values in ``voice_config.json`` resolve correctly there
-    (the worker's own cwd is the project root, not the workspace).
+    (the worker's own cwd is the project root, not the workspace). ``disabled_checks``
+    (``""`` = all checks on) becomes ``--disabled-checks`` only when non-empty, so a default
+    config produces the exact command the worker used to receive.
     """
     cmd = [
         str(python), str(worker),
@@ -89,6 +116,8 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
         cmd += ["--design-model", design_model]
     if ffmpeg_path:
         cmd += ["--ffmpeg", ffmpeg_path]
+    if disabled_checks:
+        cmd += ["--disabled-checks", disabled_checks]
     return cmd
 
 
@@ -502,7 +531,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
                 language=t.language, device=t.device,
                 model=t.model, base_model=t.base_model, design_model=t.design_model,
                 ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
-                workspace=ws,
+                workspace=ws, disabled_checks=disabled_planner_checks(t),
             )
             in_flight.clear()  # a fresh child starts with an empty in-flight set
             try:
