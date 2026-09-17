@@ -308,3 +308,413 @@ def test_build_zip_roundtrip(tmp_path):
         assert zf.read("分册01.txt") == "第一章内容".encode("utf-8")
         # STORED (no compression) -> compress_type is ZIP_STORED
         assert zf.infolist()[0].compress_type == zipfile.ZIP_STORED
+
+
+# --------------------------------------------------------------------------- #
+# Smart recognition (smart_repair — mechanical chapter-structure repair)
+# --------------------------------------------------------------------------- #
+
+def smart_body(n, seed):
+    return [f"这是{seed}的第{j}段正文内容，字数足够长一些。" for j in range(n)]
+
+
+def smart_novel(blocks):
+    """blocks: (num, title, body_lines). Paragraphs joined by \\n\\n, mimicking
+    formatted (排版) output."""
+    paras = ["这是一部用于测试的智能识别小说。", "前言内容，若干行。"]
+    for num, title, bl in blocks:
+        paras.append(f"第{num}章 {title}")
+        paras.extend(bl)
+    return "\n\n".join(paras)
+
+
+def smart_run(text, chapters=None):
+    if chapters is None:
+        chapters = B.analyze_text(text)["chapters"]
+    return B.smart_repair(text, chapters)
+
+
+def test_smart_clean_novel():
+    text = smart_novel([(i, f"标题{i}", smart_body(30, i)) for i in range(1, 11)])
+    res = smart_run(text)
+    assert res["status"] == "clean"
+    assert res["report"]["warnings"] == []
+    assert res["report"]["removed"] == []
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 11))
+    assert all(c["repair"]["actions"] == ["kept"] for c in res["chapters"])
+    # lossless round-trip
+    assert "".join(B.chapter_content({"text": text}, c) for c in res["chapters"]) == text
+    # inputs are not mutated
+    again = B.analyze_text(text)["chapters"]
+    assert res["original_count"] == len(again)
+
+
+def test_smart_gap_renumbers_without_splitting():
+    text = smart_novel(
+        [(1, "标题一", smart_body(30, 1)), (2, "标题二", smart_body(30, 2))]
+        + [(i, f"标题{i}", smart_body(30, i)) for i in range(4, 11)]
+    )
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 9  # no splitting
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 10))
+    acts = {c["final_num"]: c["repair"]["actions"] for c in res["chapters"]}
+    assert "gap_absorbed" in acts[3] and "renumbered" in acts[3]
+    assert not any("inferred_split" in a for a in acts.values())
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+
+
+def test_smart_absorbed_duplicate_same_content_truncated():
+    # 1..10 with ch5 = header+body twice (the second 第5章 line is dropped by
+    # the spurious filter, so the copy is absorbed inside top-level ch5).
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 5)]
+        + [("5", "标题5", smart_body(30, 5)), ("5", "标题5", smart_body(30, 5))]
+        + [(i, f"标题{i}", smart_body(30, i)) for i in range(6, 11)]
+    )
+    orig = B.analyze_text(text)["chapters"]
+    assert len(orig) == 10  # one 第5章 dropped by the filter -> absorbed
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 10
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 11))
+    # the duplicate copy is removed (truncated), reported with kind=truncated
+    assert len(res["report"]["removed"]) == 1
+    rm = res["report"]["removed"][0]
+    assert rm["kind"] == "truncated" and rm["num"] == 5
+    assert any(w["type"] == "duplicate_truncated" for w in res["report"]["warnings"])
+    truncated = [c for c in res["chapters"] if "duplicate_truncated" in c["repair"]["actions"]]
+    assert len(truncated) == 1 and truncated[0]["final_num"] == 5
+    # round-trip over the KEPT chapters: original minus the dropped tail
+    ch6_start = orig[5]["start"]
+    kept = "".join(text[c["start"]: c["end"]] for c in res["chapters"])
+    assert kept == text[: res["chapters"][4]["end"]] + text[ch6_start:]
+
+
+def test_smart_absorbed_duplicate_diff_content_kept():
+    # Same shape, but the absorbed copy has different content -> both kept,
+    # split at the duplicated line, renumbered.
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 5)]
+        + [("5", "标题5", smart_body(30, 5)), ("5", "标题五乙", smart_body(30, "5b"))]
+        + [(i, f"标题{i}", smart_body(30, i)) for i in range(6, 11)]
+    )
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 11
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 12))
+    fives = [c for c in res["chapters"] if c["repair"]["orig_num"] == 5]
+    assert len(fives) == 2
+    assert all("duplicate_kept" in c["repair"]["actions"] for c in fives)
+    assert fives[0]["final_num"] == 5 and fives[1]["final_num"] == 6
+    assert fives[1]["title"] == "标题五乙"
+    assert all(c["repair"]["confidence"] == "medium" for c in fives)
+    assert any(w["type"] == "duplicate_split_kept" for w in res["report"]["warnings"])
+    # nothing dropped -> full round-trip
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+
+
+def test_smart_gap_after_duplicate_only_when_real_gap():
+    # [1..4, 5, 5, 6..10]: the absorbed duplicate is followed by the
+    # CONSECUTIVE 6 -> no gap -> no gap_after_duplicate warning.
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 5)]
+        + [("5", "标题5", smart_body(30, 5)), ("5", "标题5", smart_body(30, 5))]
+        + [(i, f"标题{i}", smart_body(30, i)) for i in range(6, 11)]
+    )
+    res = smart_run(text)
+    assert not any(
+        w["type"] == "gap_after_duplicate" for w in res["report"]["warnings"]
+    )
+    # [1..4, 5, 5, 7..10]: a real gap after the duplicate -> warning.
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 5)]
+        + [("5", "标题5", smart_body(30, 5)), ("5", "标题5", smart_body(30, 5))]
+        + [(i, f"标题{i}", smart_body(30, i)) for i in range(7, 11)]
+    )
+    res = smart_run(text)
+    assert any(w["type"] == "gap_after_duplicate" for w in res["report"]["warnings"])
+
+
+def test_smart_toplevel_duplicate_dropped():
+    # A duplicate at the very end survives the spurious filter (the last
+    # candidate is never dropped) -> handled by the top-level fingerprint
+    # groups and dropped.
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 4)] + [(3, "标题3", smart_body(30, 3))]
+    )
+    orig = B.analyze_text(text)["chapters"]
+    assert len(orig) == 4  # both 第3章 present at the top level
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 3
+    assert [c["final_num"] for c in res["chapters"]] == [1, 2, 3]
+    assert len(res["report"]["removed"]) == 1
+    rm = res["report"]["removed"][0]
+    assert rm["kind"] == "dropped" and rm["num"] == 3
+    kept = "".join(text[c["start"]: c["end"]] for c in res["chapters"])
+    assert kept == text[: orig[3]["start"]]  # dropped trailing chapter excised
+    assert "duplicate_kept" in res["chapters"][2]["repair"]["actions"]
+
+
+def test_smart_long_inferred_split():
+    # 1,2,4..10 with ch2 ~2.25x the others and no internal title lines:
+    # inferred 1-cut split filling the missing 第3章.
+    text = smart_novel(
+        [(1, "标题一", smart_body(20, 1)), (2, "标题二", smart_body(45, 2))]
+        + [(i, f"标题{i}", smart_body(20, i)) for i in range(4, 11)]
+    )
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 10
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 11))
+    segs = [c for c in res["chapters"] if "inferred_split" in c["repair"]["actions"]]
+    assert len(segs) == 2
+    assert segs[0]["repair"]["orig_num"] == 2 and segs[1]["repair"]["orig_num"] == 3
+    assert segs[1]["repair"]["orig_numStr"] == "3"  # inferred number, Arabic
+    assert all(s["repair"]["confidence"] == "low" for s in segs)
+    # the cut sits on a paragraph boundary
+    assert text[segs[1]["start"]: segs[1]["start"] + 2] == "\n\n"
+    # full round-trip (nothing dropped)
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+    # the next chapter absorbs the gap in the report
+    assert "gap_absorbed" in res["chapters"][3]["repair"]["actions"]
+
+
+def test_smart_idempotent_on_repaired_structure():
+    text = smart_novel(
+        [(1, "标题一", smart_body(20, 1)), (2, "标题二", smart_body(45, 2))]
+        + [(i, f"标题{i}", smart_body(20, i)) for i in range(4, 11)]
+    )
+    first = smart_run(text)
+    # Re-running on the repaired structure (same text, repaired chapters)
+    # must find nothing to do: all kept, no warnings.
+    second = B.smart_repair(text, first["chapters"])
+    assert second["status"] == "clean"
+    assert second["report"]["warnings"] == []
+    assert all(c["repair"]["actions"] == ["kept"] for c in second["chapters"])
+    assert [c["final_num"] for c in second["chapters"]] == [c["final_num"] for c in first["chapters"]]
+
+
+def test_smart_long_no_blank_lines_exact_cut():
+    # A long chapter with no blank lines inside: the cut cannot snap to a
+    # paragraph boundary -> exact position + mid-paragraph warning.
+    paras = ["这是一部用于测试的智能识别小说。", "前言内容，若干行。", "第1章 标题1"]
+    paras.extend(smart_body(20, 1))
+    paras.append("第2章 标题2\n" + "\n".join(smart_body(100, 2)))  # one line-separated block
+    for i in range(4, 11):
+        paras.append(f"第{i}章 标题{i}")
+        paras.extend(smart_body(20, i))
+    text = "\n\n".join(paras)
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert any(w["type"] == "inferred_split_mid_paragraph" for w in res["report"]["warnings"])
+    assert len(res["chapters"]) == 10
+    segs = [c for c in res["chapters"] if "inferred_split" in c["repair"]["actions"]]
+    assert len(segs) == 2
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+
+
+def test_smart_last_chapter_long_silent_kept():
+    # A long LAST chapter has no next number to compare: no missing number
+    # can be derived -> kept as-is WITHOUT any warning (a long final chapter
+    # is normal, e.g. older novels). Only a missing-number gap warrants
+    # split-and-report; an unparseable number warrants the long_kept note.
+    text = smart_novel(
+        [(i, f"标题{i}", smart_body(20, i)) for i in range(1, 10)]
+        + [(10, "标题10", smart_body(120, 10))]
+    )
+    res = smart_run(text)
+    assert res["status"] == "clean"
+    assert res["report"]["warnings"] == []
+    assert len(res["chapters"]) == 10  # not split
+    assert all(c["repair"]["actions"] == ["kept"] for c in res["chapters"])
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+
+
+def test_smart_long_consecutive_numbers_silent():
+    # Long chapter but the following number is consecutive (no missing
+    # number): older novels simply have long chapters -> kept as-is
+    # SILENTLY (no warning, status clean), never split. User refinement
+    # 2026-09: a length flag without a gap is not an anomaly worth alerting.
+    text = smart_novel(
+        [(1, "标题一", smart_body(20, 1)), (2, "标题二", smart_body(100, 2)),
+         (3, "标题三", smart_body(20, 3)), (4, "标题四", smart_body(20, 4)),
+         (5, "标题五", smart_body(20, 5)), (6, "标题六", smart_body(20, 6))]
+    )
+    res = smart_run(text)
+    assert res["status"] == "clean"
+    assert res["report"]["warnings"] == []
+    assert len(res["chapters"]) == 6
+    assert all(c["repair"]["actions"] == ["kept"] for c in res["chapters"])
+    assert "".join(text[c["start"]: c["end"]] for c in res["chapters"]) == text
+
+
+def test_smart_unparseable_number_long_kept():
+    # 第〇章 parses to no number: a long such chapter cannot be validated.
+    paras = ["前言内容。"]
+    paras.append("第1章 标题1")
+    paras.extend(smart_body(20, 1))
+    paras.append("第〇章 标题〇")
+    paras.extend(smart_body(120, "〇"))
+    for i in range(2, 11):
+        paras.append(f"第{i}章 标题{i}")
+        paras.extend(smart_body(20, i))
+    text = "\n\n".join(paras)
+    res = smart_run(text)
+    assert res["status"] in ("ok", "clean")
+    assert len(res["chapters"]) >= 10
+    unparseable = [c for c in res["chapters"] if c["repair"]["orig_num"] is None]
+    assert len(unparseable) == 1
+    # it still gets a position in the 1..N renumbering
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, len(res["chapters"]) + 1))
+
+
+def test_smart_small_book_disables_length():
+    text = smart_novel([(i, f"标题{i}", smart_body(500, i)) for i in range(1, 4)])
+    res = smart_run(text)
+    assert res["status"] == "ok"  # length_disabled warning -> not "clean"
+    assert res["baseline_chars"] is None
+    assert any(w["type"] == "length_disabled" for w in res["report"]["warnings"])
+    assert "章节数少于 5 章" in next(w["detail"] for w in res["report"]["warnings"] if w["type"] == "length_disabled")
+
+
+def test_smart_low_median_disables_length():
+    # >= 5 chapters but the median is below 200 chars -> length detection off.
+    text = smart_novel([(i, f"标题{i}", smart_body(5, i)) for i in range(1, 8)])
+    res = smart_run(text)
+    assert res["baseline_chars"] is None
+    assert any(w["type"] == "length_disabled" for w in res["report"]["warnings"])
+    assert "中位数过低" in next(w["detail"] for w in res["report"]["warnings"] if w["type"] == "length_disabled")
+
+
+def test_smart_chinese_numerals():
+    # 一,二,五,六..十 with 二 abnormally long -> inferred segments 3,4 fill the
+    # gap; Chinese numbers parse via parse_chapter_number.
+    paras = ["前言一。", "前言二。"]
+    paras.append("第一章 标题甲")
+    paras.extend(smart_body(20, "甲"))
+    paras.append("第二章 标题乙")
+    paras.extend(smart_body(45, "乙"))
+    for cn in ["五", "六", "七", "八", "九", "十"]:
+        paras.append(f"第{cn}章 标题{cn}")
+        paras.extend(smart_body(20, cn))
+    text = "\n\n".join(paras)
+    res = smart_run(text)
+    assert res["status"] == "ok"
+    assert len(res["chapters"]) == 10
+    assert [c["final_num"] for c in res["chapters"]] == list(range(1, 11))
+    segs = [c for c in res["chapters"] if "inferred_split" in c["repair"]["actions"]]
+    assert [s["repair"]["orig_num"] for s in segs] == [2, 3, 4]
+    assert [s["repair"]["orig_numStr"] for s in segs] == ["二", "3", "4"]
+
+
+def test_smart_filename_widths():
+    # N <= 1000 -> 3-digit width (001); N > 1000 -> 4-digit (0001).
+    names = B.make_smart_filenames([{"final_num": i, "title": f"标题{i}"} for i in range(1, 1001)])
+    assert names[0] == "第 001 章 标题1.txt"
+    assert names[-1] == "第 1000 章 标题1000.txt"
+    names = B.make_smart_filenames([{"final_num": i, "title": f"标题{i}"} for i in range(1, 1002)])
+    assert names[0] == "第 0001 章 标题1.txt"
+    assert names[-1] == "第 1001 章 标题1001.txt"
+    # empty title -> no title part
+    assert B.make_smart_filenames([{"final_num": 1, "title": ""}]) == ["第 001 章.txt"]
+    assert B.make_smart_filenames([{"final_num": 7, "title": "  " }]) == ["第 007 章.txt"]
+
+
+def test_smart_filenames_unique_and_sanitized():
+    # final_num is unique by construction, but the de-dup pass must keep the
+    # list unique even when sanitizing collapses names.
+    chs = [
+        {"final_num": 1, "title": "甲/b"},   # -> 甲_b
+        {"final_num": 2, "title": "甲_b"},   # sanitizes to the same title,
+        # but a different number prefix keeps the full names unique
+    ]
+    names = B.make_smart_filenames(chs)
+    assert names == ["第 001 章 甲_b.txt", "第 002 章 甲_b.txt"]
+    assert len(set(names)) == len(names)
+    # illegal characters are replaced
+    names = B.make_smart_filenames([{"final_num": 1, "title": 'a/b\\c:d*e'}])
+    assert all(ch not in names[0] for ch in '\\/:*?')
+    assert names[0].endswith(".txt")
+
+
+def test_smart_fingerprint_ignores_whitespace():
+    assert B._normalized_fingerprint("甲 乙\n丙") == B._normalized_fingerprint("甲乙　丙\r\n")
+    assert B._normalized_fingerprint("甲乙") != B._normalized_fingerprint("甲乙丙")
+
+
+def test_smart_cross_number_collision_warns_only():
+    # Two chapters with identical content but different numbers: the header
+    # embeds the number, so this is only reachable when a chapter's content
+    # matches another's exactly (constructed here via an explicit chapters
+    # list). Warn, never drop.
+    half = "段落内容甲。\n段落内容乙。\n" * 3
+    text = half + half
+    res = B.smart_repair(
+        text,
+        [
+            {"seq": 1, "start": 0, "end": len(half), "numStr": "1", "num": 1, "title": "一", "chars": 0},
+            {"seq": 2, "start": len(half), "end": len(text), "numStr": "2", "num": 2, "title": "二", "chars": 0},
+        ],
+    )
+    assert any(w["type"] == "content_collision" for w in res["report"]["warnings"])
+    assert len(res["chapters"]) == 2  # both kept
+    assert res["report"]["removed"] == []
+
+
+def test_smart_round_trip_and_tiling_invariants():
+    # Every non-error result must tile [0, len] with kept chapters + removed
+    # spans and renumber 1..N — checked across all the fixture shapes above.
+    cases = [
+        smart_novel([(i, f"标题{i}", smart_body(30, i)) for i in range(1, 11)]),
+        smart_novel(
+            [(1, "标题一", smart_body(30, 1)), (2, "标题二", smart_body(30, 2))]
+            + [(i, f"标题{i}", smart_body(30, i)) for i in range(4, 11)]
+        ),
+        smart_novel(
+            [(i, f"标题{i}", smart_body(30, i)) for i in range(1, 5)]
+            + [("5", "标题5", smart_body(30, 5)), ("5", "标题5", smart_body(30, 5))]
+            + [(i, f"标题{i}", smart_body(30, i)) for i in range(6, 11)]
+        ),
+        smart_novel(
+            [(1, "标题一", smart_body(20, 1)), (2, "标题二", smart_body(45, 2))]
+            + [(i, f"标题{i}", smart_body(20, i)) for i in range(4, 11)]
+        ),
+    ]
+    for text in cases:
+        orig = B.analyze_text(text)["chapters"]
+        res = smart_run(text, orig)
+        assert res["status"] in ("ok", "clean")
+        n = len(res["chapters"])
+        assert [c["final_num"] for c in res["chapters"]] == list(range(1, n + 1))
+        for c in res["chapters"]:
+            assert c["end"] > c["start"]
+        # kept chapters + removed spans must tile [0, len(text)] exactly.
+        # (Kept chapters alone are NOT contiguous after a truncation: the
+        # removed tail sits between the truncated chapter and the next one.)
+        # removed entries keep the ORIGINAL seq (recorded before step-5
+        # renumbers seq 1..N), so the original chapters list resolves spans.
+        orig_by_seq = {c["seq"]: c for c in orig}
+        spans = sorted((c["start"], c["end"]) for c in res["chapters"])
+        for r in res["report"]["removed"]:
+            oc = orig_by_seq[r["seq"]]
+            if r["kind"] == "dropped":
+                spans.append((oc["start"], oc["end"]))
+            else:  # truncated: removed span = kept chapter's excised tail
+                kept_end = next(
+                    c["end"] for c in res["chapters"]
+                    if "duplicate_truncated" in c["repair"]["actions"]
+                )
+                spans.append((kept_end, oc["end"]))
+        spans.sort()
+        assert spans[0][0] == 0
+        assert spans[-1][1] == len(text)
+        assert all(a[1] == b[0] for a, b in zip(spans, spans[1:]))
+        # excision round-trip: dropping the removed spans from the text must
+        # leave exactly the kept chapters, concatenated.
+        excised = text
+        for s, e in sorted(spans, reverse=True):
+            if not any((s, e) == (c["start"], c["end"]) for c in res["chapters"]):
+                excised = excised[:s] + excised[e:]
+        assert excised == "".join(text[c["start"]: c["end"]] for c in res["chapters"])

@@ -89,6 +89,57 @@ export interface BookSplitResult {
   zip_path?: string
 }
 
+// ------------------------------ book · smart split ------------------------------
+export type SmartConfidence = 'high' | 'medium' | 'low'
+/** One per final (kept) chapter: original number -> repaired number + actions. */
+export interface SmartRepairAction {
+  seq: number
+  orig_num: number | null
+  orig_numStr: string
+  orig_title: string
+  final_num: number
+  actions: string[]
+  confidence: SmartConfidence
+}
+/** A chapter deleted during repair: duplicate dropped or duplicate copy truncated. */
+export interface SmartRemoved {
+  seq: number
+  num: number
+  numStr: string
+  title: string
+  kind: 'dropped' | 'truncated'
+}
+export interface SmartWarning {
+  type: string
+  detail: string
+}
+export interface SmartSplitChapter {
+  seq: number
+  orig_num: number | null
+  orig_numStr: string
+  final_num: number
+  title: string
+  chars: number
+  actions: string[]
+  confidence: SmartConfidence
+}
+export interface BookSmartSplitResult {
+  status: 'ok' | 'clean'
+  output_dir: string
+  file_count: number
+  files: BookSplitFile[]
+  zip_path?: string
+  chapters: SmartSplitChapter[]
+  report: {
+    actions: SmartRepairAction[]
+    warnings: SmartWarning[]
+    removed: SmartRemoved[]
+  }
+  baseline_chars: number | null
+  original_count: number
+  expected_format: string
+}
+
 // ------------------------------ audio ------------------------------
 export interface AudioProbeResult {
   ok: boolean
