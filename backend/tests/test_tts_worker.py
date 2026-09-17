@@ -618,9 +618,9 @@ def test_order_speaker_groups_empty():
 
 def test_timeout_cuda_floor_cap_and_scaling():
     tw = _load_worker()
-    assert tw.sub_batch_timeout_seconds("cuda", 0) == 180           # floor
-    assert tw.sub_batch_timeout_seconds("cuda", 30000) == 1500      # cap
-    assert tw.sub_batch_timeout_seconds("cuda", 1000) == 60 + 0.4 * 1000  # scales with chars
+    assert tw.sub_batch_timeout_seconds("cuda", 0) == 30                 # floor
+    assert tw.sub_batch_timeout_seconds("cuda", 1000) == int(1000 / 15)  # scales: chars / 15
+    assert tw.sub_batch_timeout_seconds("cuda", 60000) == 3600           # cap
 
 
 def test_timeout_cpu_is_looser():
@@ -632,33 +632,33 @@ def test_timeout_cpu_is_looser():
 
 def test_timeout_gpu_formula_for_mps():
     tw = _load_worker()
-    assert tw.sub_batch_timeout_seconds("mps", 0) == 180  # any non-cpu device uses the GPU budget
+    assert tw.sub_batch_timeout_seconds("mps", 0) == 30  # any non-cpu device uses the GPU budget
 
 
 def test_timeout_clone_formula_floor_scale_cap():
     tw = _load_worker()
-    assert tw.sub_batch_timeout_seconds("cuda", 0, vtype="clone") == 300            # floor
-    assert tw.sub_batch_timeout_seconds("cuda", 30000, vtype="clone") == 3600        # cap
-    assert tw.sub_batch_timeout_seconds("cuda", 1000, vtype="clone") == 120 + 0.7 * 1000
+    assert tw.sub_batch_timeout_seconds("cuda", 0, vtype="clone") == 30                 # floor
+    assert tw.sub_batch_timeout_seconds("cuda", 1000, vtype="clone") == int(1000 / 15)  # chars / 15
+    assert tw.sub_batch_timeout_seconds("cuda", 60000, vtype="clone") == 3600           # cap
 
 
-def test_timeout_clone_is_roomier_than_custom():
+def test_timeout_gpu_budget_is_uniform_across_vtypes():
     tw = _load_worker()
-    # A batched clone decode is slower per char (its L^2 attention spans the reference frames
-    # too) and the GPU is time-sliced with other processes — so clone's budget is roomier,
-    # at every batch size, or a healthy-but-slow batch gets false-killed under contention.
-    for chars in (0, 100, 500, 2000, 10000):
-        assert tw.sub_batch_timeout_seconds("cuda", chars, vtype="clone") > \
-            tw.sub_batch_timeout_seconds("cuda", chars, vtype="design")
+    # The GPU budget no longer differentiates by voice type: the 15 chars/sec rate was measured
+    # on a clone batch, and short-row batches decode at ~the same per-char rate whichever type
+    # renders them — so clone / custom / design all share one budget (chars/15, floored & capped).
+    for chars in (0, 100, 500, 2000, 10000, 60000):
+        assert tw.sub_batch_timeout_seconds("cuda", chars, vtype="clone") == \
+            tw.sub_batch_timeout_seconds("cuda", chars, vtype="design") == \
+            tw.sub_batch_timeout_seconds("cuda", chars)  # default vtype="custom"
 
 
-def test_timeout_clone_covers_measured_batch_rate_under_contention():
+def test_timeout_budget_tracks_measured_decode_rate():
     tw = _load_worker()
-    # 16 long rows (2254 chars) measured 662s on an IDLE GPU (~0.29 s/char); the clone budget
-    # must survive ~2x GPU contention (WDDM time-slicing with browser/compositor) without
-    # killing a batch that is still generating.
-    budget = tw.sub_batch_timeout_seconds("cuda", 2254, vtype="clone")
-    assert budget >= 2 * 662
+    # The budget tracks the measured GPU decode rate (~15 chars/sec): a 2240-char batch (the
+    # shape of the 2026-09-17 run that showed an over-generous 1688s budget) now gets ~149s,
+    # so a hung batch is caught in minutes rather than ~half an hour.
+    assert tw.sub_batch_timeout_seconds("cuda", 2240, vtype="clone") == int(2240 / 15)
 
 
 # --------------------------------------------------------------------------- #

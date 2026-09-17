@@ -159,6 +159,13 @@ VRAM_SCALE_MIN, VRAM_SCALE_MAX = 0.5, 4.0  # trust range for the static L^2 esti
 HEARTBEAT_FIRST = 10.0     # seconds before the first heartbeat (shorter batches finish before it)
 HEARTBEAT_INTERVAL = 20.0  # seconds between subsequent heartbeats
 
+# Sub-batch watchdog budget (see sub_batch_timeout_seconds): GPU decode runs at a measured
+# ~15 chars/sec, so a batch's budget is its total text divided by that rate — a hung batch is
+# caught in minutes, not ~half an hour. The floor keeps a small/contended batch alive; the cap
+# bounds a pathological batch. (CPU keeps a looser, floor-dominated budget inside the function.)
+GPU_TIMEOUT_FLOOR_S = 30     # a small batch / contended startup still gets real decode time
+GPU_TIMEOUT_CAP_S = 3600     # a pathological batch can't push the wait past an hour
+
 # Two-stage merge (merge mode): per-batch part WAVs are staged first, then folded into
 # the whole book, so merging thousands of segments reports live progress throughout
 # instead of going silent. RE_FFMPEG_TIME is the port of backend/engines/audio.py's
@@ -472,24 +479,24 @@ def plan_sub_batches(char_lens, *, max_batch, max_batch_chars, max_seq_chars=0,
 
 
 def sub_batch_timeout_seconds(device, total_chars, vtype="custom"):
-    """A sub-batch's watchdog budget: a floor, scaled by the batch's text, then capped (pure).
+    """A sub-batch's watchdog budget: how long a hung batch may run before the worker
+    sacrifices the process (``os._exit(124)``) (pure).
 
-    GPU decode is fast, so a tight budget (a hung batch is caught in minutes); CPU decode is
-    far slower, so a much looser budget (a slow-but-healthy CPU batch must not be killed).
+    GPU (cuda/mps): the budget is the batch's total text at the measured decode rate of
+    ~15 chars/sec — ``total_chars / 15`` seconds — so a hung batch is caught in minutes, not
+    ~half an hour. It is floored (``GPU_TIMEOUT_FLOOR_S``) so a small or contended batch still
+    gets real time, and capped (``GPU_TIMEOUT_CAP_S``) so a pathological batch cannot wait
+    unboundedly. ``vtype`` no longer changes the GPU budget: the 15 chars/sec figure was
+    measured on a clone batch, and short-row batches (the common dialogue case) decode at
+    roughly the same per-char rate whichever voice type renders them.
 
-    Clone gets a roomier per-char rate than custom/design (measured on this machine: 16 long
-    clone rows = 0.29 s/char on an idle GPU vs ~0.2 for custom, and Windows WDDM time-slices the
-    GPU with every other process — browser, compositor — so a budget calibrated on an idle GPU
-    false-kills a healthy-but-slow batch under contention; each false kill loses the batch's
-    work and burns a restart attempt). A genuinely hung batch is still caught — it just takes
-    the (larger) budget to elapse before the process is sacrificed.
+    CPU decode is far slower than GPU, so it keeps a much looser, floor-dominated budget — a
+    slow-but-healthy CPU batch must not be killed.
     """
     total_chars = max(0, int(total_chars))
     if device == "cpu":
         return max(600, min(10800, int(600 + 4 * total_chars)))
-    if vtype == "clone":
-        return max(300, min(3600, int(120 + 0.7 * total_chars)))
-    return max(180, min(1500, int(60 + 0.4 * total_chars)))
+    return max(GPU_TIMEOUT_FLOOR_S, min(GPU_TIMEOUT_CAP_S, int(total_chars / 15)))
 
 
 def estimate_batch_vram(num_rows, heads, kv_per_token, seq_tokens, max_new):
