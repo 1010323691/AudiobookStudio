@@ -82,9 +82,21 @@ def disabled_planner_checks(tts_cfg) -> str:
                     if not getattr(tts_cfg, field, True))
 
 
+def encode_restore_stack(stack) -> str:
+    """The pending demotion records as the worker's ``--restore-stack`` value (pure).
+
+    ``stack`` is the LIFO list of ``(timeout_chars, cap)`` pairs, OLDEST first — each entry
+    is the total chars of the sub-batch that timed out and the per-batch cap in force just
+    before that demotion. The worker compares each planned sub-batch against the NEWEST
+    (last) record and restores that cap when the batch is smaller. ``""`` for an empty
+    stack (the flag is then omitted from the command entirely — the exact legacy command).
+    """
+    return ",".join(f"{chars}:{cap}" for chars, cap in stack)
+
+
 def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
                model, base_model, design_model, ffmpeg_path, concurrency, seed,
-               workspace=None, disabled_checks: str = "") -> list:
+               workspace=None, disabled_checks: str = "", restore_stack: str = "") -> list:
     """The one-shot ``.venv-tts`` batch command (pure; factored out for testing).
 
     ``--concurrency`` is always present (a clamped int) — the worker's *per-batch ceiling*
@@ -94,7 +106,9 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
     workspace-relative ``ref_audio`` values in ``voice_config.json`` resolve correctly there
     (the worker's own cwd is the project root, not the workspace). ``disabled_checks``
     (``""`` = all checks on) becomes ``--disabled-checks`` only when non-empty, so a default
-    config produces the exact command the worker used to receive.
+    config produces the exact command the worker used to receive. ``restore_stack``
+    (``""`` = no pending demotion records) becomes ``--restore-stack`` only when non-empty,
+    so a run without a watchdog demotion sends the exact legacy command.
     """
     cmd = [
         str(python), str(worker),
@@ -119,6 +133,8 @@ def _build_cmd(python, worker, seg_file, vc_path, out_dir, *, language, device,
         cmd += ["--ffmpeg", ffmpeg_path]
     if disabled_checks:
         cmd += ["--disabled-checks", disabled_checks]
+    if restore_stack:
+        cmd += ["--restore-stack", restore_stack]
     return cmd
 
 
@@ -174,6 +190,18 @@ def _parse_watchdog_indices(line: str):
         except ValueError:
             continue
     return out
+
+
+def _parse_restore_cap(line: str):
+    """The restored per-batch cap named in a ``[restore] cap=<N>`` line (``None`` if the
+    marker / value is absent or unparseable — the caller logs the raw line and carries on)."""
+    for tok in line.split():
+        if tok.startswith("cap="):
+            try:
+                return int(tok[len("cap="):])
+            except ValueError:
+                return None
+    return None
 
 
 def _build_segments(script, indices=None):
@@ -662,6 +690,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
         last_flush[0] = now
 
     def on_line(line: str) -> None:
+        nonlocal workers  # a confirmed restore re-syncs the per-batch cap
         if line.startswith("[segment]"):
             _handle_segment(line, by_index, run_total, seg_results, handle)
             _write_manifest()
@@ -670,6 +699,24 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
             # indices so a strike at workers==1 targets the right segment(s).
             in_flight.update(_parse_watchdog_indices(line))
             handle.log(line, "WARNING")
+        elif line.startswith("[restore]"):
+            # A planned sub-batch came in below the newest demotion record's threshold: the
+            # child restored the pre-demotion cap and popped that record from its mirror
+            # stack. This line is the only source of the workers bookkeeping after a
+            # restore, so re-sync from it; a desync (unparseable / no pending record) is a
+            # WARNING, not fatal — the worker's value still wins.
+            cap = _parse_restore_cap(line)
+            if cap is None:
+                handle.log(line, "WARNING")
+            else:
+                if restore_stack:
+                    _chars, expected = restore_stack.pop()
+                    if expected != cap:
+                        handle.log(f"[restore] 上报挡位 {cap} 与降档记录 {expected} 不一致——按 worker 上报同步", "WARNING")
+                else:
+                    handle.log("收到 [restore] 行但没有待恢复的降档记录——按 worker 上报同步", "WARNING")
+                workers = cap
+                handle.log(f"子批总字数低于降档阈值 → 批内上限恢复为 {workers} 段")
         else:
             handle.log(line)
 
@@ -680,6 +727,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
     MAX_ATTEMPTS = 8
     excluded: set = set()
     struck: dict = {}
+    restore_stack: list = []  # LIFO demotion records (oldest first), handed to every restart
     attempt = 0
     try:
         while True:
@@ -700,6 +748,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
                 model=t.model, base_model=t.base_model, design_model=t.design_model,
                 ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
                 workspace=ws, disabled_checks=disabled_planner_checks(t),
+                restore_stack=encode_restore_stack(restore_stack),
             )
             in_flight.clear()  # a fresh child starts with an empty in-flight set
             try:
@@ -709,8 +758,20 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
             except WorkerWatchdogTimeout:
                 attempt += 1
                 if workers > 1:
+                    # Record this demotion (the timed-out sub-batch's total chars + the cap
+                    # it ran at) BEFORE the halving: a later sub-batch smaller than it
+                    # restores the old gear (LIFO, one demotion per restore). An empty /
+                    # unparseable in-flight set records nothing — a zero-chars record would
+                    # be inert and would block the records behind it in the LIFO stack.
+                    # (chars = stripped code points — _build_segments already strips the
+                    # text, so this matches the worker's per-row chars exactly.)
+                    timeout_chars = sum(len(by_index[i]["text"]) for i in in_flight if i in by_index)
+                    if timeout_chars > 0:
+                        restore_stack.append((timeout_chars, workers))
                     workers = max(1, workers // 2)
-                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段"
+                               + (f"（记录本批 {timeout_chars} 字，后续更小的子批将自动恢复）" if timeout_chars else "")
+                               + "，重启引擎", "WARNING")
                 else:
                     # workers == 1: strike the in-flight segment; two strikes isolate a poison
                     # segment
@@ -930,12 +991,31 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
     in_flight: set = set()
 
     def on_line(line: str) -> None:
+        nonlocal workers  # a confirmed restore re-syncs the per-batch cap
         if line.startswith("[segment]"):
             _handle_segment_pool(line, pool_map, pool_total, handle)
             flush_manifests()
         elif line.startswith("[watchdog]"):
             in_flight.update(_parse_watchdog_indices(line))
             handle.log(line, "WARNING")
+        elif line.startswith("[restore]"):
+            # A planned sub-batch came in below the newest demotion record's threshold: the
+            # child restored the pre-demotion cap and popped that record from its mirror
+            # stack. This line is the only source of the workers bookkeeping after a
+            # restore, so re-sync from it; a desync (unparseable / no pending record) is a
+            # WARNING, not fatal — the worker's value still wins.
+            cap = _parse_restore_cap(line)
+            if cap is None:
+                handle.log(line, "WARNING")
+            else:
+                if restore_stack:
+                    _chars, expected = restore_stack.pop()
+                    if expected != cap:
+                        handle.log(f"[restore] 上报挡位 {cap} 与降档记录 {expected} 不一致——按 worker 上报同步", "WARNING")
+                else:
+                    handle.log("收到 [restore] 行但没有待恢复的降档记录——按 worker 上报同步", "WARNING")
+                workers = cap
+                handle.log(f"子批总字数低于降档阈值 → 批内上限恢复为 {workers} 段")
         else:
             handle.log(line)
 
@@ -959,6 +1039,7 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
     MAX_ATTEMPTS = 8
     excluded: set = set()  # pool indices isolated after two strikes
     struck: dict = {}
+    restore_stack: list = []  # LIFO demotion records (oldest first), handed to every restart
     attempt = 0
     try:
         while True:
@@ -987,6 +1068,7 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
                 model=t.model, base_model=t.base_model, design_model=t.design_model,
                 ffmpeg_path=cfg.ffmpeg.ffmpeg_path, concurrency=workers, seed=seed,
                 workspace=ws, disabled_checks=disabled_planner_checks(t),
+                restore_stack=encode_restore_stack(restore_stack),
             )
             in_flight.clear()  # a fresh child starts with an empty in-flight set
             try:
@@ -996,8 +1078,19 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
             except WorkerWatchdogTimeout:
                 attempt += 1
                 if workers > 1:
+                    # Record this demotion (the timed-out sub-batch's total chars + the cap
+                    # it ran at) BEFORE the halving: a later sub-batch smaller than it
+                    # restores the old gear (LIFO, one demotion per restore). The in-flight
+                    # set holds POOL-global indices — the rows' own table carries the text.
+                    # An empty / unparseable set records nothing (a zero-chars record would
+                    # block the LIFO stack behind it).
+                    timeout_chars = sum(len(r["text"]) for r in pool_rows if r["index"] in in_flight)
+                    if timeout_chars > 0:
+                        restore_stack.append((timeout_chars, workers))
                     workers = max(1, workers // 2)
-                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段，重启引擎", "WARNING")
+                    handle.log(f"看门狗触发（批内段超时）→ 批内上限缩到 {workers} 段"
+                               + (f"（记录本批 {timeout_chars} 字，后续更小的子批将自动恢复）" if timeout_chars else "")
+                               + "，重启引擎", "WARNING")
                 else:
                     # workers == 1: strike the in-flight POOL rows; two strikes isolate a
                     # poison row — mapped back to its chapter for the manifest write.

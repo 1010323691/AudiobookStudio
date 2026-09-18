@@ -340,6 +340,227 @@ def test_synthesize_watchdog_attempt_cap_raises(workspace, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# --restore-stack — a timeout demotion records its chars; a smaller later
+# sub-batch restores the pre-demotion gear (LIFO)
+# --------------------------------------------------------------------------- #
+
+def _seed_long_script(ws, name="long.json"):
+    """1000 + 2000 char lines: the char metric (stripped text length) is pinned by real text."""
+    (ws / "03_parsed_json" / name).write_text(json.dumps([
+        {"speaker": "A", "text": "字" * 1000},
+        {"speaker": "B", "text": "字" * 2000},
+    ]), encoding="utf-8")
+
+
+def test_synthesize_default_cmd_omits_restore_stack(workspace, monkeypatch):
+    """No demotion history -> the flag is omitted: the default command is byte-identical
+    to the legacy one."""
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    tts_batch.synthesize(_Handle(), None, "s.json", 4)
+    assert "--restore-stack" not in captured["cmd"]
+
+
+def test_synthesize_watchdog_records_timeout_chars(workspace, monkeypatch):
+    """A timeout demotion records the timed-out sub-batch's total chars (the pre-demotion
+    cap): the restart carries --restore-stack '3000:4' (1000 + 2000 chars, cap 4) and the
+    halved --concurrency '2'."""
+    ws = workspace
+    _seed_long_script(ws)
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) == 1:  # first run hangs: name the in-flight batch, then exit 124
+            on_line("[watchdog] timeout batch=custom#1 indices=[0, 1] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "long.json", 4)
+    assert len(calls) == 2
+    assert "--restore-stack" not in calls[0]  # no demotion yet -> legacy command
+    assert _cmd_flag(calls[1], "--restore-stack") == "3000:4"
+    assert _cmd_flag(calls[1], "--concurrency") == "2"  # the cap halved on the restart
+    assert result["completed"] == 2 and result["failed"] == []
+    # the demotion log carries the recorded char count (the user-visible half of the restore)
+    assert any("记录本批 3000 字" in msg for _lvl, msg in h.logs)
+
+
+def test_synthesize_restore_line_pops_before_next_record(workspace, monkeypatch):
+    """A [restore] cap=N line re-syncs the backend's workers and pops the record: the NEXT
+    demotion records the restored cap (4), not the demoted one (2)."""
+    ws = workspace
+    _seed_long_script(ws)
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            on_line("[watchdog] timeout batch=custom#1 indices=[0, 1] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        if len(calls) == 2:
+            # a small batch fits below the threshold: the child restores cap 4, then the
+            # next (restored-gear) batch hangs again — in-flight = index 0 (1000 chars)
+            on_line("[restore] cap=4")
+            on_line("[watchdog] timeout batch=custom#1 indices=[0] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "long.json", 4)
+    assert len(calls) == 3
+    assert _cmd_flag(calls[1], "--restore-stack") == "3000:4"
+    assert any("恢复为 4 段" in msg for _lvl, msg in h.logs)
+    # the next demotion records the RESTORED cap (4) — the pop happened before the push
+    assert _cmd_flag(calls[2], "--restore-stack") == "1000:4"
+    assert _cmd_flag(calls[2], "--concurrency") == "2"  # and the halving applies to it
+    assert result["completed"] == 2
+
+
+def test_synthesize_cascade_demotions_encode_oldest_first(workspace, monkeypatch):
+    """Back-to-back demotions 4 -> 2 -> 1 stack LIFO: the restart command carries
+    '3000:4,3000:2' (oldest first) plus the fully-demoted --concurrency '1'."""
+    ws = workspace
+    _seed_long_script(ws)
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) in (1, 2):
+            on_line("[watchdog] timeout batch=custom#1 indices=[0, 1] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "long.json", 4)
+    assert len(calls) == 3
+    assert _cmd_flag(calls[0], "--concurrency") == "4"
+    assert "--restore-stack" not in calls[0]
+    assert _cmd_flag(calls[1], "--concurrency") == "2"
+    assert _cmd_flag(calls[1], "--restore-stack") == "3000:4"
+    assert _cmd_flag(calls[2], "--concurrency") == "1"
+    assert _cmd_flag(calls[2], "--restore-stack") == "3000:4,3000:2"  # oldest first
+    assert result["completed"] == 2
+
+
+def test_synthesize_strike_at_one_records_nothing(workspace, monkeypatch):
+    """A strike at workers==1 changes no gear, so it must not push a record (a (chars, 1)
+    entry would be a no-op that blocks the LIFO stack behind it): the stack is unchanged
+    across both strikes, still the two genuine demotions."""
+    ws = workspace
+    _seed_long_script(ws)
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) in (1, 2):  # genuine demotions 4 -> 2 -> 1
+            on_line("[watchdog] timeout batch=custom#1 indices=[0, 1] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        if len(calls) in (3, 4):  # strikes at workers==1 (first strike, then isolation)
+            on_line("[watchdog] timeout batch=custom#1 indices=[0] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        # fifth run: only the healthy segment (index 1)
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "long.json", 4)
+    assert len(calls) == 5
+    assert "--restore-stack" not in calls[0]
+    assert _cmd_flag(calls[1], "--restore-stack") == "3000:4"
+    assert _cmd_flag(calls[2], "--restore-stack") == "3000:4,3000:2"
+    # the two strikes pushed nothing: the stack is identical across them
+    assert _cmd_flag(calls[3], "--restore-stack") == "3000:4,3000:2"
+    assert _cmd_flag(calls[4], "--restore-stack") == "3000:4,3000:2"
+    assert result["completed"] == 1 and result["failed"][0]["index"] == 0
+
+
+def test_synthesize_unknown_inflight_index_records_nothing(workspace, monkeypatch):
+    """A timeout naming only an out-of-range index means zero known chars: the demotion
+    still halves the cap, but nothing is recorded (a 0-chars record would be inert and
+    would block the LIFO stack behind it)."""
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            on_line("[watchdog] timeout batch=custom#1 indices=[99] elapsed=181.2")
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "s.json", 4)
+    assert len(calls) == 2
+    assert "--restore-stack" not in calls[1]  # demoted, but nothing to restore to
+    assert _cmd_flag(calls[1], "--concurrency") == "2"
+    assert result["completed"] == 2
+
+
+def test_synthesize_restore_line_without_record_still_syncs(workspace, monkeypatch):
+    """A [restore] line with no pending record (a desync) must not fail the run: log a
+    WARNING and still take the worker's value (the worker's value always wins)."""
+    calls = []
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            # no [watchdog] line before the exit: the backend has no in-flight set -> no record
+            raise WorkerWatchdogTimeout("音频合成引擎失败（退出码 124）")
+        # second run: a restore line the backend has no record for, then a clean finish
+        on_line("[restore] cap=4")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        for s in segs:
+            on_line(f"[segment] {s['index']} ok {os.path.join(out_dir, str(s['index'] + 1).zfill(4) + '.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "s.json", 4)
+    assert len(calls) == 2
+    assert "--restore-stack" not in calls[1]  # nothing was recorded, so nothing is sent
+    assert any(lvl == "WARNING" and "没有待恢复" in msg for lvl, msg in h.logs)
+    assert result["completed"] == 2  # the desync is a warning, not a failure
+
+
+# --------------------------------------------------------------------------- #
 # the persistent per-run transcript (a forensic trail for a mid-batch death)
 # --------------------------------------------------------------------------- #
 
@@ -1037,6 +1258,50 @@ def test_synthesize_multi_watchdog_pool_index_mapping(workspace, monkeypatch):
     s = {e["index"]: e for e in json.loads(
         (ws / "05_audio_chunk" / "s" / "manifest.json").read_text("utf-8"))}
     assert s[0]["ok"] is True and s[1]["ok"] is True  # s's package untouched by the strike
+
+
+def test_synthesize_multi_watchdog_records_and_restore(workspace, monkeypatch):
+    """The pooled loop records demotions the same way: the chars are the POOL rows' text
+    (pool-global in-flight indices -> rows), and a [restore] line re-syncs the pool loop's
+    workers for the next restart's command."""
+    ws = workspace
+    _seed_second_file(ws)
+    calls = []
+    kills = [1]  # one whole-process watchdog kill, then a clean run
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        calls.append(cmd)
+        if kills:
+            # the hung sub-batch holds pool indices 0,1 (s's rows: 'hello' + 'world' = 10 chars)
+            kills.pop(0)
+            on_line("[watchdog] timeout batch=1 indices=[0, 1] elapsed=99s")
+            raise WorkerWatchdogTimeout()
+        # second run: a small batch restores cap 4, then the whole pool finishes cleanly
+        on_line("[restore] cap=4")
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        fallback = cmd[cmd.index("--out-dir") + 1]
+        width = max(4, len(str(len(segs))))
+        for s in segs:
+            local = s.get("file_index", s["index"])
+            out = s.get("out_dir") or fallback
+            (Path(out) / f"{local + 1:0{width}d}.mp3").write_bytes(b"fake")
+            on_line(f"[segment] {s['index']} ok {os.path.join(out, f'{local + 1:0{width}d}.mp3')}")
+        return deque()
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+
+    assert len(calls) == 2
+    assert _cmd_flag(calls[0], "--concurrency") == "4"
+    assert "--restore-stack" not in calls[0]  # no demotion yet -> legacy command
+    # 10 = len('hello') + len('world') — the pool rows' own text, keyed by pool index
+    assert _cmd_flag(calls[1], "--restore-stack") == "10:4"
+    assert _cmd_flag(calls[1], "--concurrency") == "2"  # halved on the restart
+    assert any("恢复为 4 段" in msg for _lvl, msg in h.logs)
+    assert result["completed"] == 4 and result["failed"] == []
 
 
 def test_synthesize_multi_one_file_engine_level_all_failed_isolated_in_failed_list(workspace, monkeypatch):

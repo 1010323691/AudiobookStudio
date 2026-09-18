@@ -23,7 +23,9 @@ Modes (``--mode``)
   batch              all segments in a file, one subprocess, needed models loaded once;
                      segments are padded into native tensor batches; --concurrency is only the
                      per-batch CEILING — the real size follows the segment-length bands and a
-                     measured VRAM governor that shrinks / grows it as the run goes
+                     measured VRAM governor that shrinks / grows it as the run goes; pending
+                     watchdog-demotion records (--restore-stack) let a sub-batch smaller than
+                     the batch that timed out restore the pre-demotion cap
   design-batch       all VoiceDesign candidates in a file, one subprocess, the design model
                      loaded once; every candidate (short ref text + its own voice description)
                      runs as a native tensor sub-batch like batch mode — the 角色配音·克隆
@@ -47,6 +49,9 @@ Contract with the backend (all on STDOUT unless noted)
   - ``[watchdog] timeout batch=<n> indices=[...] elapsed=<s>`` -> a sub-batch produced no
     output within its budget; the process then exits 124 (the backend shrinks the batch and
     restarts a fresh subprocess)
+  - ``[restore] cap=<N>`` -> a planned sub-batch came in below the newest demotion record's
+    threshold (see --restore-stack): the backend restores the per-batch cap to N and pops
+    that record (batch mode; the demotion records arrive via --restore-stack on restart)
   - any other line                    -> forwarded as a log entry
   - exit 0 on success; non-zero on failure, error on STDERR.
 
@@ -1488,6 +1493,35 @@ def parse_disabled_checks(raw: str) -> frozenset:
     return frozenset(names)
 
 
+def parse_restore_stack(raw: str) -> list:
+    """``--restore-stack`` -> list of ``(threshold_chars, cap)`` pairs, oldest first (pure).
+
+    Empty / omitted = no pending demotion record (the default). Each entry is
+    ``<chars>:<cap>`` — the timed-out sub-batch's total chars and the per-batch cap that
+    was in force just before that demotion — so the newest (LAST) record is the one a
+    planned sub-batch is compared against first (LIFO one-step restore). Whitespace-tolerant.
+    A malformed entry (missing / extra colon, non-integer, or a non-positive number) raises
+    ``ValueError`` (the caller turns it into ``TTS_WORKER_ERROR`` + exit 2) — a typo must
+    never silently drop a pending restore.
+    """
+    out = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        fields = [f.strip() for f in part.split(":")]
+        if len(fields) != 2:
+            raise ValueError(f"malformed --restore-stack entry {part!r} (want <chars>:<cap>)")
+        try:
+            chars, cap = int(fields[0]), int(fields[1])
+        except ValueError:
+            raise ValueError(f"malformed --restore-stack entry {part!r} (want <chars>:<cap>)") from None
+        if chars <= 0 or cap <= 0:
+            raise ValueError(f"malformed --restore-stack entry {part!r} (both numbers must be positive)")
+        out.append((chars, cap))
+    return out
+
+
 def _plan_cap_terms(disabled, band_label):
     """The still-active static caps for the '实际每批条数 = min(…)' log line: one term per
     check that is on. 动态调节 (the measured VramGovernor cap) is never closable, so it is
@@ -1561,6 +1595,50 @@ def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
     pos = batches[0]  # always a prefix of the ascending rows
     pos_set = set(pos)
     return [remaining[i] for i in pos], [r for i, r in enumerate(remaining) if i not in pos_set]
+
+
+def plan_next_sub_batch_with_restore(remaining, restore_stack, *, vtype, overhead,
+                                     params, budget, gov, max_batch, max_batch_chars,
+                                     disabled: frozenset = frozenset()):
+    """One planning round that honours the newest pending demotion record (pure).
+
+    ``restore_stack`` is the LIFO list of ``(threshold_chars, cap)`` pairs the backend
+    recorded when it demoted the per-batch cap (``--restore-stack``, oldest first). The
+    round plans ONCE at the current (demoted) gear; if that batch's total chars sit below
+    the newest record's threshold, a TRIAL plan is taken at the record's original gear
+    (the governor's live cap bumped for the trial and the manual cap raised, so the
+    length bands re-derive from it). The restore is confirmed only if the trial ALSO fits
+    under the threshold — a full-size batch that would still overshoot must not run at
+    the old gear — in which case the governor stays at the restored gear (the
+    fresh-process-at-that-gear state; the caller pops the record and emits the ``[restore]``
+    line) and the trial's rows are the batch. On rejection the trial's cap bump is reverted
+    and the demoted batch runs (the record stays pending for later rounds). Only the
+    newest record is consulted (LIFO: levels come back one demotion at a time); every
+    other planning check (bands / char caps / overlong solo / length ratio / static VRAM)
+    and the governor's measured ``vram_scale`` apply to the trial unchanged — a restore
+    raises the manual ceiling only.
+
+    Returns ``(rows, remaining, new_max_batch, restored_cap)`` — ``restored_cap`` is the
+    restored gear when the restore was confirmed, else ``None`` (and ``new_max_batch`` is
+    the input ``max_batch`` unchanged).
+    """
+    rows_b, remaining_b = plan_next_sub_batch(
+        remaining, vtype=vtype, overhead=overhead, params=params, budget=budget,
+        gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars, disabled=disabled)
+    if not restore_stack:
+        return rows_b, remaining_b, max_batch, None
+    threshold, cap = restore_stack[-1]
+    if cap <= max_batch or sum(r["chars"] for r in rows_b) >= threshold:
+        return rows_b, remaining_b, max_batch, None
+    saved = gov.cap
+    gov.cap = cap  # the trial sees the restored gear; reverted on rejection
+    rows_big, remaining_big = plan_next_sub_batch(
+        remaining, vtype=vtype, overhead=overhead, params=params, budget=budget,
+        gov=gov, max_batch=cap, max_batch_chars=max_batch_chars, disabled=disabled)
+    if sum(r["chars"] for r in rows_big) < threshold:
+        return rows_big, remaining_big, cap, cap  # confirmed — gov.cap stays restored
+    gov.cap = saved
+    return rows_b, remaining_b, max_batch, None
 
 
 def _run_batch(args) -> int:
@@ -1796,17 +1874,28 @@ def _run_batch(args) -> int:
     # the authority). Per-row VRAM overhead: a sub-batch that mixes characters carries each
     # character's own measured reference overhead on its own rows, so the budget stays honest.
     sub_counter = [0]  # global sub-batch sequence (a reproducible per-sub-batch seed offset)
+    restore_stack = args.restore_stack  # LIFO demotion records from --restore-stack (oldest first)
     for vtype, rows in queues:
         model = models.get(vtype)
         params = _talker_vram_params(model) if model is not None else None
         remaining = rows
         while remaining:
             budget = _free_vram_budget(device) if params is not None else None  # fresh per round
-            rows_b, remaining = plan_next_sub_batch(
-                remaining, vtype=vtype, overhead=[r["overhead"] for r in remaining],
+            rows_b, remaining, max_batch, restored = plan_next_sub_batch_with_restore(
+                remaining, restore_stack,
+                vtype=vtype, overhead=[r["overhead"] for r in remaining],
                 params=params, budget=budget,
                 gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
                 disabled=disabled)
+            if restored is not None:
+                # The planned sub-batch fits below the newest demotion record's threshold:
+                # the gear returns to its pre-demotion cap (the fresh-process-at-that-gear
+                # state, modulo the governor's accumulated vram_scale). The pop + manual-cap
+                # bump stay in lockstep with the backend, which pops its mirror stack when
+                # the [restore] line arrives.
+                restore_stack.pop()
+                gov.manual_cap = restored
+                print(f"[restore] cap={restored}", flush=True)
 
             rows_cap = 1 if vtype == "design" else gov.cap
             log(f"子批（{vtype}）：{len(rows_b)} 段（批内上限 {rows_cap}）")
@@ -2417,6 +2506,11 @@ def main() -> int:
                     help="comma list of sub-batch planning checks to disable (batch / design-batch): "
                          "length_bands, batch_chars, seq_chars, length_ratio, vram "
                          "(empty = all on; an unknown name is a setup error)")
+    ap.add_argument("--restore-stack", default="",
+                    help="pending watchdog-demotion records '<chars>:<cap>,…', oldest first (batch): "
+                         "each is the timed-out sub-batch's total chars + the pre-demotion per-batch "
+                         "cap; a planned sub-batch below the newest record's chars restores that cap "
+                         "(empty = no pending restore)")
     ap.add_argument("--seed", type=int, default=-1,
                     help="reproducible seed offset per sub-batch (batch / design / design-batch; -1 = random)")
     ap.add_argument("--done-offset", type=int, default=0,
@@ -2441,6 +2535,7 @@ def main() -> int:
     if args.mode in ("batch", "design-batch"):
         try:
             args.disabled = parse_disabled_checks(args.disabled_checks)
+            args.restore_stack = parse_restore_stack(args.restore_stack)
         except ValueError as e:
             print(f"TTS_WORKER_ERROR: {e}", file=sys.stderr, flush=True)
             return 2

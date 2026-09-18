@@ -467,6 +467,110 @@ def test_plan_next_sub_batch_disabled_vram_user_scenario():
     assert len(rows_b) == 32 and remaining == []
 
 
+# ---------------------------------------------------------------------------
+# --restore-stack — watchdog demotion records and the per-batch auto-restore
+# ---------------------------------------------------------------------------
+
+def test_parse_restore_stack_empty_and_valid():
+    tw = _load_worker()
+    assert tw.parse_restore_stack("") == []
+    assert tw.parse_restore_stack(None) == []
+    assert tw.parse_restore_stack("  ") == []
+    # empty parts are skipped (a trailing comma is harmless)
+    assert tw.parse_restore_stack("12000:4,") == [(12000, 4)]
+    assert tw.parse_restore_stack("12000:4,,5000:2") == [(12000, 4), (5000, 2)]
+    # whitespace-tolerant, order pinned (oldest first)
+    assert tw.parse_restore_stack(" 12000:4 , 5000:2 ") == [(12000, 4), (5000, 2)]
+
+
+def test_parse_restore_stack_malformed_raises():
+    tw = _load_worker()
+    for bad in ("12000", "12000:4:9", "abc:4", "0:4", "12000:-4"):
+        with pytest.raises(ValueError) as exc:
+            tw.parse_restore_stack(bad)
+        # the error names the offender (the caller surfaces it as TTS_WORKER_ERROR +
+        # exit 2 — a typo must never silently drop a pending restore)
+        assert bad in str(exc.value)
+
+
+def test_plan_next_sub_batch_with_restore_empty_stack_is_plain_planning():
+    tw = _load_worker()
+    rows = [_row(10) for _ in range(6)]
+    gov = tw.VramGovernor(4, device="cuda", total_vram=8 * GB)
+    plain, rem_plain = tw.plan_next_sub_batch(
+        rows, vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=4, max_batch_chars=12000)
+    rows_b, remaining, new_mb, restored = tw.plan_next_sub_batch_with_restore(
+        rows, [], vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=4, max_batch_chars=12000)
+    # field-for-field the plain round
+    assert (rows_b, remaining) == (plain, rem_plain)
+    assert new_mb == 4 and restored is None
+
+
+def test_plan_next_sub_batch_with_restore_confirms_when_trial_fits():
+    tw = _load_worker()
+    # demoted gear 2 (cap 2), a pending record "threshold 100 chars restores cap 4";
+    # three short rows: the demoted batch is 20 chars, the trial (cap 4) is 30 — both
+    # under 100, so the restore is confirmed and the trial's rows become the batch
+    rows = [_row(10) for _ in range(3)]
+    gov = tw.VramGovernor(2, device="cuda", total_vram=8 * GB)
+    assert gov.cap == 2
+    rows_b, remaining, new_mb, restored = tw.plan_next_sub_batch_with_restore(
+        rows, [(100, 4)], vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=2, max_batch_chars=12000)
+    assert [r["chars"] for r in rows_b] == [10, 10, 10]  # the trial's rows, not the demoted batch
+    assert remaining == [] and new_mb == 4 and restored == 4
+    # the governor sits at the restored gear (the fresh-process-at-that-gear state)...
+    assert gov.cap == 4
+    # ...but the manual cap is left to the driver (it sets it, pops the record, emits [restore])
+    assert gov.manual_cap == 2
+
+
+def test_plan_next_sub_batch_with_restore_rejected_when_trial_overshoots():
+    tw = _load_worker()
+    # threshold 25: the demoted batch (2 rows = 20 chars) fits, but the trial (3 rows =
+    # 30 chars) would still overshoot -> the restore is refused, the demoted batch runs,
+    # the trial's cap bump is reverted, and the record stays pending
+    rows = [_row(10) for _ in range(3)]
+    gov = tw.VramGovernor(2, device="cuda", total_vram=8 * GB)
+    rows_b, remaining, new_mb, restored = tw.plan_next_sub_batch_with_restore(
+        rows, [(25, 4)], vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=2, max_batch_chars=12000)
+    assert [r["chars"] for r in rows_b] == [10, 10]  # the demoted batch
+    assert [r["chars"] for r in remaining] == [10]
+    assert new_mb == 2 and restored is None
+    assert gov.cap == 2  # the trial's cap bump was reverted
+
+
+def test_plan_next_sub_batch_with_restore_skips_record_not_above_current_cap():
+    tw = _load_worker()
+    rows = [_row(10) for _ in range(3)]
+    gov = tw.VramGovernor(4, device="cuda", total_vram=8 * GB)
+    # the record's cap is not above the current cap: there is nothing to restore to
+    rows_b, remaining, new_mb, restored = tw.plan_next_sub_batch_with_restore(
+        rows, [(100, 4)], vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=4, max_batch_chars=12000)
+    assert [r["chars"] for r in rows_b] == [10, 10, 10]
+    assert new_mb == 4 and restored is None and gov.cap == 4
+
+
+def test_plan_next_sub_batch_with_restore_consults_only_stack_top():
+    tw = _load_worker()
+    rows = [_row(10) for _ in range(3)]
+    gov = tw.VramGovernor(2, device="cuda", total_vram=8 * GB)
+    stack = [(100, 8), (25, 4)]
+    # the BOTTOM record (100, 8) would confirm (30 < 100); the TOP (25, 4) rejects
+    # (30 >= 25) — LIFO: only the top is consulted, so no restore this round...
+    rows_b, remaining, new_mb, restored = tw.plan_next_sub_batch_with_restore(
+        rows, stack, vtype="custom", overhead=16, params=None, budget=None,
+        gov=gov, max_batch=2, max_batch_chars=12000)
+    assert restored is None and new_mb == 2 and gov.cap == 2
+    assert [r["chars"] for r in rows_b] == [10, 10]  # the demoted batch ran
+    # ...and the helper never mutates the stack (the driver pops on confirmation)
+    assert stack == [(100, 8), (25, 4)]
+
+
 def test_plan_next_sub_batch_disabled_bands():
     tw = _load_worker()
     # 300-char rows: the length band (8 of 16) binds while on; closed, the manual
@@ -1181,7 +1285,8 @@ def test_worker_module_loads_without_torch():
                  "_row_output_paths", "_save_and_report",
                  "_clone_input_overhead", "band_cap_for_chars", "VramGovernor",
                  "plan_merge_batches", "normalize_pause_ms", "boundary_gap_ms",
-                 "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac"):
+                 "merge_stage1_frac", "merge_stage2_frac", "merge_encode_frac",
+                 "parse_restore_stack", "plan_next_sub_batch_with_restore"):
         assert callable(getattr(tw, name)), f"missing {name}"
     for const in ("ROW_STRUCTURAL_OVERHEAD", "CLONE_FALLBACK_OVERHEAD",
                   "CHAR_TOKENS_PER_CHAR", "LENGTH_RATIO", "PEAK_PRESSURE_FRAC",
