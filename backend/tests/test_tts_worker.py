@@ -554,7 +554,9 @@ def test_plan_next_sub_batch_disabled_all_governed_by_manual_cap():
 
 
 # --------------------------------------------------------------------------- #
-# order_speaker_groups — per-character grouping, most lines first
+# order_speaker_groups — key-generic grouping, most lines first
+# (character keys: one queue per character; vtype keys: the cross-character unified
+#  queues the batch / design-batch modes actually run)
 # --------------------------------------------------------------------------- #
 
 def test_order_speaker_groups_most_lines_first():
@@ -591,7 +593,7 @@ def test_order_speaker_groups_rows_length_ascending():
     assert [r["chars"] for r in rows] == [3, 12, 40, 200]
 
 
-def test_order_speaker_groups_never_mix_characters():
+def test_order_speaker_groups_never_mixes_keys():
     tw = _load_worker()
     classified = {
         ("custom", "A"): [_row(5), _row(9)],
@@ -599,8 +601,9 @@ def test_order_speaker_groups_never_mix_characters():
         ("clone", "C"): [_row(2), _row(3), _row(4)],
     }
     groups = tw.order_speaker_groups(classified)
-    # each group is exactly one character's rows — all of them, length-ascending,
-    # no cross-character pooling
+    # each group is exactly one KEY's rows — all of them, length-ascending, no cross-key
+    # pooling (at the vtype keys the batch mode actually uses, a custom row can never
+    # enter a clone queue — the three vtypes are three different models)
     for key, rows in groups:
         assert [r["chars"] for r in rows] == \
             sorted(r["chars"] for r in classified[key])
@@ -844,6 +847,96 @@ def test_generate_rows_design_uses_per_row_instruct_and_do_sample_switch():
     assert model.calls[1].get("do_sample") is True
 
 
+def test_generate_rows_clone_passes_per_row_prompt_items():
+    tw = _load_worker()
+
+    class _Model:
+        def __init__(self):
+            self.calls = []
+
+        def generate_voice_clone(self, **kw):
+            self.calls.append(kw)
+            return [[1.0] * 8] * len(kw["text"]), 24000
+
+    model = _Model()
+    args = SimpleNamespace(language="chinese")
+    # One tensor call serving TWO characters: each row is conditioned on its own
+    # character's reference (the model's list API matches prompt items to rows 1:1).
+    rows = [
+        {"index": 0, "speaker": "甲", "text": "t0", "instruct": "", "vd": {}},
+        {"index": 1, "speaker": "乙", "text": "t1", "instruct": "", "vd": {}},
+        {"index": 2, "speaker": "甲", "text": "t2", "instruct": "", "vd": {}},
+    ]
+    prompts = {"甲": ["prompt-甲"], "乙": ["prompt-乙"]}
+    results = tw._generate_rows(model, "clone", rows, args, prompts, None)
+    assert results == [(True, ([1.0] * 8, 24000))] * 3
+    kw = model.calls[0]
+    assert kw["voice_clone_prompt"] == ["prompt-甲", "prompt-乙", "prompt-甲"]
+    # a single-character batch passes the same item on every row (the old broadcast)
+    tw._generate_rows(model, "clone", [rows[0], rows[2]], args, prompts, None)
+    assert model.calls[1]["voice_clone_prompt"] == ["prompt-甲", "prompt-甲"]
+
+
+def test_plan_row_tokens_accepts_per_row_overhead():
+    tw = _load_worker()
+    texts = ["一" * 10, "一" * 20]
+    # a scalar is shorthand for "every row the same" (the legacy call shape)
+    assert tw.plan_row_tokens(texts, None, 16) == \
+        tw.plan_row_tokens(texts, None, [16, 16])
+    # a per-row list prices each row at its own overhead (a cross-character clone round:
+    # different references have different frame counts)
+    per_row = tw.plan_row_tokens(texts, None, [10, 100])
+    base = tw.plan_row_tokens(texts, None, 0)
+    assert per_row == [base[0] + 10, base[1] + 100]
+    # a mismatched list falls back to its max (the conservative, batch-shrinking direction)
+    assert tw.plan_row_tokens(texts, None, [7]) == tw.plan_row_tokens(texts, None, 7)
+    # negative overheads clamp to 0
+    assert tw.plan_row_tokens(["x"], None, [-5]) == tw.plan_row_tokens(["x"], None, 0)
+
+
+def test_unified_queue_fills_the_cap_across_characters():
+    tw = _load_worker()
+    # The user's incident shape: three characters with 2 + 3 + 1 rows, all in the same
+    # length band (40-45 chars, ratio 45/40 < 3). The merged length-ascending queue
+    # fills the 6-row cap in ONE sub-batch — under the old per-character queues the
+    # 2-row and 1-row characters stranded 4 of the 6 cap slots.
+    rows = (
+        [_row(40, speaker="A"), _row(42, speaker="A")]
+        + [_row(41, speaker="B"), _row(43, speaker="B"), _row(44, speaker="B")]
+        + [_row(45, speaker="C")]
+    )
+    rows.sort(key=lambda r: r["chars"])
+    gov = tw.VramGovernor(6, device="cuda", total_vram=8 * GB)
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="clone",
+        overhead=[10, 10, 16, 16, 16, 100],  # per-character reference overheads
+        params=None, budget=None,
+        gov=gov, max_batch=6, max_batch_chars=12000)
+    assert len(rows_b) == 6
+    assert [r["speaker"] for r in rows_b] == ["A", "B", "A", "B", "B", "C"]
+    assert remaining == []
+
+
+def test_unified_queue_keeps_length_homogeneity_across_characters():
+    tw = _load_worker()
+    # A cross-character batch may not re-create the 2026-09-17 failure: a 2-char row
+    # next to a 40-char row (20x > the ratio 3) must split, even across characters.
+    rows = sorted([_row(40, speaker="A"), _row(2, speaker="B")],
+                  key=lambda r: r["chars"])
+    gov = tw.VramGovernor(6, device="cuda", total_vram=8 * GB)
+    rows_b, remaining = tw.plan_next_sub_batch(
+        rows, vtype="clone", overhead=[16, 16], params=None, budget=None,
+        gov=gov, max_batch=6, max_batch_chars=12000)
+    # the short row batches first (it leads the ascending stream) and the 20x longer
+    # row of the OTHER character starts the next sub-batch
+    assert [r["speaker"] for r in rows_b] == ["B"]
+    rows_b2, remaining2 = tw.plan_next_sub_batch(
+        remaining, vtype="clone", overhead=[16], params=None, budget=None,
+        gov=gov, max_batch=6, max_batch_chars=12000)
+    assert [r["speaker"] for r in rows_b2] == ["A"]
+    assert remaining2 == []
+
+
 class TestLengthProportionalDecodeCap:
     """In a multi-row tensor batch the model does not stop individual rows at EOS
     (model-side behaviour), so the decode cap scales with the sub-batch's longest row
@@ -893,7 +986,7 @@ class TestLengthProportionalDecodeCap:
             {"index": 0, "speaker": "NARRATOR", "text": "啪！", "instruct": "", "vd": {}},
             {"index": 1, "speaker": "NARRATOR", "text": "侍女抱了拳。", "instruct": "", "vd": {}},
         ]
-        tw._generate_rows(model, "clone", rows, args, {"NARRATOR": "prompt"}, None)
+        tw._generate_rows(model, "clone", rows, args, {"NARRATOR": ["prompt"]}, None)
         # 6-char longest row -> the floor, NOT the full 2048 cap (the hang signature)
         assert model.calls[0]["max_new_tokens"] == tw.max_new_tokens_for_chars(6)
         assert model.calls[0]["max_new_tokens"] < tw.MAX_NEW_TOKENS
@@ -904,7 +997,7 @@ class TestLengthProportionalDecodeCap:
             "text": "风从街口穿过来，带着一股淡淡的柴火气味。" * 5,
             "instruct": "", "vd": {},
         }]
-        tw._generate_rows(model, "clone", long_rows, args, {"NARRATOR": "prompt"}, None)
+        tw._generate_rows(model, "clone", long_rows, args, {"NARRATOR": ["prompt"]}, None)
         cap = model.calls[1]["max_new_tokens"]
         assert cap == tw.max_new_tokens_for_chars(len(long_rows[0]["text"]))
         assert tw.FRAME_CAP_FLOOR < cap < tw.MAX_NEW_TOKENS

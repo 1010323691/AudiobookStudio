@@ -8,6 +8,7 @@ the console down (requirement #7).
 """
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 import time
@@ -61,6 +62,17 @@ class TaskHandle:
     def progress(self, frac: float, current: str = "") -> None:
         self._t.set_progress(frac, current)
 
+    def phase(self, name: str) -> None:
+        """Report the current work stage (e.g. ``"parse"`` / ``"check"``).
+
+        The 文本解析 batch coordinator reads ``Task.phase`` to tell which tasks have
+        already released their concurrency slot (the mechanical check stages run
+        slot-free) so it can keep admitting prefetched files. Display-neutral: the
+        frontend store ignores the SSE event, and ``current`` stays the user-facing
+        step text.
+        """
+        self._t.set_phase(name)
+
     def log(self, msg: str, level: str = "INFO") -> None:
         self._t.log(msg, level)
 
@@ -112,6 +124,16 @@ class Task:
     id: str
     module: str
     label: str
+    # Monotonic creation order (1-based, assigned by the TaskManager). Unlike
+    # ``created`` (wall clock, can tie within a tight create loop) it is a
+    # guaranteed ordering key — the 文本解析 page rebuilds a batch's file order
+    # after a page reload by sorting non-terminal tasks on this.
+    seq: int = 0
+    # Engine-reported work stage (e.g. ``"parse"`` / ``"check"``, set via
+    # :meth:`set_phase`) — consumed in-process by the 文本解析 batch coordinator
+    # (which tasks have already released their concurrency slot). Empty for
+    # stages the engine doesn't report.
+    phase: str = ""
     status: TaskStatus = TaskStatus.PENDING
     progress: float = 0.0
     current: str = ""
@@ -173,6 +195,16 @@ class Task:
         if current:
             self.current = current
         self._emit({"type": "progress", "progress": self.progress, "current": self.current})
+
+    def set_phase(self, phase: str) -> None:
+        """Set the engine-reported work stage (see ``Task.phase``) and forward it.
+
+        The event rides the usual bus; the multiplexed SSE stream passes it through
+        and the frontend store ignores unknown event types — the consumers are
+        in-process (the batch coordinator polls ``Task.phase`` directly).
+        """
+        self.phase = phase
+        self._emit({"type": "phase", "phase": phase})
 
     def log(self, msg: str, level: str = "INFO") -> None:
         # Append in chronological order (oldest → newest). The UI renders the newest
@@ -272,6 +304,7 @@ class Task:
             "id": self.id,
             "module": self.module,
             "label": self.label,
+            "seq": self.seq,
             "status": self.status.value,
             "progress": self.progress,
             "current": self.current,
@@ -309,6 +342,10 @@ class TaskManager:
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
+        # Monotonic creation counter (thread-safe): a guaranteed-total ordering
+        # for tasks created back-to-back (``created`` wall-clock timestamps can
+        # tie within a tight loop).
+        self._seq = itertools.count(1)
         # Process-wide event bus feeding the multiplexed ``GET /api/tasks/stream``
         # SSE endpoint. Browsers cap simultaneous HTTP/1.1 connections per host at
         # ~6, so the UI holds exactly ONE such connection per tab (covering all
@@ -319,14 +356,48 @@ class TaskManager:
         self._bus: set = set()
         self._bus_lock = threading.Lock()
 
-    def create(self, module: str, label: str, func: Callable, *args, **kwargs) -> Task:
-        task = Task(id=uuid.uuid4().hex[:12], module=module, label=label)
+    def create(self, module: str, label: str, func: Callable, *args,
+               start: bool = True, **kwargs) -> Task:
+        """Create a task and (by default) start its worker thread.
+
+        ``start=False`` creates a **PENDING shell**: registered in ``self._tasks``
+        (visible to ``GET /api/tasks`` / ``snapshot_all`` / page-reload reattach and
+        counted as non-terminal for the SSE keep-alive) but with NO thread started —
+        the 文本解析 batch endpoint creates all of a batch's file shells up front
+        (returning every task_id so the UI binds rows immediately) and a coordinator
+        thread calls :meth:`start` on each in selection order as capacity opens.
+        """
+        task = Task(id=uuid.uuid4().hex[:12], module=module, label=label, seq=next(self._seq))
         task._func, task._args, task._kwargs = func, args, kwargs
         task._broadcast = self._bus_event
-        task.started = time.time()
-        task._set_status(TaskStatus.RUNNING)
         with self._lock:
             self._tasks[task.id] = task
+            if start:
+                task.started = time.time()
+                task._set_status(TaskStatus.RUNNING)
+        if start:
+            t = threading.Thread(target=self._run, args=(task,), daemon=True)
+            task._thread = t
+            t.start()
+        return task
+
+    def start(self, task_id: str) -> Task:
+        """Start a PENDING shell (created via ``create(..., start=False)``).
+
+        The PENDING → RUNNING transition happens under the manager lock so it cannot
+        race with ``control("cancel")`` finalizing the shell; when the task is no
+        longer PENDING (e.g. cancelled meanwhile) this raises ``ValueError`` — the
+        文本解析 coordinator treats that as a benign race and moves on to the next
+        file.
+        """
+        task = self.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with self._lock:
+            if task.status is not TaskStatus.PENDING:
+                raise ValueError(f"task {task_id} 非 PENDING（{task.status.value}），不能启动")
+            task.started = time.time()
+            task._set_status(TaskStatus.RUNNING)
         t = threading.Thread(target=self._run, args=(task,), daemon=True)
         task._thread = t
         t.start()
@@ -410,8 +481,24 @@ class TaskManager:
         if task is None:
             raise KeyError(task_id)
         if action == "cancel":
-            task.cancel_event.set()
-            task.log("收到取消请求", "WARNING")
+            finalized_shell = False
+            with self._lock:
+                task.cancel_event.set()
+                if task.status is TaskStatus.PENDING:
+                    # A shell has no worker thread to observe cancel_event — finalize
+                    # it in place or it would hang PENDING forever (and the SSE
+                    # keep-alive would keep the stream open). The terminal status
+                    # event below carries the full snapshot, like _run's path.
+                    task.finished = time.time()
+                    task._set_status(TaskStatus.CANCELLED)
+                    finalized_shell = True
+            if finalized_shell:
+                # _run's finally never runs for a shell — emit the terminal log line
+                # and the final event here so SSE consumers see the same lifecycle.
+                task.log("任务已取消（未启动）", "WARNING")
+                task._emit({"type": "final", "task": task.snapshot()})
+            else:
+                task.log("收到取消请求", "WARNING")
         elif action == "pause":
             if task.status == TaskStatus.RUNNING:
                 task.pause_event.set()
@@ -428,6 +515,8 @@ class TaskManager:
                 task.pause_event.clear()
                 task.error = ""
                 task.progress = 0.0
+                task.phase = ""  # a rerun starts from scratch — a stale "check" phase
+                # would make the batch coordinator think the slot was already released
                 task.logs.clear()
                 task.llm_chunks.clear()
                 task.llm_len = 0

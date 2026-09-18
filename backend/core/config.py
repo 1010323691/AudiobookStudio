@@ -121,6 +121,9 @@ class LogConfig(BaseModel):
 
 class UIConfig(BaseModel):
     theme: str = "system"  # system | light | dark
+    # 解析页「解析进度」日志区（每文件实时日志 + 流式反馈）是否显示；默认关。
+    # 关时三性能指标移到「开始处理」按钮下方（每文件行内的进度/速度/状态不受影响）。
+    show_parse_logs: bool = False
 
 
 class LLMConfig(BaseModel):
@@ -168,9 +171,15 @@ class GenerationConfig(BaseModel):
     # 解析内「纯归属标签条清理」开关（设置页可切换，默认开）：整条即纯归属标签的短
     # NARRATOR 条确定性删除（零 LLM 成本）。关 = 跳过该阶段并留一行日志（tags_deleted 为 0）。
     delete_saying_tags: bool = True
+    # 解析内「角色匹配检查」开关（设置页可切换，默认开）：chunk 切割会切断跨段上下文，
+    # 边界两侧的条目在解析时看不到另一侧的对话/角色上下文 → 用跨边界窗口
+    # （[前置上下文]+[目标]+[后置上下文]，上下文仅辅助、只有目标可被修改）重判
+    # 每个内部 chunk 边界两侧 check_context_window 条。关 = 跳过该阶段并留一行日志
+    # （boundary_checked / boundary_fixed 为 0）。
+    check_boundary_speakers: bool = True
     # 解析内重判阶段的批几何（自已退役的 speaker_check 段迁入）：每次 LLM 调用重判的
-    # 目标条目数 / 目标块两侧的上下文条数。断句失败校验只用 context_window；归属抽样两者
-    # 都用。设置页不露出（config/app.json 可编辑）。
+    # 目标条目数 / 目标块两侧的上下文条数。角色匹配检查与归属抽样两者都用；
+    # 断句失败校验只用 context_window。设置页不露出（config/app.json 可编辑）。
     check_batch_size: int = 20
     check_context_window: int = 4
 

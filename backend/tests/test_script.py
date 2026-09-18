@@ -11,14 +11,17 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
+import time
 import urllib.request
 
 import pytest
 
 from backend.core import config as core_config
+from backend.core import concurrency
 from backend.core import paths as core_paths
 from backend.core.config import GenerationConfig, LLMConfig, PromptsConfig
-from backend.core.tasks import TaskCancelled
+from backend.core.tasks import TERMINAL, TaskCancelled, TaskManager, TaskStatus
 from backend.engines.script import (
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_USER_PROMPT,
@@ -35,6 +38,7 @@ from backend.engines.script import (
     _risk_tier,
     _strip_leading_saying_tag,
     _tag_in,
+    boundary_check_speakers,
     build_batch_window,
     check_chunk_fidelity,
     clean_json_string,
@@ -50,6 +54,7 @@ from backend.engines.script import (
     revalidate_entry,
     repair_json_array,
     salvage_json_entries,
+    select_boundary_targets,
     select_spot_targets,
     spot_budget,
     spot_check_speakers,
@@ -85,7 +90,9 @@ def test_split_packs_small_paragraphs():
 
 
 def test_split_long_paragraph_by_sentences():
-    assert split_into_chunks("aaaa. bbbb. cccc.", max_size=8) == ["aaaa.", "bbbb.", "cccc."]
+    # 17 字 @8：段数 ceil(17/8)=3 → 固定切法尾段 1 字 < 4（半长）→ 减一为 2 段，
+    # 目标均长 8.5，最近合法边界（句末+空白）= 11 → 两段尽量平均。
+    assert split_into_chunks("aaaa. bbbb. cccc.", max_size=8) == ["aaaa. bbbb.", "cccc."]
 
 
 def test_split_empty():
@@ -102,6 +109,67 @@ def test_split_preserves_content():
     for src in samples:
         chunks = split_into_chunks(src, max_size=20)
         assert re.sub(r"\s", "", src) == re.sub(r"\s", "", "\n\n".join(chunks)), repr(src)
+
+
+def _paras(n, ch, width=100):
+    """n 个等宽段落（每段 width 个相同字符）拼成的正文（段落间空行）。"""
+    return "\n\n".join(ch * width for _ in range(n))
+
+
+def test_split_count_rule_evening_out_short_tail():
+    # 段数公式四例（每段 100 字、段间 2 字空行；长度 = strip 后）：
+    # ① 31 段 = 3160 字 @1500：ceil → 3，固定切法尾段 160 < 750 → 2 段均分
+    # ② 38 段 = 3874 字 @1500：ceil → 3，尾段 874 ≥ 750 → 保持 3 段
+    # ③ 45 段 = 4588 字 @1500：ceil → 4，尾段 88 < 750 → 3 段均分
+    # ④ 46 段 = 4690 字 @1500：ceil → 4，尾段 190 < 750 → 3 段均分（而非 1500/1500/1600）
+    assert [len(c) for c in split_into_chunks(_paras(31, "甲"), max_size=1500)] == [1630, 1528]
+    assert [len(c) for c in split_into_chunks(_paras(38, "乙"), max_size=1500)] == [1324, 1222, 1324]
+    assert [len(c) for c in split_into_chunks(_paras(45, "丙"), max_size=1500)] == [1528, 1528, 1528]
+    assert [len(c) for c in split_into_chunks(_paras(46, "丁"), max_size=1500)] == [1528, 1630, 1528]
+
+
+def test_split_clamps_count_to_boundary_count():
+    # 段数公式给 4（ceil(30/8)），但内部合法边界仅 1 个（段间空行）→ 钳回 2 段：
+    # 目标均长只是软目标，合法结构边界是最高约束（无边界处绝不强切）。
+    src = "夜色像潮水一样漫进街巷，行人渐稀。\n\n巷口的灯一盏盏亮起来。"
+    assert len(split_into_chunks(src, max_size=8)) == 2
+
+
+def test_split_cjk_sentence_boundaries():
+    # 无空格中文句：CJK 句末标点 。！？!?… 是零宽合法边界（不要求后随空白）——
+    # 旧正则 (?<=[.!?])\s+ 对中文从不触发，超长中文段从此可切。
+    src = "句子一。句子二。句子三。句子四。"
+    chunks = split_into_chunks(src, max_size=8)
+    assert chunks == ["句子一。句子二。", "句子三。句子四。"]
+    assert all(c.endswith("。") for c in chunks)
+
+
+def test_split_ascii_mid_token_dot_protected():
+    # ASCII .!? 须后随空白才是句末边界——3.14 的词内点号绝不可成为切点。
+    # 4 字尾段「dddd」< 半长 5 → 收尾 pass 并入左邻（只删切点）；
+    # 「3.14」始终完整地位于同一块内。
+    src = "aaaa. bbbb 3.14 cccc. dddd"
+    chunks = split_into_chunks(src, max_size=10)
+    assert chunks == ["aaaa.", "bbbb 3.14 cccc. dddd"]
+    assert "3.14" in chunks[1]
+
+
+def test_split_short_tail_merged():
+    # 固定切法会留下 10 字尾段（< 半长 100）→ 收尾 pass 删掉相邻切点、
+    # 与较短邻块合并（只删切点，不引入新切点）→ 2 段。
+    src = "甲" * 300 + "\n\n" + "乙" * 300 + "\n\n" + "丙" * 10
+    chunks = split_into_chunks(src, max_size=200)
+    assert [len(c) for c in chunks] == [300, 312]
+    assert chunks[1] == "乙" * 300 + "\n\n" + "丙" * 10
+
+
+def test_split_keeps_lone_tail_title_block():
+    # 书末短标题块（6 字 < 半长 10）无法与左邻合并（合并块末行成标题 = 悬题）
+    # → 保留短块（允许，非异常）——标题独立成块，绝不丢失。
+    title = "第十章 舞会"
+    src = "甲" * 30 + "\n\n" + title
+    chunks = split_into_chunks(src, max_size=20)
+    assert chunks == ["甲" * 30, title]
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +348,9 @@ class _Handle:
     def progress(self, *a, **k):
         pass
 
+    def phase(self, *a):
+        pass  # display-neutral stage marker (generate_file's slot-scope handoff)
+
 
 class _LogHandle(_Handle):
     """A ``_Handle`` that also records ``log()`` calls as ``(level, msg)`` pairs."""
@@ -434,9 +505,10 @@ def test_split_keeps_lone_title_chunk():
     p2 = "景" * 100
     src = p1 + "\n\n" + title + "\n\n" + p2
     chunks = split_into_chunks(src, max_size=100)
-    # p1 (100) alone fills its chunk -> the title can't be appended -> it forms its
-    # own chunk; a chunk that IS a title is never emptied of it.
-    assert chunks == [p1, title, p2]
+    # 210 字 @100：段数 3 → 固定切法尾段 10 < 50 → 减一为 2 段，目标均长 105。
+    # 最近边界（108，标题之后）悬题（切后块末行是标题）→ 改判取次近边界 100
+    # （标题之前）——标题恒随其统领正文同段，不再独占一块。
+    assert chunks == [p1, title + "\n\n" + p2]
 
 
 # --------------------------------------------------------------------------- #
@@ -1989,3 +2061,526 @@ def test_generate_file_cancel_mid_spot_writes_nothing(tmp_path, monkeypatch, wor
         )
     assert not (workspace / "03_parsed_json" / "chapter.json").exists()
     assert not (workspace / "config" / "spot_check_history.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 角色匹配检查（chunk 边界重判——解析内第四检查阶段）
+# --------------------------------------------------------------------------- #
+
+def _window_from(user: str, end_marker: str) -> list:
+    """Extract the context-window JSON array at the head of a re-judgment / re-parse
+    user prompt (the window precedes the trailing instruction block)."""
+    return json.loads(user[:user.index(end_marker)])
+
+
+def _two_para_source() -> str:
+    """Two 3-line paragraphs (dialogue / narration / dialogue) — with chunk_size=50
+    this splits into exactly 2 chunks at the paragraph boundary."""
+    p1 = (
+        f"林某说：{LQ}这件事要慎重。{RQ}\n"
+        "夜色像潮水一样漫进街巷。\n"
+        f"林某说：{LQ}我们明天再谈。{RQ}"
+    )
+    p2 = (
+        f"李四说：{LQ}这件事我不同意。{RQ}\n"
+        "他点了点头。\n"
+        f"杜尘说：{LQ}那就先这样。{RQ}"
+    )
+    return p1 + "\n\n" + p2
+
+
+# 每段 3 条解析条目（对白 / 旁白 / 对白）
+PARSE_REPLY_P1 = json.dumps([
+    {"speaker": "林某", "text": f"{LQ}这件事要慎重。{RQ}", "instruct": "a"},
+    {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "b"},
+    {"speaker": "林某", "text": f"{LQ}我们明天再谈。{RQ}", "instruct": "c"},
+], ensure_ascii=False)
+PARSE_REPLY_P2 = json.dumps([
+    {"speaker": "李四", "text": f"{LQ}这件事我不同意。{RQ}", "instruct": "d"},
+    {"speaker": "NARRATOR", "text": "他点了点头。", "instruct": "e"},
+    {"speaker": "杜尘", "text": f"{LQ}那就先这样。{RQ}", "instruct": "f"},
+], ensure_ascii=False)
+
+
+def _expected_entries() -> list:
+    return [
+        {"speaker": "林某", "text": f"{LQ}这件事要慎重。{RQ}", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "b"},
+        {"speaker": "林某", "text": f"{LQ}我们明天再谈。{RQ}", "instruct": "c"},
+        {"speaker": "李四", "text": f"{LQ}这件事我不同意。{RQ}", "instruct": "d"},
+        {"speaker": "NARRATOR", "text": "他点了点头。", "instruct": "e"},
+        {"speaker": "杜尘", "text": f"{LQ}那就先这样。{RQ}", "instruct": "f"},
+    ]
+
+
+# 被测阶段之外的检查阶段全部关闭（调用数才能钉死）
+_STAGES_OFF = dict(revalidate_splits=False, delete_saying_tags=False, spot_check_rate=0.0)
+
+
+def _boundary_e2e(tmp_path, monkeypatch, workspace, rejudge_reply,
+                  parse_replies=(PARSE_REPLY_P1, PARSE_REPLY_P2), **gen_kwargs):
+    """双段源 e2e：解析回复固定，重判回复由测试经 ``rejudge_reply(user, state)``
+    供给（state = 共享调用计数）。返回 ``(handle, result, state)``。"""
+    gen = GenerationConfig(chunk_size=50, **gen_kwargs)
+    state = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        state["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        if "SOURCE TEXT:" in user:
+            if state["n"] <= len(parse_replies):
+                # 解析调用（前 N 次 = 按 chunk 序解析）
+                return _BodyResp(_chat_payload(parse_replies[state["n"] - 1]))
+            # 断句重推（同形 "SOURCE TEXT:" 用户提示）——同样交给测试
+            return _BodyResp(_chat_payload(rejudge_reply(user, state)))
+        # 边界重判（捆绑重判提示词，无 SOURCE TEXT 标记）
+        return _BodyResp(_chat_payload(rejudge_reply(user, state)))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "boundary.txt"
+    src.write_bytes(_two_para_source().encode("utf-8"))
+    handle = _LogHandle()
+    result = generate_file(handle, str(src), _LLM, PromptsConfig(), gen)
+    return handle, result, state
+
+
+def test_select_boundary_targets_unit():
+    # 单 chunk → 无内部边界 → 零目标
+    assert select_boundary_targets([6], 4, 6) == []
+    # n=0 → 零目标（窗宽 0 = 阶段退化为零 LLM 调用的空操作）
+    assert select_boundary_targets([3, 6], 0, 6) == []
+    # 单个内部边界 b=3、两侧各 n 条 → [3-1, 3+1)
+    assert select_boundary_targets([3, 6], 1, 6) == [2, 3]
+    # 相邻两边界窗口重叠 → 全局去重
+    assert select_boundary_targets([3, 5, 6], 2, 6) == [1, 2, 3, 4, 5]
+    # 边界贴近文件头/尾 → 钳入 [0, total)
+    assert select_boundary_targets([1, 6], 3, 6) == [0, 1, 2, 3]
+    assert select_boundary_targets([5, 6], 3, 6) == [2, 3, 4, 5]
+
+
+def test_boundary_single_chunk_silent(monkeypatch):
+    # 单 chunk 文件（无内部边界）→ 静默返回：零 LLM 调用、零日志行
+    # （与「零目标」留痕日志相区分——单段文件不是"阶段缺失"）
+    def boom(*a, **k):
+        raise AssertionError("no LLM call may happen")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    entries = [_entry("NARRATOR", "夜色像潮水一样漫进街巷。")]
+    handle = _LogHandle()
+    out, stats = boundary_check_speakers(handle, _LLM,
+                                         GenerationConfig(check_context_window=4),
+                                         entries, [1])
+    assert out is entries  # 原始列表对象身份（零修正）
+    assert stats == {"checked": 0, "fixed": 0}
+    assert handle.logs == []
+
+
+def test_boundary_zero_targets_leaves_log(monkeypatch):
+    # n=0 → 零边界目标：仍留一行日志（与断句校验同一理由——防静默退出被误读为
+    # 阶段缺失），零 LLM 调用
+    def boom(*a, **k):
+        raise AssertionError("no LLM call may happen")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    entries = [_entry("NARRATOR", "夜色。"), _entry("林某", "好。"),
+               _entry("NARRATOR", "他走了。"), _entry("李四", "嗯。")]
+    handle = _LogHandle()
+    out, stats = boundary_check_speakers(handle, _LLM,
+                                         GenerationConfig(check_context_window=0),
+                                         entries, [2, 4])
+    assert out is entries
+    assert stats == {"checked": 0, "fixed": 0}
+    assert handle.logs == [("INFO", "角色匹配检查：0 条边界目标（无重判，零 LLM 调用）")]
+
+
+def test_boundary_stage_switch_off(tmp_path, monkeypatch, workspace):
+    # check_boundary_speakers=False → 整体跳过：零重判 LLM 调用、一行「已关闭（配置）」
+    # 日志、结果字段保持 0；基文件照常落盘
+    def rejudge(user, state):
+        raise AssertionError("the boundary stage must be skipped entirely")
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge, **_STAGES_OFF,
+        check_context_window=1, check_boundary_speakers=False)
+    assert calls["n"] == 2  # 只有两次解析调用
+    assert result["boundary_checked"] == 0 and result["boundary_fixed"] == 0
+    assert any("角色匹配检查已关闭（配置）" in m for _l, m in handle.logs)
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    assert out == _expected_entries()
+
+
+def test_boundary_window_crosses_chunks_context_untouched(tmp_path, monkeypatch, workspace):
+    # 跨 chunk 窗口：窗口 = 目标块 ± n，首尾条目来自边界两侧的不同 chunk（正是解析时
+    # 被切断的上下文）；context 条目永不被改写——零修正时基文件 = 原始 6 条目
+    users = []
+
+    def rejudge(user, state):
+        users.append(user)
+        win = _window_from(user, "\n\nRe-judge")
+        return json.dumps({"results": [
+            {"index": it["index"], "speaker": it["speaker"]}
+            for it in win if it.get("target")
+        ]}, ensure_ascii=False)
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge, **_STAGES_OFF, check_context_window=1)
+    assert calls["n"] == 3  # 2 解析 + 1 重判（无分歧 → 无重试）
+    assert result["boundary_checked"] == 2 and result["boundary_fixed"] == 0
+
+    win = _window_from(users[0], "\n\nRe-judge")
+    assert [it["index"] for it in win] == [1, 2, 3, 4]
+    assert [it["index"] for it in win if it.get("target")] == [2, 3]
+    # 窗口首 = chunk 1 的边界侧条目、尾 = chunk 2 的边界侧条目（均未标 target 的上下文）
+    assert win[0] == {"index": 1, "speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。"}
+    assert win[3] == {"index": 4, "speaker": "NARRATOR", "text": "他点了点头。"}
+
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    assert out == _expected_entries()
+
+
+def test_boundary_majority_adoption(tmp_path, monkeypatch, workspace):
+    # 2:1 严格多数 → 修正生效：目标条目 speaker 被改写并随基文件落盘
+    # （context 条目保持原样）
+    def rejudge(user, state):
+        win = _window_from(user, "\n\nRe-judge")
+        return json.dumps({"results": [
+            {"index": it["index"],
+             "speaker": "李四" if it["index"] == 2 else it["speaker"]}
+            for it in win if it.get("target")
+        ]}, ensure_ascii=False)
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge, **_STAGES_OFF, check_context_window=1)
+    assert calls["n"] == 4  # 2 解析 + 首判 + 1 次投票重试（2:1 即决）
+    assert result["boundary_checked"] == 2 and result["boundary_fixed"] == 1
+
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    expected = _expected_entries()
+    expected[2]["speaker"] = "李四"
+    assert out == expected
+
+
+def test_boundary_no_consensus_keeps_original(tmp_path, monkeypatch, workspace):
+    # 5 个互异投票（原值 + 首判 + 3 次重试）→ 无严格多数 → 保留原值（从不猜），
+    # 条目原样落盘
+    flips = {3: "李四", 4: "NARRATOR", 5: "杜尘", 6: "王五"}
+
+    def rejudge(user, state):
+        win = _window_from(user, "\n\nRe-judge")
+        return json.dumps({"results": [
+            {"index": it["index"],
+             "speaker": flips[state["n"]] if it["index"] == 2 else it["speaker"]}
+            for it in win if it.get("target")
+        ]}, ensure_ascii=False)
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge, **_STAGES_OFF, check_context_window=1)
+    assert calls["n"] == 6  # 2 解析 + 首判 + 3 次重试（始终无共识）
+    assert result["boundary_fixed"] == 0
+    assert any("重试 3 次仍无共识" in m for _l, m in handle.logs)
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    assert out == _expected_entries()
+
+
+def test_boundary_cancel_mid_stage_writes_nothing(tmp_path, monkeypatch, workspace):
+    # 取消落在边界阶段的 LLM 调用上 → TaskCancelled 上抛：基文件不落盘
+    # （基文件在所有检查阶段返回后才写）
+    def rejudge(user, state):
+        raise TaskCancelled("cancel landed in the boundary stage")
+
+    with pytest.raises(TaskCancelled):
+        _boundary_e2e(tmp_path, monkeypatch, workspace, rejudge,
+                      **_STAGES_OFF, check_context_window=1)
+    assert not (workspace / "03_parsed_json" / "boundary.json").exists()
+
+
+def test_boundary_groups_use_pristine_windows(tmp_path, monkeypatch, workspace):
+    # check_batch_size=1 → 2 个单目标组（n=1 时边界两侧共 2 条目标）：第 1 组把 E2
+    # 改为 李四；第 2 组的窗口里 E2 作为未标记 context 条目出现，仍须显示原始 E2——
+    # 窗口恒由 pristine 列表预建，已应用的修正不回流
+    windows = []
+
+    def rejudge(user, state):
+        win = _window_from(user, "\n\nRe-judge")
+        windows.append(win)
+        return json.dumps({"results": [
+            {"index": it["index"],
+             "speaker": "李四" if (state["n"] in (3, 4) and it["index"] == 2) else it["speaker"]}
+            for it in win if it.get("target")
+        ]}, ensure_ascii=False)
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge, **_STAGES_OFF,
+        check_context_window=1, check_batch_size=1)
+    assert calls["n"] == 5  # 2 解析 + (首判 + 重试) + 首判
+    assert result["boundary_fixed"] == 1
+    # 第 1 组的重试逐字节复用首判窗口（同一预建窗口），其中 E2 仍是原值
+    assert windows[0] == windows[1]
+    assert all(it["index"] != 2 or it["speaker"] == "林某"
+               for win in windows[:2] for it in win)
+    # 第 2 组窗口 = E2, E3, E4：E2（context）仍是原始 林某，不是改后的 李四
+    # （context 条目不带 target 键——build_batch_window 只给 target 打标记）
+    g2 = {it["index"]: it for it in windows[2]}
+    assert "target" not in g2[2] and g2[2]["speaker"] == "林某"
+    assert g2[3].get("target") is True and g2[3]["speaker"] == "李四"
+    assert "target" not in g2[4] and g2[4]["speaker"] == "NARRATOR"
+    # 修正只落在 target 条目：E2 = 李四 进基文件，其余不动
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    expected = _expected_entries()
+    expected[2]["speaker"] = "李四"
+    assert out == expected
+
+
+def test_boundary_stage_ordering_before_revalidate(tmp_path, monkeypatch, workspace):
+    # 阶段顺序钉死：边界窗口取自 pristine 列表（E1 仍是 NARRATOR）；断句校验窗口
+    # 取自边界修正后的列表（E1 已是 林某）——边界阶段必须居检查段最前（断句拆条 /
+    # 标签删条都会移动下标，后两者的窗口必须看到改后列表）
+    e2_susp = f"{LQ}林某道：{LQ}我们明天再谈。{RQ}{RQ}"  # 解析回复的 E2 = 疑似断句失败形态
+    p1_susp = json.dumps([
+        {"speaker": "林某", "text": f"{LQ}这件事要慎重。{RQ}", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "b"},
+        {"speaker": "林某", "text": e2_susp, "instruct": "c"},
+    ], ensure_ascii=False)
+    rederive = json.dumps([{"speaker": "林某", "text": "我们明天再谈。"}], ensure_ascii=False)
+    boundary_users, revalidate_users = [], []
+
+    def rejudge(user, state):
+        if "SOURCE TEXT:" in user:
+            # 断句重推（两次相同回复 → 2:0）
+            revalidate_users.append(user)
+            return rederive
+        boundary_users.append(user)
+        win = _window_from(user, "\n\nRe-judge")
+        return json.dumps({"results": [
+            {"index": it["index"],
+             "speaker": "林某" if it["index"] == 1 else it["speaker"]}
+            for it in win if it.get("target")
+        ]}, ensure_ascii=False)
+
+    handle, result, calls = _boundary_e2e(
+        tmp_path, monkeypatch, workspace, rejudge,
+        parse_replies=(p1_susp, PARSE_REPLY_P2),
+        delete_saying_tags=False, spot_check_rate=0.0, check_context_window=2)
+    # 断句失败校验保持开启（默认）；2 解析 + 边界(首判 + 重试) + 断句(2 次同票)
+    assert calls["n"] == 6
+    assert result["boundary_checked"] == 4 and result["boundary_fixed"] == 1
+    assert result["suspicious"] == 1 and result["suspicious_fixed"] == 1
+    assert result["count"] == 6 and result["merged_narrator"] == 0
+
+    # 边界窗口（pristine）：E1 仍是原始 NARRATOR
+    b_items = {it["index"]: it for it in _window_from(boundary_users[0], "\n\nRe-judge")}
+    assert set(b_items) == {0, 1, 2, 3, 4, 5}
+    assert b_items[1]["speaker"] == "NARRATOR"
+    assert {i for i, it in b_items.items() if it.get("target")} == {1, 2, 3, 4}
+    # 断句窗口（改后）：E1 已是边界阶段修正的 林某
+    line = next(l for l in revalidate_users[0].splitlines()
+                if l.startswith('{"index": 1'))
+    assert json.loads(line)["speaker"] == "林某"
+    # 断句输入 = E2 的原文（边界阶段只改 speaker、不改 text）
+    i = revalidate_users[0].index("SOURCE TEXT:\n")
+    assert revalidate_users[0][i + len("SOURCE TEXT:\n"):] == e2_susp
+    # 基文件：E1 = 林某（边界修正，instruct 不动）；E2 = 断句重推（instruct 归空）
+    out = json.loads((workspace / "03_parsed_json" / "boundary.json").read_text("utf-8"))
+    assert out[1] == {"speaker": "林某", "text": "夜色像潮水一样漫进街巷。", "instruct": "b"}
+    assert out[2] == {"speaker": "林某", "text": "我们明天再谈。", "instruct": ""}
+
+
+# --------------------------------------------------------------------------- #
+# generate_file 槽位作用域（预备阶段不占槽；chunk 循环一结束即 release；排队可即时取消）
+# --------------------------------------------------------------------------- #
+
+class _GateSpy:
+    """Wraps the real shared gate and records acquire / release in event order."""
+
+    def __init__(self, real, events):
+        self._real = real
+        self._events = events
+        self.acquires = 0
+        self.releases = 0
+
+    def acquire(self, stop_check=None):
+        self.acquires += 1
+        self._events.append(("acquire", None))
+        return self._real.acquire(stop_check=stop_check)
+
+    def release(self):
+        self.releases += 1
+        self._events.append(("release", None))
+        self._real.release()
+
+    @property
+    def active(self):
+        return self._real.active
+
+
+class _TraceHandle(_LogHandle):
+    """A ``_LogHandle`` that also records progress / phase into a shared event list."""
+
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+
+    def progress(self, frac, current=""):
+        self._events.append(("progress", current))
+
+    def phase(self, name):
+        self._events.append(("phase", name))
+
+
+def test_generate_file_slot_scope(tmp_path, monkeypatch, workspace):
+    # 槽位只覆盖 LLM 分段解析阶段：预备（读文件 / 分 chunk）在 acquire 之前；release 恰好
+    # 发生在检查阶段入口日志之前；acquire / release 各恰一次且配平。
+    events: list = []
+    real_gate = concurrency.gate()
+    spy = _GateSpy(real_gate, events)
+    monkeypatch.setattr("backend.engines.script.gate", lambda: spy)
+
+    source = "夜色像潮水一样漫进街巷。"
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": source, "instruct": "a"},
+    ], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))
+
+    result = generate_file(
+        _TraceHandle(events), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(revalidate_splits=False, delete_saying_tags=False,
+                         spot_check_rate=0.0),
+    )
+    assert result["count"] == 1
+
+    def pos(kind, value):
+        return events.index((kind, value))
+
+    # 各恰一次：acquire 一次（返回 True 才进 try）、release 一次（成功路径在检查前释放）。
+    assert spy.acquires == 1 and spy.releases == 1
+    assert events.count(("acquire", None)) == 1 and events.count(("release", None)) == 1
+    # 「排队中」文案在取槽前；parse 阶段标记在取槽后。
+    assert pos("progress", "排队中（等待并发槽位）") < pos("acquire", None)
+    assert pos("phase", "parse") > pos("acquire", None)
+    # release 先于检查阶段入口（phase("check") 标记 + progress 0.9 文案）——预取补位点
+    # （引擎先发 phase 后发 progress，两者都在 release 之后；相对次序无功能意义）。
+    # 源为单段 → 角色匹配检查无内部边界、静默零调用，不产生额外事件。
+    check_mark = pos("progress", "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 归属抽样）")
+    assert pos("release", None) < pos("phase", "check")
+    assert pos("release", None) < check_mark
+    # 100% 只在真正完成时出现，且是最后一条事件。
+    assert pos("progress", "完成") == len(events) - 1
+    assert real_gate.active == 0  # 槽位配平
+
+
+def test_generate_file_cancel_while_queued(tmp_path, monkeypatch, workspace):
+    # C=1 且主线程持有唯一槽 → 任务停在 gate().acquire(stop_check=…) 排队；取消 → 一个
+    # 0.2s stop_check 轮询内弃位退出：CANCELLED、从未取槽、无产出（取消 ≠ 失败）。
+    source = "夜色像潮水一样漫进街巷。"
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": source, "instruct": "a"},
+    ], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))
+
+    saved = concurrency.gate().limit
+    g = concurrency.gate()
+    try:
+        concurrency.set_concurrency(1)
+        g.acquire()  # 主线程持有唯一槽位
+        mgr = TaskManager()
+        task = mgr.create(
+            "script", "文本解析（chapter.txt）",
+            generate_file, str(src), _LLM, PromptsConfig(),
+            GenerationConfig(revalidate_splits=False, delete_saying_tags=False,
+                             spot_check_rate=0.0),
+        )
+        # 等任务真正进入等槽队列（「排队中」进度文案是队列标记，勿改引擎文案）。
+        deadline = time.time() + 5
+        while time.time() < deadline and "排队" not in (task.current or ""):
+            time.sleep(0.02)
+        assert "排队" in (task.current or ""), "task never reached the slot queue"
+        assert g.active == 1  # 只有主线程持槽；任务仍在排队
+
+        t0 = time.time()
+        mgr.control(task.id, "cancel")
+        while task.status not in TERMINAL and time.time() - t0 < 2.0:
+            time.sleep(0.02)
+        assert task.status is TaskStatus.CANCELLED
+        assert time.time() - t0 < 1.0  # stop_check 0.2s 轮询内弃位，不是等满超时
+        assert task.error == ""  # 取消不是失败
+        assert g.active == 1  # 排队中的任务从未取走槽位
+    finally:
+        g.release()
+        concurrency.set_concurrency(saved)
+    assert not (workspace / "03_parsed_json" / "chapter.json").exists()
+
+
+def test_generate_file_cancel_mid_chunk_releases_once(tmp_path, monkeypatch, workspace):
+    # 取消落在第 1 段的 LLM 调用进行期间 → 调用返回后在下一段循环头的 check() 上抛
+    # TaskCancelled：acquire 恰 1 次 / release 恰 1 次（finally 配平路径，非成功路径的
+    # 提前 release），CANCELLED、槽位归还、无产出。
+    events: list = []
+    real_gate = concurrency.gate()
+    spy = _GateSpy(real_gate, events)
+    monkeypatch.setattr("backend.engines.script.gate", lambda: spy)
+
+    # 两个短段 + 小 chunk_size → 恰 2 段（段数公式给 4，被合法边界数钳回 2；
+    # 第 2 段的循环头 check() 承接取消）。
+    source = "夜色像潮水一样漫进街巷，行人渐稀。\n\n巷口的灯一盏盏亮起来。"
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷，行人渐稀。", "instruct": "a"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+    hold = threading.Event()
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            hold.wait(20)  # 停在第 1 段的 LLM 调用内——取消在此刻落下
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "chapter.txt"
+    src.write_bytes(source.encode("utf-8"))
+
+    saved = concurrency.gate().limit
+    try:
+        concurrency.set_concurrency(1)
+        mgr = TaskManager()
+        task = mgr.create(
+            "script", "文本解析（chapter.txt）",
+            generate_file, str(src), _LLM, PromptsConfig(),
+            GenerationConfig(chunk_size=8, revalidate_splits=False,
+                             delete_saying_tags=False, spot_check_rate=0.0),
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline and calls["n"] < 1:
+            time.sleep(0.02)
+        assert calls["n"] >= 1  # 任务已取槽并发出第 1 段解析
+        assert real_gate.active == 1
+
+        mgr.control(task.id, "cancel")
+        hold.set()  # 放行在途调用；下一段循环头的 check() 上抛 TaskCancelled
+
+        deadline = time.time() + 5
+        while time.time() < deadline and task.status not in TERMINAL:
+            time.sleep(0.02)
+        assert task.status is TaskStatus.CANCELLED
+        assert task.error == ""
+        assert spy.acquires == 1 and spy.releases == 1  # finally 配平：恰一次 release
+        assert real_gate.active == 0
+    finally:
+        hold.set()
+        concurrency.set_concurrency(saved)
+    assert not (workspace / "03_parsed_json" / "chapter.json").exists()

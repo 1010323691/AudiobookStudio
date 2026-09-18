@@ -2,10 +2,9 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
-import { generateScriptFiles } from '@/api/script'
+import { cancelParseBatch, generateScriptFiles } from '@/api/script'
 import { listDir } from '@/api/files'
 import { downloadFile } from '@/utils/fileops'
-import { formatBytes } from '@/utils/format'
 import type { FileItem, TaskSnapshot } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
@@ -39,7 +38,7 @@ const settings = useSettingsStore()
 const taskStore = useTaskStore()
 const { workspaceSet } = useWorkspaceGate()
 
-// LLM / 生成参数 / Prompt 的配置编辑在「设置」页（含解析内检查的两个开关）；本页
+// LLM / 生成参数 / Prompt 的配置编辑在「设置」页（含解析内检查的三个开关）；本页
 // 只从 settings.config 读取已保存的值（用于并发数显示与模型名校验），不再本地编辑 / 保存。
 
 // ---- File selection (02_split_text) + per-file parse jobs ------------------------
@@ -59,6 +58,11 @@ const selected = reactive<Record<string, boolean>>({})
 const selectedNames = computed(() => files.value.filter((f) => selected[f.name]).map((f) => f.name))
 const doneCount = computed(() => files.value.filter((f) => f.done).length)
 const allSelected = computed(() => files.value.length > 0 && files.value.every((f) => selected[f.name]))
+const allPendingSelected = computed(() => {
+  const pending = files.value.filter((f) => !f.done)
+  return pending.length > 0 && pending.every((f) => selected[f.name])
+})
+const selectedDoneCount = computed(() => files.value.filter((f) => f.done && selected[f.name]).length)
 
 const error = ref('')
 const fileJobs = ref<{ name: string; taskId: string }[]>([])
@@ -84,10 +88,14 @@ function jobState(task: TaskSnapshot | undefined): JobState {
       return { label: '已暂停', variant: 'secondary' }
     case 'running':
       // Still waiting on the concurrency gate reads as "queued", not actively working.
-      if (/排队/.test(task.current || '')) return { label: '待处理', variant: 'secondary' }
+      // （后端排队文案含「排队」二字，勿改文案否则此判定失效。）
+      if (/排队/.test(task.current || '')) return { label: '排队', variant: 'secondary' }
       return { label: '解析中', variant: 'default' }
+    case 'pending':
+      // PENDING 壳：批次协调者尚未投放（有序投放 + 有限预取）。
+      return { label: '排队', variant: 'secondary' }
     default:
-      return { label: '待处理', variant: 'secondary' }
+      return { label: '排队', variant: 'secondary' }
   }
 }
 
@@ -96,20 +104,29 @@ interface JobRow {
   taskId: string
   task: TaskSnapshot | undefined
   state: JobState
+  /** Badge 文案：排队时带等待位置（1 基序号 / 批内总数，= 投放顺序）。 */
+  stateText: string
+  /** 1 基投放位置（fileJobs 下标 + 1；F5 恢复后按 task.seq 升序重建 = 原勾选序）。 */
+  queueIndex: number
+  queueTotal: number
   progress: number
   active: boolean
   error: string
   outputName: string
 }
 const jobRows = computed<JobRow[]>(() =>
-  fileJobs.value.map((j) => {
+  fileJobs.value.map((j, idx) => {
     const task = jobTask(j.taskId)
     const status = task?.status
+    const state = jobState(task)
     return {
       name: j.name,
       taskId: j.taskId,
       task,
-      state: jobState(task),
+      state,
+      stateText: state.label === '排队' ? `排队 ${idx + 1}/${fileJobs.value.length}` : state.label,
+      queueIndex: idx + 1,
+      queueTotal: fileJobs.value.length,
       progress: task?.progress ?? 0,
       active: status === 'pending' || status === 'running' || status === 'paused',
       error: task?.error || '',
@@ -119,6 +136,24 @@ const jobRows = computed<JobRow[]>(() =>
     }
   }),
 )
+
+const jobRowByName = computed(() => new Map(jobRows.value.map((r) => [r.name, r])))
+
+/** 选择区渲染行 = 磁盘文件 + 本批进度行（若在该批中）。文件行即进度行：
+ *  批次内文件直接在此显示状态 / 速度 / 进度条 / 取消·重试·下载。 */
+const fileRows = computed(() =>
+  files.value.map((f) => ({ file: f, job: jobRowByName.value.get(f.name) })),
+)
+
+/** 行内进度条指示色：完成=emerald、失败=destructive、取消=muted、其余（排队/处理中）=primary。 */
+function progressIndicator(row: JobRow): string {
+  switch (row.state.label) {
+    case '已完成': return 'bg-emerald-500'
+    case '失败': return 'bg-destructive'
+    case '已取消': return 'bg-muted-foreground/40'
+    default: return 'bg-primary'
+  }
+}
 
 // "In flight" while any job's task hasn't reached a terminal state (drives the button).
 const busy = computed(() => jobRows.value.some((r) => r.active))
@@ -136,9 +171,14 @@ const concurrencyWarning = computed(() => {
   const eff = effectiveConcurrency.value
   if (eff >= n) return ''
   return eff === 1
-    ? `并发数为 1，将串行逐个解析这 ${n} 个文件（一个完整跑完才开始下一个），无法并发。请在上方「并发数」设为 ≥ ${n} 以同时解析。`
-    : `并发数（${eff}）小于所选文件数（${n}）：前 ${eff} 个文件并发解析，其余 ${n - eff} 个排队，待有槽位时再逐个进行。`
+    ? `并发数为 1，将串行逐个解析这 ${n} 个文件（一个完整跑完才开始下一个），无法并发。请在「设置」页把「并发数」设为 ≥ ${n} 以同时解析。`
+    : `并发数（${eff}）小于所选文件数（${n}）：前 ${eff} 个文件并发解析，之后按序预取投放（预取深度 4），其余排队，前面的文件进入机械检查后空出的槽位会立即补给后面的文件。`
 })
+
+// 解析日志区显隐（设置页「解析日志显示」，默认关）：开 = 显示「解析进度」Card
+// （每文件实时日志 + 流式反馈，三指标在 Card 内）；关 = 整个 Card 隐藏、三指标移到
+// 「开始处理」按钮下方。保存设置后立即生效（settings.config 是响应式的）。
+const showParseLogs = computed(() => settings.config?.ui.show_parse_logs ?? false)
 
 // ---- 性能指标（顶部 3 卡）：并发数 / 吞吐量 / 处理速度 ---------------------------
 // 吞吐量 (字/s): 各运行中窗口「近 10 秒平均」生成速率之和。每个任务的 10 秒窗口速率
@@ -151,7 +191,7 @@ const totalTps = computed(() => {
   return sum
 })
 
-// 一批解析结束后自动刷新文件列表：把刚生成 JSON 的文件标记为「已完成」并收起其勾选。
+// 一批解析结束后自动刷新文件列表：把刚生成 JSON 的文件标记为「已完成」（既有勾选保留）。
 watch(busy, (b, was) => {
   if (was && !b) loadFiles()
 })
@@ -172,14 +212,38 @@ const speedCps = computed(() => {
   return secs > 0 ? chars / secs : 0
 })
 
+// 三指标的统一数据源（日志区开 = 「解析进度」Card 顶部；关 = 「开始处理」按钮下方紧凑卡）。
+const metrics = computed(() => [
+  {
+    label: '并发数',
+    value: String(effectiveConcurrency.value),
+    title: '当前配置的同时解析文件数（超过并发的文件排队，前面的文件进入机械检查后槽位立即补给后面的文件）',
+  },
+  {
+    label: '吞吐量（字/s）',
+    value: String(Math.round(totalTps.value)),
+    title: '近 10 秒平均：各运行中窗口「近 10 秒生成字符 ÷ 对应秒数」之和（后端按真实流式字符计算，平滑不抖动）',
+  },
+  {
+    label: '处理速度（字/s）',
+    value: String(Math.round(speedCps.value)),
+    title: '累计平均：Σ已完成源字符 ÷ Σ累计处理耗时（自批次开始；每完成一段刷新、段间恒定）',
+  },
+])
+
 // 刷新恢复：页面重载后 fileJobs 为空，但后端任务仍在跑（store 的 refresh 已拉回全量任务）。
-// 按 module + label 重新挂接非终态解析任务——label 形如「文本解析（{文件名}）」（全角括号）。
+// 按 module + label 重新挂接非终态解析任务——label 形如「文本解析（{文件名}）」（全角括号，
+// 后端 api/script.py 的 label 格式，勿改）。恢复顺序按 task.seq（后端单调创建序）升序重建 =
+// 原勾选/投放顺序，排队位置 N/总 因此与刷新前一致。批次注册表在进程内存、重启即失，恢复不依赖它。
 function reattachJobs() {
+  const pending: { name: string; taskId: string; seq: number }[] = []
   for (const t of taskStore.activeTasks('script')) {
     if (fileJobs.value.some((j) => j.taskId === t.id)) continue
     const m = t.label.match(/文本解析（(.+)）$/)
-    if (m) fileJobs.value.push({ name: m[1], taskId: t.id })
+    if (m) pending.push({ name: m[1], taskId: t.id, seq: t.seq })
   }
+  pending.sort((a, b) => a.seq - b.seq)
+  for (const p of pending) fileJobs.value.push({ name: p.name, taskId: p.taskId })
 }
 
 onMounted(async () => {
@@ -223,6 +287,14 @@ async function loadFiles() {
 }
 
 function selectAll() {
+  // 【全选】= 只勾未完成的条目（先清空，避免残留已完成的勾选；幂等）。
+  clearAll()
+  files.value.forEach((f) => {
+    if (!f.done) selected[f.name] = true
+  })
+}
+function selectAllAll() {
+  // 【全量全选】= 无视状态全勾（含已完成）；执行时按实际勾选原样提交，不做状态二次过滤。
   files.value.forEach((f) => {
     selected[f.name] = true
   })
@@ -259,6 +331,24 @@ function cancelJob(task: TaskSnapshot | undefined) {
   if (task) taskStore.control(task.id, 'cancel')
 }
 
+function retryJob(task: TaskSnapshot | undefined) {
+  if (task) taskStore.control(task.id, 'retry')
+}
+
+/** 【取消全部】：一次取消本批所有排队 + 在跑任务，并停止批次继续投放后续文件。
+ *  走专用端点（单个任务 cancel 表达不了「停止投放」，否则协调者会继续把剩余文件投出去）；
+ *  端点失败时回退为逐任务 cancel（投放停止缺失但取消本身可达）。 */
+async function cancelAll() {
+  const ids = jobRows.value.filter((r) => r.active).map((r) => r.taskId)
+  if (!ids.length) return
+  try {
+    await cancelParseBatch(ids)
+  } catch {
+    for (const id of ids) taskStore.control(id, 'cancel')
+  }
+  await taskStore.refresh()
+}
+
 function downloadJob(row: JobRow) {
   downloadFile('03_parsed_json', row.outputName)
 }
@@ -271,9 +361,10 @@ function downloadJob(row: JobRow) {
         <ScanText class="h-6 w-6" />文本解析
       </h1>
       <p class="mt-1 text-muted-foreground">
-        从 <code class="text-xs">02_split_text/</code> 勾选要解析的分册文本（可多选），每个文件作为独立任务
-        并发调用 LLM（并发数可配），分别生成 <code class="text-xs">03_parsed_json/&lt;文件基名&gt;.json</code>；
-        每个文件独立成败、互不影响。
+        从 <code class="text-xs">02_split_text/</code> 勾选要解析的分册文本（可多选），按勾选顺序依次投放：
+        并发槽内的文件并发调用 LLM 解析（并发数可配），槽位之外按序预取（预取深度 4），
+        前面的文件进入机械检查后空出的槽位立即补给后续文件；每个文件分别生成
+        <code class="text-xs">03_parsed_json/&lt;文件基名&gt;.json</code>、独立成败、互不影响。
       </p>
     </div>
 
@@ -286,6 +377,7 @@ function downloadJob(row: JobRow) {
         <CardDescription>
           列出工作空间 <code class="text-xs">02_split_text/</code> 下的分册文本，勾选要处理的分册（可多选）；
           已生成 <code class="text-xs">03_parsed_json/</code> 的标记为「已完成」（可再次勾选以重新解析 / 跑其他流程）。
+          【全选】只勾未完成条目；【全量全选】无视状态勾选全部（含已完成）；执行均按实际勾选原样提交。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
@@ -298,22 +390,73 @@ function downloadJob(row: JobRow) {
           v-else-if="files.length"
           class="max-h-80 space-y-1 overflow-y-auto rounded-md border p-2"
         >
-          <label
-            v-for="f in files"
-            :key="f.name"
-            class="flex cursor-pointer items-center gap-3 rounded px-2 py-1.5 hover:bg-accent/50"
+          <!-- 文件行 = 进度行：本批文件直接在此显示 状态（含排队位置）/ 速度 / 进度条 /
+               取消·重试·下载（行内按钮不包在 <label> 里，避免点按钮连带切换勾选）。 -->
+          <div
+            v-for="row in fileRows"
+            :key="row.file.name"
+            class="rounded px-2 py-1.5 hover:bg-accent/50"
           >
-            <input
-              type="checkbox"
-              class="h-4 w-4 shrink-0 accent-primary"
-              :checked="!!selected[f.name]"
-              :disabled="busy"
-              @change="onFileChange(f.name, $event)"
-            />
-            <span class="min-w-0 flex-1 truncate text-sm">{{ f.name }}</span>
-            <Badge v-if="f.done" variant="success" class="shrink-0">已完成</Badge>
-            <span class="shrink-0 text-xs text-muted-foreground">{{ formatBytes(f.size) }}</span>
-          </label>
+            <div class="flex items-center gap-3">
+              <label class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                <input
+                  type="checkbox"
+                  class="h-4 w-4 shrink-0 accent-primary"
+                  :checked="!!selected[row.file.name]"
+                  :disabled="busy"
+                  @change="onFileChange(row.file.name, $event)"
+                />
+                <span class="min-w-0 truncate text-sm" :title="row.file.name">{{ row.file.name }}</span>
+              </label>
+              <template v-if="row.job">
+                <Badge :variant="row.job.state.variant" class="shrink-0">{{ row.job.stateText }}</Badge>
+                <span
+                  class="shrink-0 text-xs tabular-nums"
+                  :class="row.job.state.label === '解析中' ? 'text-primary' : 'text-muted-foreground'"
+                  title="本窗口近 10 秒平均生成速度（字/s，按 LLM 流式输出实测）"
+                >{{ row.job.state.label === '解析中' ? `${Math.round(row.job.task?.llm_cps_10s ?? 0)} 字/s` : '—' }}</span>
+                <Progress
+                  :value="row.job.progress"
+                  :indicator-class="progressIndicator(row.job)"
+                  class="h-1.5 w-24 shrink-0 sm:w-32"
+                />
+                <span class="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                  {{ Math.round(row.job.progress * 100) }}%
+                </span>
+                <Button
+                  v-if="row.job.active"
+                  variant="outline"
+                  size="sm"
+                  class="shrink-0"
+                  @click="cancelJob(row.job.task)"
+                >
+                  <XCircle class="h-3.5 w-3.5" />取消
+                </Button>
+                <Button
+                  v-else-if="row.job.state.label === '失败'"
+                  variant="outline"
+                  size="sm"
+                  class="shrink-0"
+                  @click="retryJob(row.job.task)"
+                >
+                  <RefreshCw class="h-3.5 w-3.5" />重试
+                </Button>
+                <Button
+                  v-else-if="row.job.state.label === '已完成'"
+                  variant="outline"
+                  size="sm"
+                  class="shrink-0"
+                  @click="downloadJob(row.job)"
+                >
+                  <Download class="h-3.5 w-3.5" />下载 JSON
+                </Button>
+              </template>
+              <Badge v-else-if="row.file.done" variant="success" class="shrink-0">已完成</Badge>
+            </div>
+            <p v-if="row.job && row.job.state.label === '失败'" class="mt-1 pl-7 text-xs text-destructive">
+              {{ row.job.error || '解析失败' }}
+            </p>
+          </div>
         </div>
         <p v-else class="text-sm text-muted-foreground">
           02_split_text/ 下暂无 .txt 文件——请先到「排版与分册」生成分册。
@@ -321,7 +464,10 @@ function downloadJob(row: JobRow) {
 
         <div class="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" :disabled="busy || !files.length" @click="selectAll">
-            <ListChecks class="h-3.5 w-3.5" />{{ allSelected ? '已全选' : '全选' }}
+            <ListChecks class="h-3.5 w-3.5" />{{ allPendingSelected ? '已选' : '全选' }}
+          </Button>
+          <Button variant="outline" size="sm" :disabled="busy || !files.length" @click="selectAllAll">
+            <ListChecks class="h-3.5 w-3.5" />{{ allSelected ? '已全选' : '全量全选' }}
           </Button>
           <Button variant="outline" size="sm" :disabled="busy || !files.length" @click="clearAll">
             <Eraser class="h-3.5 w-3.5" />清空
@@ -332,6 +478,7 @@ function downloadJob(row: JobRow) {
           <span class="ml-auto text-xs text-muted-foreground">
             已选 {{ selectedNames.length }} / {{ files.length }} 个
             <span v-if="doneCount"> · 已完成 {{ doneCount }} 个</span>
+            <span v-if="selectedDoneCount"> · 含已完成 {{ selectedDoneCount }}</span>
             · 并发 {{ settings.config?.generation.max_concurrency ?? '—' }}
           </span>
         </div>
@@ -345,8 +492,23 @@ function downloadJob(row: JobRow) {
           <Button class="min-w-[10rem] flex-1" :disabled="!selectedNames.length || !workspaceSet || busy" @click="startParse">
             <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
             <ScanText v-else class="h-4 w-4" />
-            {{ busy ? '处理中…' : '开始解析' }}
+            {{ busy ? '处理中…' : '开始处理' }}
           </Button>
+          <Button v-if="busy" variant="destructive" @click="cancelAll">
+            <XCircle class="h-4 w-4" />取消全部
+          </Button>
+        </div>
+
+        <!-- 性能指标（日志区关闭时显示在按钮下方；开启时三指标在「解析进度」Card 内） -->
+        <div v-if="!showParseLogs && fileJobs.length" class="flex flex-wrap gap-3">
+          <div
+            v-for="m in metrics"
+            :key="m.label"
+            class="min-w-[7rem] flex-1 rounded-md border bg-muted/30 px-3 py-2"
+          >
+            <div class="text-xs text-muted-foreground" :title="m.title">{{ m.label }}</div>
+            <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ m.value }}</div>
+          </div>
         </div>
       </CardContent>
       <CardFooter>
@@ -358,35 +520,32 @@ function downloadJob(row: JobRow) {
       </CardFooter>
     </Card>
 
-    <!-- 解析进度（每文件一行） -->
-    <Card v-if="fileJobs.length">
+    <!-- 解析进度（每文件一行）：仅「解析日志显示」开启时渲染整个 Card
+         （实时日志 + 流式反馈 + 三指标）；关闭时由上方按钮下的紧凑指标卡替代。 -->
+    <Card v-if="fileJobs.length && showParseLogs">
       <CardHeader>
         <CardTitle class="flex items-center gap-2"><ScanText class="h-5 w-5" />解析进度</CardTitle>
         <CardDescription>
-          每个文件一个独立任务：待处理 / 解析中 / 已完成 / 失败 / 已取消；一个文件失败不影响其他。
+          每个文件一个独立任务：排队 / 解析中 / 已完成 / 失败 / 已取消 / 已暂停；一个文件失败不影响其他。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
         <!-- 性能指标（顶部 3 卡）：并发数（当前配置）/ 吞吐量（各运行中窗口「近 10 秒平均」字/s 之和，随 SSE 实时刷新）/ 处理速度（累计已处理字÷累计处理耗时，每完成一段刷新、段间恒定） -->
         <div class="grid gap-3 sm:grid-cols-3">
-          <div class="rounded-md border bg-muted/30 px-3 py-2">
-            <div class="text-xs text-muted-foreground">并发数</div>
-            <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ effectiveConcurrency }}</div>
-          </div>
-          <div class="rounded-md border bg-muted/30 px-3 py-2">
-            <div class="text-xs text-muted-foreground" title="近 10 秒平均：各运行中窗口「近 10 秒生成字符 ÷ 对应秒数」之和（后端按真实流式字符计算，平滑不抖动）">吞吐量（字/s）</div>
-            <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ Math.round(totalTps) }}</div>
-          </div>
-          <div class="rounded-md border bg-muted/30 px-3 py-2">
-            <div class="text-xs text-muted-foreground" title="累计平均：Σ已完成源字符 ÷ Σ累计处理耗时（自批次开始；每完成一段刷新、段间恒定）">处理速度（字/s）</div>
-            <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ Math.round(speedCps) }}</div>
+          <div
+            v-for="m in metrics"
+            :key="m.label"
+            class="rounded-md border bg-muted/30 px-3 py-2"
+          >
+            <div class="text-xs text-muted-foreground" :title="m.title">{{ m.label }}</div>
+            <div class="mt-0.5 text-lg font-semibold tabular-nums">{{ m.value }}</div>
           </div>
         </div>
 
         <div v-for="row in jobRows" :key="row.taskId" class="space-y-2 rounded-md border p-3">
           <div class="flex items-center gap-3">
             <span class="min-w-0 flex-1 truncate text-sm font-medium" :title="row.name">{{ row.name }}</span>
-            <Badge :variant="row.state.variant">{{ row.state.label }}</Badge>
+            <Badge :variant="row.state.variant">{{ row.stateText }}</Badge>
             <span
               class="shrink-0 text-xs tabular-nums"
               :class="row.state.label === '解析中' ? 'text-primary' : 'text-muted-foreground'"
@@ -399,6 +558,14 @@ function downloadJob(row: JobRow) {
               <XCircle class="h-3.5 w-3.5" />取消
             </Button>
             <Button
+              v-else-if="row.state.label === '失败'"
+              variant="outline"
+              size="sm"
+              @click="retryJob(row.task)"
+            >
+              <RefreshCw class="h-3.5 w-3.5" />重试
+            </Button>
+            <Button
               v-else-if="row.state.label === '已完成'"
               variant="outline"
               size="sm"
@@ -408,7 +575,7 @@ function downloadJob(row: JobRow) {
             </Button>
           </div>
 
-          <Progress :value="row.progress" />
+          <Progress :value="row.progress" :indicator-class="progressIndicator(row)" />
 
           <div class="flex items-stretch gap-3">
             <!-- 左：解析进度日志（现有窗口，行为不变；任务结束后收起，把整行让给右侧） -->

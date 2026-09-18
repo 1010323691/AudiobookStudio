@@ -14,6 +14,7 @@ takes a slot is matched by exactly one ``release``.
 from __future__ import annotations
 
 import threading
+from typing import Callable
 
 
 class ConcurrencyGate:
@@ -47,12 +48,27 @@ class ConcurrencyGate:
         with self._cond:
             return self._active
 
-    def acquire(self) -> None:
-        """Block until a slot is free, then take it."""
+    def acquire(self, stop_check: Callable[[], bool] | None = None) -> bool:
+        """Block until a slot is free, then take it (returns ``True``).
+
+        When ``stop_check`` is supplied the wait is cooperative: the predicate is
+        re-checked every 0.2 s while blocked, and once it returns ``True`` the wait is
+        abandoned WITHOUT taking a slot (returns ``False``). The caller must then abort
+        (e.g. raise ``TaskCancelled``) and must NOT call ``release`` — no slot was
+        taken. ``stop_check=None`` keeps the original notify-driven blocking
+        semantics (also returns ``True``). Existing callers ignore the return value,
+        so the ``None`` path is byte-for-byte the old behaviour.
+        """
         with self._cond:
             while self._active >= self._limit:
-                self._cond.wait()
+                if stop_check is not None:
+                    if stop_check():
+                        return False
+                    self._cond.wait(0.2)
+                else:
+                    self._cond.wait()
             self._active += 1
+            return True
 
     def release(self) -> None:
         """Free the slot this thread took (guarded against underflow)."""

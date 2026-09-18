@@ -116,7 +116,7 @@ def max_new_tokens_for_chars(chars: int) -> int:
 # row in a length-mixed batch runs the long row's full cap (the 2026-09-17 "几十字 + 几个字
 # 同批" slowdown). Tightened from 5 to 3: a 3x spread keeps the shared cap close to the
 # shorter rows' natural length (a 2-char line next to a 6-char one still batches; 2 next to
-# 7 splits), so per-character, length-sorted groups stay fast in practice.
+# 7 splits), so the per-type, length-sorted unified queues stay fast in practice.
 LENGTH_RATIO = 3
 
 # Fixed input tokens a row carries BEYOND its target text (role marker + codec prefill + tts
@@ -539,26 +539,24 @@ def band_cap_for_chars(n_chars, manual_cap):
 
 
 def order_speaker_groups(classified):
-    """Per-character execution groups, ordered most-lines-first (pure).
+    """Per-key execution queues, ordered most-rows-first (pure, key-generic).
 
-    ``classified`` maps ``key -> [row, ...]`` — in batch mode the key is
-    ``(vtype, speaker)`` (a speaker's rows all share one voice entry, so the vtype is
-    uniform within a key); in design-batch mode the key is the speaker — in the order each
-    key FIRST appears (dict insertion order). Returns ``[(key, rows), ...]``:
+    ``classified`` maps ``key -> [row, ...]`` — in batch mode the key is the voice type:
+    one UNIFIED queue per model, merging every character's rows (the cross-character
+    tensor sub-batches; see ``_run_batch``) — in the order each key FIRST appears (dict
+    insertion order). Returns ``[(key, rows), ...]``:
 
-      * groups are ordered by line count DESCENDING — the character with the most lines
-        runs first (the heaviest share of the run starts immediately: fastest visible
-        progress, and the governor's measured cap settles while most rows are still to
-        do); ties keep first-seen order (deterministic for a given input file);
-      * each group's rows are sorted by length ascending, so a sub-batch drawn from them
+      * queues are ordered by row count DESCENDING — the biggest queue runs first (the
+        heaviest share of the run starts immediately: fastest visible progress, and the
+        governor's measured cap settles while most rows are still to do); ties keep
+        first-seen order (deterministic for a given input file);
+      * each queue's rows are sorted by length ascending, so a sub-batch drawn from it
         stays length-homogeneous (``LENGTH_RATIO``) and the decode cap (longest row x
-        ``FRAME_CAP_PER_CHAR``) hugs the rows' true length instead of some other character's
-        longer lines.
-
-    One character's rows never mix with another character's: the old cross-character pools
-    (ALL custom rows in one group, ALL design rows in another) are exactly how a 2-char
-    line ended up batched with a 40-char one — and every row then ran the 40-char cap
-    (batch mode does not stop short rows at EOS).
+        ``FRAME_CAP_PER_CHAR``) hugs the rows' true length. The sort spans characters —
+        which is what lets the cross-character mix stay safe: same-length rows from
+        different characters batch together, while the old cross-character pools (a 2-char
+        line batched with a 40-char one, every row then running the 40-char cap) are
+        prevented by the length ordering itself.
     """
     groups = [(key, sorted(rows, key=lambda r: r["chars"]))
               for key, rows in classified.items() if rows]
@@ -741,16 +739,26 @@ def plan_row_tokens(texts, instructs, overhead):
     """Per-row input token counts for the VRAM budget, from char counts alone (no tokenizer).
 
     ``chars x CHAR_TOKENS_PER_CHAR`` (a conservative over-estimate for Chinese) over the row's
-    target text + instruct, plus the fixed ``overhead`` a row carries BEYOND its target text
+    target text + instruct, plus the per-row ``overhead`` a row carries BEYOND its target text
     (structural markers, and for clone the reference frames + ref_text — see
-    ``_clone_input_overhead``). The O(L^2) attention term is sized by the longest row's full
-    input length, so dropping the overhead systematically under-sizes the budget and admits
-    oversized batches.
+    ``_clone_input_overhead``). ``overhead`` may be a scalar (applied to every row) or a
+    per-row list: a cross-character clone sub-batch carries each character's measured
+    reference overhead on its own rows (different references have different frame counts),
+    so the budget prices every row against its TRUE sequence length. A mismatched list
+    falls back to its max — the conservative (over-estimating, batch-shrinking) direction.
+    The O(L^2) attention term is sized by the longest row's full input length, so dropping
+    the overhead systematically under-sizes the budget and admits oversized batches.
     """
     if instructs is None:
         instructs = [""] * len(texts)
-    return [max(1, int((len(t) + len(i)) * CHAR_TOKENS_PER_CHAR)) + max(0, int(overhead))
-            for t, i in zip(texts, instructs)]
+    if isinstance(overhead, (list, tuple)):
+        per_row = [max(0, int(o)) for o in overhead]
+        if len(per_row) != len(texts):
+            per_row = [max(per_row, default=0)] * len(texts)
+    else:
+        per_row = [max(0, int(overhead))] * len(texts)
+    return [max(1, int((len(t) + len(i)) * CHAR_TOKENS_PER_CHAR)) + o
+            for t, i, o in zip(texts, instructs, per_row)]
 
 
 def _clone_input_overhead(prompt, voice_data):
@@ -1248,6 +1256,12 @@ def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed, *, force
     lines (that happens on the main thread after the watchdog returns, so the ``[segment]`` /
     ``[progress]`` stream stays single-threaded and monotonic).
 
+    A sub-batch may mix CHARACTERS: the list API takes per-row speaker / instruct / clone-prompt
+    values (the model builds each row's ICL prefill from its own reference — see
+    ``modeling_qwen3_tts.generate``), so ``clone_prompts`` is a per-character cache and each
+    row indexes its own character's prompt item. A single-character batch passes the same
+    item on every row — the exact broadcast the old single-speaker code produced.
+
     ``force_do_sample`` is design-batch-only: sampling is forced on so a checkpoint whose
     generate_config disables it (greedy decode) cannot make identical-input candidates
     byte-identical. Batch mode never sets it — its behaviour is unchanged.
@@ -1269,8 +1283,9 @@ def _generate_rows(model, vtype, rows, args, clone_prompts, batch_seed, *, force
             text=texts, language=args.language, speaker=speakers, instruct=instructs,
             non_streaming_mode=True, max_new_tokens=cap)
     elif vtype == "clone":
-        # a clone sub-batch is single-speaker; the per-speaker length-1 prompt broadcasts to N
-        prompt = clone_prompts[rows[0]["speaker"]]
+        # per-row clone prompts: one tensor call may serve several characters, each row
+        # conditioned on its own reference (the API matches prompt items to rows 1:1)
+        prompt = [clone_prompts[r["speaker"]][0] for r in rows]
         wavs, _sr = model.generate_voice_clone(
             text=texts, voice_clone_prompt=prompt,
             non_streaming_mode=True, max_new_tokens=cap)
@@ -1516,6 +1531,11 @@ def plan_next_sub_batch(remaining, *, vtype, overhead, params, budget, gov,
     VramGovernor cap is never closable and always applies. The planner's first batch is
     always a prefix of the (ascending) rows, so the remainder is well defined. Returns
     ``(batch_rows, remaining_rows)``.
+
+    ``overhead`` is the per-row input overhead for the VRAM budget: a scalar (every row the
+    same — custom / design rows, or a single-character clone run) or a per-row list (a
+    cross-character clone round, where each row carries its own character's measured
+    reference overhead).
     """
     tokens = plan_row_tokens([r["text"] for r in remaining],
                              [_effective_instruct(r, vtype) for r in remaining], overhead)
@@ -1552,14 +1572,21 @@ def _run_batch(args) -> int:
     ``--concurrency`` is only a ceiling: the real per-batch size follows the length bands
     (short rows run at the full cap, long rows step down, extreme rows run solo) and a measured
     VramGovernor that shrinks / grows it batch by batch from the GPU's actual VRAM consumption
-    and throughput (never chasing 100% VRAM). Rows run PER CHARACTER — the characters are
-    processed in line-count descending order (the most-line character, usually NARRATOR,
-    first), and within a character the rows run ascending by length (short first: early
-    progress + crash resilience; a sub-batch never mixes lengths beyond ``LENGTH_RATIO``);
-    files are still named by segment index, so the generation order never affects the
-    assembled audiobook. Each sub-batch runs under a watchdog that kills
-    the process on a hang (exit 124) so the backend can shrink and restart. A per-segment fault
-    (missing config, model error) is a recorded ``[segment]`` line, never a run abort.
+    and throughput (never chasing 100% VRAM).
+
+    Rows run in **per-type unified queues** — one length-ascending stream per voice type
+    (custom / clone / design), ALL characters merged, so a sub-batch may mix characters:
+    the model API takes per-row speaker / instruct / clone-prompt values, and the length
+    homogeneity that keeps the decode cap honest (the 2026-09-17 cross-character-pool
+    slowdown: a 2-char line batched with a 40-char one ran the 40-char cap) is now enforced
+    by the queue's length ordering instead of by a per-character partition. Queues run
+    most-rows-first (the heaviest model's share starts immediately); within a queue the
+    rows run ascending by length (short first: early progress + crash resilience; a
+    sub-batch never mixes lengths beyond ``LENGTH_RATIO``). Files are still named by segment
+    index, so the generation order never affects the assembled audiobook. Each sub-batch
+    runs under a watchdog that kills the process on a hang (exit 124) so the backend can
+    shrink and restart. A per-segment fault (missing config, model error) is a recorded
+    ``[segment]`` line, never a run abort.
     """
     import json as _json
 
@@ -1640,19 +1667,23 @@ def _run_batch(args) -> int:
     log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
         f"顶格 {MAX_NEW_TOKENS} 帧）——批量模式模型不按行提前停，短行批不再跑满全程")
     if "length_ratio" not in disabled:
-        log(f"分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序，"
-            f"批内长度比 ≤{LENGTH_RATIO} —— 同批字数接近，解码上限不再被混入的长行抬高")
+        log(f"分组：按类型分跨角色统一队列（行数最多的队列先跑）、长度升序；不同角色的同长度行"
+            f"同批凑满批内上限，批内长度比 ≤{LENGTH_RATIO} —— 同批字数接近，解码上限不再被混入的长行抬高")
     else:
-        log("分组：按角色分组、台词数降序处理（台词最多的角色先跑）；角色内按字数升序")
+        log("分组：按类型分跨角色统一队列（行数最多的队列先跑）、长度升序；不同角色的同长度行同批凑满批内上限")
     if seed >= 0:
         log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
 
-    # -- classify every segment: immediate errors, then per-character groups --
-    # One group PER CHARACTER: (vtype, canonical) — a speaker's rows all share one voice
-    # config entry (one vtype), and the decode cap scales with a sub-batch's LONGEST row,
-    # so a character's short rows must never be pooled with another character's long ones
+    # -- classify every segment: immediate errors, then per-type unified queues --
+    # The classification key stays PER CHARACTER, (vtype, canonical) — a speaker's rows all
+    # share one voice config entry (one vtype), so its clone prompt is built once and reused
+    # and its measured input overhead can be stamped onto each of its rows. SCHEDULING then
+    # merges all characters of a vtype into ONE length-ascending unified queue — the length
+    # ordering (not a per-character partition) is what keeps a sub-batch length-homogeneous
     # (the 2026-09-17 slowdown: cross-character pools mixed 2-char and 40-char lines, and
-    # every row ran the 40-char cap — batch mode does not stop short rows at EOS).
+    # every row ran the 40-char cap — batch mode does not stop short rows at EOS); a
+    # length-sorted stream spanning characters gives the same protection while letting the
+    # row cap fill across characters.
     total = len(segments)
     width = max(4, len(str(total)))
     counts = {"completed": 0, "failed": 0}
@@ -1703,21 +1734,13 @@ def _run_batch(args) -> int:
                "file_index": int(seg.get("file_index", index))}
         classified.setdefault((vtype, canonical), []).append(row)
 
-    # -- build the execution groups: per character, most lines first, rows length-ascending --
-    # Characters run in line-count DESCENDING order (the heaviest character starts
-    # immediately), rows are length-ascending within a character (see order_speaker_groups),
-    # and each group's rows are planned into sub-batches LAZILY at run time (one sub-batch
-    # per planning round, the remainder re-planned after each round) so the governor's
-    # measured adjustments reshape every batch that follows.
-    groups = []  # each: {"key", "model", "vtype", "rows" (ascending by length), "overhead"}
-
-    for (vtype, canonical), rows in order_speaker_groups(classified):
-        if vtype == "custom":
-            groups.append({"key": (vtype, canonical), "model": models.get("custom"),
-                           "vtype": "custom", "rows": rows,
-                           "overhead": ROW_STRUCTURAL_OVERHEAD})
-        elif vtype == "clone":
-            # each speaker's clone prompt is built once and reused across that speaker's sub-batches
+    # -- per-character setup: clone prompts + per-row VRAM overhead ----------------------
+    # (classification stays per character — see the comment above the loop)
+    by_vtype: dict = {}  # vtype -> [row, ...] all characters merged, first-seen order
+    for (vtype, canonical), rows in classified.items():
+        if vtype == "clone":
+            # each character's clone prompt is built once and reused across all of that
+            # character's sub-batches — including the ones shared with other characters
             model = models.get("clone")
             if model is None:
                 for r in rows:
@@ -1728,24 +1751,31 @@ def _run_batch(args) -> int:
                 # format — resolve it against the workspace root the backend handed us.
                 clone_prompts[canonical] = _build_clone_prompt(
                     model, voice_config[canonical], _workspace_root(args), canonical)
-            except Exception as e:  # noqa: BLE001 — a bad reference poisons only this speaker's rows
+            except Exception as e:  # noqa: BLE001 — a bad reference poisons only this character's rows
                 for r in rows:
                     report_result(r["index"], False, f"克隆提示构建失败：{e}")
                 continue
-            # Measure this speaker's fixed per-row input overhead (reference frames + ref_text +
-            # structural) from the prompt just built, so the VRAM budget sizes this group's
-            # sub-batches against the rows' TRUE sequence length (not just the target text).
-            groups.append({"key": (vtype, canonical), "model": model, "vtype": "clone",
-                           "rows": rows,
-                           "overhead": _clone_input_overhead(clone_prompts[canonical],
-                                                             voice_config[canonical])})
-        else:  # design
-            # each design row is unique (its own description) -> one row per sub-batch
-            groups.append({"key": (vtype, canonical), "model": models.get("design"),
-                           "vtype": "design", "rows": rows,
-                           "overhead": ROW_STRUCTURAL_OVERHEAD})
+            # Measure this character's fixed per-row input overhead (reference frames +
+            # ref_text + structural) from the prompt just built and stamp it onto every row
+            # of the character, so a sub-batch that MIXES characters still prices each row's
+            # VRAM budget against its TRUE sequence length (not just the target text).
+            overhead = _clone_input_overhead(clone_prompts[canonical],
+                                             voice_config[canonical])
+        else:
+            overhead = ROW_STRUCTURAL_OVERHEAD  # custom / design rows carry no reference
+        for r in rows:
+            r["overhead"] = overhead
+        by_vtype.setdefault(vtype, []).extend(rows)
 
-    if not groups:
+    # -- the execution queues: per vtype, unified across characters, most rows first ----
+    # All characters of a vtype merge into one length-ascending stream (order_speaker_groups
+    # is key-generic): a sub-batch drawn from it is length-homogeneous ACROSS characters
+    # (LENGTH_RATIO / the length bands apply to the merged stream), and the row cap is
+    # filled by same-length rows of whichever character comes next in the stream — a
+    # 2-row character no longer strands the rest of a 6-row cap.
+    queues = order_speaker_groups(by_vtype)  # [(vtype, rows ascending by length), ...]
+
+    if not queues:
         # nothing to generate (every segment was an immediate error) — report and finish
         progress(1.0, f"完成（成功 {counts['completed']} / 失败 {counts['failed']} / 共 {total}）")
         log(f"批量合成结束：成功 {counts['completed']}，失败 {counts['failed']}，共 {total} 段。"
@@ -1755,23 +1785,26 @@ def _run_batch(args) -> int:
     gov = VramGovernor(max_batch, device=device, total_vram=_total_vram(device))
 
     # warm up the GPU once, on the model the first sub-batch will use (CUDA only)
-    first_model = groups[0]["model"]
+    first_vtype, _first_rows = queues[0]
+    first_model = models.get(first_vtype)
     if first_model is not None:
-        _warmup(first_model, groups[0]["vtype"], args.language, device)
+        _warmup(first_model, first_vtype, args.language, device)
 
-    # -- run: plan each group's remaining rows one sub-batch at a time ----------------
+    # -- run: plan each queue's remaining rows one sub-batch at a time -----------------
     # Every planning round sees the caps the governor's measurements justify, so the run adapts
     # to the GPU as it goes (the static estimate is only the first guess; the measured loop is
-    # the authority).
+    # the authority). Per-row VRAM overhead: a sub-batch that mixes characters carries each
+    # character's own measured reference overhead on its own rows, so the budget stays honest.
     sub_counter = [0]  # global sub-batch sequence (a reproducible per-sub-batch seed offset)
-    for g in groups:
-        vtype = g["vtype"]
-        params = _talker_vram_params(g["model"]) if g["model"] is not None else None
-        remaining = g["rows"]
+    for vtype, rows in queues:
+        model = models.get(vtype)
+        params = _talker_vram_params(model) if model is not None else None
+        remaining = rows
         while remaining:
             budget = _free_vram_budget(device) if params is not None else None  # fresh per round
             rows_b, remaining = plan_next_sub_batch(
-                remaining, vtype=vtype, overhead=g["overhead"], params=params, budget=budget,
+                remaining, vtype=vtype, overhead=[r["overhead"] for r in remaining],
+                params=params, budget=budget,
                 gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
                 disabled=disabled)
 
@@ -1780,7 +1813,7 @@ def _run_batch(args) -> int:
             free_before = _free_vram(device)
             t0 = time.monotonic()
             _synth_sub_batch(
-                g["model"], vtype, rows_b,
+                model, vtype, rows_b,
                 args=args, clone_prompts=clone_prompts, device=device, seed=seed,
                 sub_counter=sub_counter, out_dir=out_dir, width=width, report=report_result,
                 gov=gov)
@@ -1793,7 +1826,7 @@ def _run_batch(args) -> int:
                     len(rows_b), params["heads"], params["kv_per_token"],
                     plan_row_tokens([r["text"] for r in rows_b],
                                     [_effective_instruct(r, vtype) for r in rows_b],
-                                    g["overhead"]),
+                                    [r["overhead"] for r in rows_b]),
                     MAX_NEW_TOKENS)
             action = gov.observe_success(
                 free_before=free_before, free_after=free_after, rows=len(rows_b),
@@ -1816,11 +1849,12 @@ def _run_design_batch(args) -> int:
     tensor sub-batches — unlike batch mode's design rows (book segments, one per sub-batch),
     candidates DO share a sub-batch (``force_rows_cap`` = the governor's cap), which is the
     point of this mode. The per-batch size follows the length bands + the measured
-    VramGovernor; ``--concurrency`` is only the ceiling. Candidates run PER CHARACTER — the
-    characters are processed in candidate-count descending order, and within a character the
-    rows run ascending by length (early progress + crash resilience); each row keeps its
-    backend identity (``index`` = position in the jobs file) so the ``[design]`` lines and
-    the watchdog's ``indices=`` map back after the grouping.
+    VramGovernor; ``--concurrency`` is only the ceiling. All candidates run from ONE unified
+    length-ascending queue across characters — a sub-batch stays length-homogeneous (the
+    length bands + the ≤3 ratio apply to the merged stream), so same-length candidates of
+    different characters fill the cap together (short rows first: early progress + crash
+    resilience); each row keeps its backend identity (``index`` = position in the jobs file)
+    so the ``[design]`` lines and the watchdog's ``indices=`` map back after the sorting.
 
     Every candidate is seeded ``--seed + sub-batch#`` (rows in one sub-batch share the seed;
     the backend records it per candidate — the same layout-conditioned reproducibility as
@@ -1916,20 +1950,17 @@ def _run_design_batch(args) -> int:
     _log_disabled_checks(disabled)
     log(f"解码上限：随批内最长行缩放（{FRAME_CAP_FLOOR} 帧起 · {FRAME_CAP_PER_CHAR} 帧/字 · "
         f"顶格 {MAX_NEW_TOKENS} 帧）")
-    log("分组：按角色分组、候选数降序处理（候选最多的角色先跑）；角色内按长度升序 —— "
-        "同角色候选输入相同，同批长度一致")
+    log("分组：跨角色单一队列、按长度升序 —— 每行输入各自独立，不同角色的同长度候选一起凑满"
+        "批内行数上限；批内长度比 ≤3、长度分档照旧，解码上限不再被混入的长 ref_text 行抬高")
     if seed >= 0:
         log(f"seed = {seed}（可复现：同输入 + 同 seed + 同批布局 → 相同结果）")
 
-    # Per-character sub-batch groups, most candidates first (mirrors _run_batch's grouping):
-    # a character's candidates share identical inputs, so their lengths are equal and the
-    # sub-batch's decode cap reflects the true length; mixing characters in one batch would
-    # charge every row at the longest character's ref-text length (batch mode does not stop
-    # short rows at EOS).
-    by_speaker: dict = {}  # speaker -> [row, ...], first-seen order
-    for r in gen_rows:
-        by_speaker.setdefault(r["sp"], []).append(r)
-    groups = [rows for _sp, rows in order_speaker_groups(by_speaker)]
+    # One unified length-ascending queue across characters (mirrors _run_batch's queues):
+    # each row's input is its own, so mixing characters is safe as long as the sub-batch
+    # stays length-homogeneous (the bands + the ratio apply to the merged stream) — and
+    # the cap is then filled by same-length candidates of whichever character comes next,
+    # instead of a 2-candidate character stranding the rest of a 6-row cap.
+    remaining = sorted(gen_rows, key=lambda r: r["chars"])
 
     gov = VramGovernor(max_batch, device=device, total_vram=_total_vram(device))
     params = _talker_vram_params(model)
@@ -1940,40 +1971,41 @@ def _run_design_batch(args) -> int:
     # of sub-batches any earlier attempt could have run) keeps every seed run-unique.
     sub_counter = [offset]
 
-    for g in groups:
-        remaining = g
-        while remaining:
-            budget = _free_vram_budget(device) if params is not None else None  # fresh per round
-            rows_b, remaining = plan_next_sub_batch(
-                remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
-                budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
-                force_rows_cap=gov.cap, disabled=disabled)
-            log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
-            free_before = _free_vram(device)
-            t0 = time.monotonic()
-            _synth_sub_batch(
-                model, "design", rows_b,
-                args=args, clone_prompts={}, device=device, seed=seed,
-                sub_counter=sub_counter, out_dir=out_dir, width=max(4, len(str(total))),
-                report=report_result, gov=gov, save=_save_and_report_design,
-                force_do_sample=True)
-            _clear_gpu_cache(device)
-            elapsed = time.monotonic() - t0
-            free_after = _free_vram(device)
-            static_est = 0
-            if params is not None:
-                static_est = estimate_batch_vram(
-                    len(rows_b), params["heads"], params["kv_per_token"],
-                    plan_row_tokens([r["text"] for r in rows_b],
-                                    [_effective_instruct(r, "design") for r in rows_b],
-                                    ROW_STRUCTURAL_OVERHEAD),
-                    MAX_NEW_TOKENS)
-            action = gov.observe_success(
-                free_before=free_before, free_after=free_after, rows=len(rows_b),
-                chars=sum(r["chars"] for r in rows_b), elapsed=elapsed, static_est=static_est)
-            if action:
-                _what, _detail = gov.events[-1]
-                log(f"动态并发{action}（{_detail}）→ 批内上限 {gov.cap}")
+    # run: plan the remaining candidates one sub-batch at a time — the same lazy,
+    # governor-adaptive loop as _run_batch (every round sees the caps the measurements
+    # justify, so the run adapts to the GPU as it goes).
+    while remaining:
+        budget = _free_vram_budget(device) if params is not None else None  # fresh per round
+        rows_b, remaining = plan_next_sub_batch(
+            remaining, vtype="design", overhead=ROW_STRUCTURAL_OVERHEAD, params=params,
+            budget=budget, gov=gov, max_batch=max_batch, max_batch_chars=max_batch_chars,
+            force_rows_cap=gov.cap, disabled=disabled)
+        log(f"子批（design）：{len(rows_b)} 行（批内上限 {gov.cap}）")
+        free_before = _free_vram(device)
+        t0 = time.monotonic()
+        _synth_sub_batch(
+            model, "design", rows_b,
+            args=args, clone_prompts={}, device=device, seed=seed,
+            sub_counter=sub_counter, out_dir=out_dir, width=max(4, len(str(total))),
+            report=report_result, gov=gov, save=_save_and_report_design,
+            force_do_sample=True)
+        _clear_gpu_cache(device)
+        elapsed = time.monotonic() - t0
+        free_after = _free_vram(device)
+        static_est = 0
+        if params is not None:
+            static_est = estimate_batch_vram(
+                len(rows_b), params["heads"], params["kv_per_token"],
+                plan_row_tokens([r["text"] for r in rows_b],
+                                [_effective_instruct(r, "design") for r in rows_b],
+                                ROW_STRUCTURAL_OVERHEAD),
+                MAX_NEW_TOKENS)
+        action = gov.observe_success(
+            free_before=free_before, free_after=free_after, rows=len(rows_b),
+            chars=sum(r["chars"] for r in rows_b), elapsed=elapsed, static_est=static_est)
+        if action:
+            _what, _detail = gov.events[-1]
+            log(f"动态并发{action}（{_detail}）→ 批内上限 {gov.cap}")
 
     progress(1.0, f"完成（共 {total} 候选）")
     log(f"候选渲染结束：{offset + done}/{total} 候选已落定。输出目录：{out_dir}")

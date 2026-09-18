@@ -14,6 +14,7 @@ per-chunk progress and logs over SSE and honours cooperative cancel between chun
 """
 from __future__ import annotations
 
+import bisect
 import json
 import random
 import re
@@ -246,67 +247,173 @@ def _evict_trailing_title(chunk: str) -> tuple:
     return body, last_line
 
 
-def split_into_chunks(text, max_size=3000):
-    """Split text into chunks at paragraph/sentence boundaries.
+def _run_start(S: str, q: int) -> int:
+    """包含 q 的极大空白游程的起始偏移（q = 空白字符，或零宽句末位置）。
 
-    章标题防丢：若标题行落在即将关闭的 chunk 尾部 100 字内，边界移到标题行之前——
-    标题被放到下一 chunk 的开头（与它所统领的章节正文同段），防止标题孤悬在失败 /
-    截断 chunk 的尾部而丢失。
+    句末候选落在标点之后：若后随空白则游程自标点后的第一个空白字符起；
+    若标点直接衔接文字（中文常态）则游程长度为零、起点即标点后一位。
     """
-    paragraphs = re.split(r'\n\s*\n', text)
+    while q > 0 and S[q - 1].isspace():
+        q -= 1
+    return q
 
-    chunks = []
-    current_chunk = ""
-    carry = ""  # 上一 chunk 尾部切出的标题行，将放到本 chunk 开头
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
+def _boundary_runs(S: str) -> list:
+    """统一合法边界表（硬约束）：合法切点偏移的升序列表。
+
+    一个极大空白游程 = 一个逻辑边界（同 gap 内多类候选合并为一个）；句末候选
+    分两类——CJK 句末标点 。！？!?… 零宽（不要求后随空白——旧正则
+    ``(?<=[.!?])\\s+`` 对中文从不触发，正是「超长中文段切不开」的根因）；
+    ASCII .!? 须后随空白（保护 3.14 / e.g. 之类的词内点号）。
+    切点只能落在这张表的偏移上；没有合法边界就不切。
+    """
+    starts = set()
+    for m in re.finditer(r"\n\s*\n", S):
+        starts.add(_run_start(S, m.start()))
+    for m in re.finditer(r"\n", S):
+        starts.add(_run_start(S, m.start()))
+    for m in re.finditer(r"(?<=[。！？!?…])", S):
+        p = m.end()
+        if p < len(S):
+            starts.add(_run_start(S, p))
+    for m in re.finditer(r"(?<=[.!?])\s", S):
+        starts.add(_run_start(S, m.end() - 1))
+    starts.discard(0)
+    return sorted(starts)
+
+
+def _tail_is_title(block: str) -> bool:
+    """块末行（strip 后）是否为章标题——悬题判定，严于兜底（无 100 字窗）。
+
+    标题独占块不算悬题（那是预期的独立块形态，如书末标题 / 被移到下一块
+    开头的标题），与 _evict_trailing_title 的「标题独占块不清空」一致。
+    """
+    b = block.strip()
+    if not b or "\n" not in b:
+        return False
+    return is_chapter_title(b.rsplit("\n", 1)[1])
+
+
+def _find_cut(runs: list, t: float, floor: int, S: str):
+    """目标位 t 的切点：t 最近、且在上一切点（floor）右侧的合法边界。
+
+    悬题改判：最近者悬题（切后前一块末行是章标题）而另一候选不悬题 →
+    必选不悬题者（标题防丢是硬约束，均长只是审美）；两候选皆悬题 → 取最近
+    （交兜底 _evict_trailing_title 前移）。平手取较小偏移（确定性）。
+    无候选 / 切出的块为空 → None（余下并入前一块，绝不强切）。
+    """
+    i = bisect.bisect_left(runs, t)
+    cands = []
+    if i > 0 and runs[i - 1] > floor:
+        cands.append(runs[i - 1])
+    if i < len(runs) and runs[i] > floor:
+        cands.append(runs[i])
+    cands = [c for c in cands if S[floor:c].strip()]
+    if not cands:
+        return None
+    safe = [c for c in cands if not _tail_is_title(S[floor:c])]
+    pool = safe if safe else cands
+    return min(pool, key=lambda c: (abs(t - c), c))
+
+
+def _drop_short_chunks(S: str, cuts: list, size: int) -> list:
+    """收尾调整：消除过短块（strip 后 < 目标长度一半）。
+
+    合并 = 只删一个已有切点（不重切、不引入任何新切点——每轮严格收缩，
+    必然终止、无震荡）；与较短邻块合并（均长最优）；合并不得跨越不可拆
+    结构——合并块末行成为章标题（悬题，兜底会把它移进下一块）则该侧禁止；
+    两侧都不可合并 → 保留该短块（允许，非异常）。
+    """
+    threshold = size / 2
+    accepted = set()
+    while True:
+        bounds = [0] + list(cuts) + [len(S)]
+        lens = [len(S[a:b].strip()) for a, b in zip(bounds, bounds[1:])]
+        i = next(
+            (k for k in range(len(lens))
+             if lens[k] < threshold and (bounds[k], bounds[k + 1]) not in accepted),
+            None,
+        )
+        if i is None:
+            break
+        a, b = bounds[i], bounds[i + 1]
+        # 合并结果是否「末行成标题」按兜底自身口径（_evict，含 100 字窗）判定，
+        # 与切片阶段的驱逐语义一致——绝不产出会在切片时被再驱逐的块。
+        okL = i > 0 and _evict_trailing_title(S[bounds[i - 1]:b].strip())[1] == ""
+        okR = i < len(lens) - 1 and _evict_trailing_title(S[a:bounds[i + 1]].strip())[1] == ""
+        if not (okL or okR):
+            accepted.add((a, b))
             continue
-
-        if len(current_chunk) + len(para) + 2 > max_size:
-            if current_chunk:
-                body, title = _evict_trailing_title(current_chunk.strip())
-                if body:
-                    chunks.append(body)
-                carry = title
-                current_chunk = ""
-
-            if len(para) > max_size:
-                if carry:
-                    current_chunk = carry
-                    carry = ""
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                for sentence in sentences:
-                    if len(current_chunk) + len(sentence) + 1 > max_size:
-                        if current_chunk:
-                            body, title = _evict_trailing_title(current_chunk.strip())
-                            if body:
-                                chunks.append(body)
-                            carry = title
-                        current_chunk = sentence
-                        if carry:
-                            current_chunk = carry + " " + current_chunk
-                            carry = ""
-                    else:
-                        current_chunk += " " + sentence if current_chunk else sentence
-            else:
-                current_chunk = (carry + "\n\n" + para) if carry else para
-                carry = ""
+        if okL and (not okR or lens[i - 1] <= lens[i + 1]):
+            cuts.remove(a)                # 与较短左邻合并（删本块起点切点）
         else:
-            if not current_chunk and carry:
-                current_chunk = carry
-                carry = ""
-            current_chunk += "\n\n" + para if current_chunk else para
+            cuts.remove(b)                # 与较短右邻合并（删本块终点切点）
+    return list(cuts)
 
-    if current_chunk:
-        body, title = _evict_trailing_title(current_chunk.strip())
+
+def split_into_chunks(text, max_size=3000):
+    """Split text into chunks: fix the count first, then snap each cut to the
+    nearest legal structural boundary around the target average length.
+
+    段数 = ceil(总长 / size)；固定切法下尾段 < size/2 时减一重新平均；再按合法
+    边界数钳制（合法结构边界 = 最高约束，段数 / 均长只是软目标）。切点只能落在
+    合法边界（段落 > 换行 > 句末；CJK 句末零宽、ASCII .!? 须后随空白）——绝不
+    拦腰截断句子 / 对话；目标位附近无边界则吸附到最近合法边界（允许个别段超
+    目标长）；完全没有合法边界则不切。
+    章标题防丢：切后块末行是标题 → 切点改判移到标题行之前（搜索期悬题判定，
+    严于兜底）；兜底 = _evict_trailing_title + carry 移交（保留旧版语义，覆盖
+    「唯一候选即悬题」与「书末标题独立成块」）。
+    过短块（不足目标半长）与较短邻块合并——只删切点、不跨章标题、无法合并则
+    保留短块。无损口径 = 现有「去空白后拼接相等」。
+    """
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    if not paragraphs:
+        return []
+    S = "\n\n".join(paragraphs)
+    total = len(S)
+    size = max(1, int(max_size))
+
+    runs = _boundary_runs(S)
+
+    # ① 段数（软目标，受硬约束钳制：内部合法边界数）
+    count = (total + size - 1) // size
+    if count > 1 and total - (count - 1) * size < size / 2:
+        count -= 1
+    count = min(count, len(runs) + 1)
+
+    # ② 切点搜索：每个目标位的最近合法边界（严格单调，悬题改判）
+    cuts = []
+    for k in range(1, count):
+        c = _find_cut(runs, total * k / count, cuts[-1] if cuts else 0, S)
+        if c is None:
+            break  # 无合法边界 → 余下并入前一块（不强切）
+        cuts.append(c)
+
+    # ③ 标题兜底：块末行是标题（100 字窗内）→ 切点前移到标题行起点
+    for i in range(len(cuts)):
+        prev = cuts[i - 1] if i else 0
+        _, title = _evict_trailing_title(S[prev:cuts[i]].strip())
+        if title:
+            cuts[i] -= len(title)
+
+    # ④ 收尾调整：消除过短块（只删切点）
+    cuts = _drop_short_chunks(S, cuts, size)
+
+    # ⑤ 切片 + carry（书末标题独立成块，绝不丢）
+    bounds = [0] + cuts + [total]
+    chunks = []
+    carry = ""
+    for a, b in zip(bounds, bounds[1:]):
+        piece = S[a:b].strip()
+        if carry:
+            piece = f"{carry}\n\n{piece}" if piece else carry
+            carry = ""
+        body, title = _evict_trailing_title(piece)
         if body:
             chunks.append(body)
-        if title:
-            chunks.append(title)  # 书末标题：无下一 chunk 可去，独立成尾 chunk
+        carry = title
     if carry:
-        chunks.append(carry)  # 标题被切出但已无后续文本——独立成 chunk，绝不丢
+        chunks.append(carry)
 
     return chunks
 
@@ -1461,7 +1568,9 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
         f"检测到 {len(flagged)} 条疑似断句失败条目（台词引号内含「…道：」标签），"
         f"逐条带上下文窗口（±{n} 条）重跑校验…"
     )
-    handle.progress(1.0, f"断句校验 {len(flagged)} 条")
+    # The mechanical check stages share the [0.9, 1.0) progress band (see
+    # generate_file): re-validation owns [0.9, 0.98), the spot audit [0.98, 0.998).
+    handle.progress(0.9, f"断句校验 {len(flagged)} 条")
 
     updated = None
     fixed = 0
@@ -1469,7 +1578,7 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
     # entry's (already built) window refers to.
     for seq, i in enumerate(sorted(flagged, reverse=True), 1):
         handle.check()
-        handle.progress(1.0, f"断句校验 {seq}/{len(flagged)}")
+        handle.progress(0.9 + 0.08 * seq / len(flagged), f"断句校验 {seq}/{len(flagged)}")
         snippet = (entries[i].get("text") or "").replace("\n", " ")
         handle.log(f"条目 {i + 1}（疑似断句失败）：{snippet[:60]}{'…' if len(snippet) > 60 else ''}")
         parts = revalidate_entry(handle, llm, generation, sys_prompt, usr_template,
@@ -1494,6 +1603,93 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
         else:
             handle.log(f"条目 {i + 1} 校验通过：重写为单条（剥离包裹引号 / 语气标签）")
     return (updated if updated is not None else entries), len(flagged), fixed
+
+
+# ---------------------------------------------------------------------------
+# 角色匹配检查（chunk 边界 speaker 重判；解析内四检查阶段之首）
+#
+# Chunk 切割切断了跨段上下文：解析边界条目的 LLM 看不到边界另一侧的对话 /
+# 角色上下文，speaker 易误判（引语行紧邻切点、其归属角色只出现在另一侧时）。
+# 本阶段用跨边界窗口 [前置上下文]+[检查目标]+[后置上下文] 重判每个**内部**
+# chunk 边界两侧各 n 条（n = check_context_window，与其余重判阶段同一配置）；
+# 上下文仅提供判断依据——**只有 target 条目可被修改**（硬不变式，见
+# _run_rejudge_groups 的三层保证）。判定复用重判批协议（3 样本严格多数、
+# 无共识继续取样本，从不猜）。首/末 chunk 边界不检查：首/末段解析时 LLM 明确
+# 知道 Beginning / End of text，没有上下文被"切掉"。受
+# ``generation.check_boundary_speakers`` 门控（默认开；关 = generate_file 跳过
+# + 一行日志 + 结果字段 0）。本阶段居检查段最前：断句校验（拆条）与标签删除
+# （删条）都会移动条目下标，本阶段的窗口必须取自 pristine 列表。
+# 不建历史文件：本阶段无仪表语义（仪表读数只属归属抽样的纯随机桶）。
+# ---------------------------------------------------------------------------
+
+def select_boundary_targets(chunk_ends: list, n: int, total: int) -> list:
+    """角色匹配检查目标：每个内部 chunk 边界两侧各 n 条（全局去重 → 升序）。
+
+    ``chunk_ends`` = 每段结束时的累计条目数（第 k 段末 = ``chunk_ends[k-1]``）；
+    边界 b = ``chunk_ends[k]``（后一段的首条目下标）→ 两侧各 n 条 =
+    ``[b-n, b+n)``。文件头/尾边界不检查（首/末段解析无上下文被切掉——故障
+    模式只存在于内部边界）。n=0 → 空（阶段零 LLM 调用）。
+    """
+    targets = set()
+    for b in chunk_ends[:-1]:  # 内部边界（首/尾不查）
+        for t in range(b - n, b + n):
+            if 0 <= t < total:
+                targets.add(t)
+    return sorted(targets)
+
+
+def boundary_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
+                            entries: list, chunk_ends: list) -> tuple:
+    """角色匹配检查阶段（解析内四阶段之首；调用方负责开关门控）。
+
+    用跨边界窗口重判每个内部 chunk 边界两侧各 n 条（n =
+    ``check_context_window``）的 speaker——只改 target（context 条目逐字节
+    不动），判定 = 共享重判批协议的 3 样本严格多数；高置信改判在内存中生效、
+    随解析任务自己的基文件写出（基文件本就是解析任务的产物）。
+
+    返回 ``(entries, {checked, fixed})``——未应用任何修正时返回**原始列表
+    对象**（对象身份由测试钉死）；零目标 / 单段文件 → 零 LLM 调用 + 一行
+    日志（防静默被误读为阶段缺失）。
+    """
+    from . import check_prompts  # bundled re-judgment prompt defaults
+
+    stats = {"checked": 0, "fixed": 0}
+    if not entries or len(chunk_ends) < 2:
+        # 单段文件无内部边界 → 无事可做（静默即可：不是"阶段缺失"）。
+        return entries, stats
+
+    n = max(0, int(generation.check_context_window or 0))
+    batch = max(1, int(generation.check_batch_size or 0))
+    targets = select_boundary_targets(chunk_ends, n, len(entries))
+    if not targets:
+        # 零命中也留一行日志：与断句校验同一理由——静默退出会被误读成阶段缺失。
+        handle.log("角色匹配检查：0 条边界目标（无重判，零 LLM 调用）")
+        return entries, stats
+
+    original = entries  # 窗口恒由 pristine 列表预建（硬不变式）
+    roster = build_roster(original)
+    sys_prompt = check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
+    usr_template = check_prompts.DEFAULT_CHECK_USER_PROMPT
+    groups = group_retry_indices(targets, n, batch)
+
+    stats["checked"] = len(targets)
+    handle.log(
+        f"角色匹配检查：{len(targets)} 条边界条目（内部 chunk 边界两侧各 {n} 条，"
+        f"共 {len(groups)} 组），复用重判批协议…"
+    )
+
+    result, rep = _run_rejudge_groups(
+        handle, llm, generation, sys_prompt, usr_template,
+        original, groups, n, roster,
+        stage="角色匹配检查", progress_base=0.9, progress_span=0.06,
+    )
+    stats["fixed"] = rep["fixed"]
+    if rep["fixed"] or rep["unwrapped"]:
+        handle.log(
+            f"角色匹配检查完成：重判 {stats['checked']} 条边界条目，更正 {rep['fixed']} 条 speaker"
+            + (f"、{rep['unwrapped']} 条台词去引号" if rep["unwrapped"] else "")
+        )
+    return result, stats
 
 
 # ---------------------------------------------------------------------------
@@ -1692,6 +1888,164 @@ def _append_spot_history(handle, file_stem: str, stats: dict) -> None:
         handle.log(f"归属抽样历史写入失败（不影响解析结果）：{e}", "WARNING")
 
 
+def _run_rejudge_groups(handle, llm: LLMConfig, generation: GenerationConfig,
+                        sys_prompt: str, usr_template: str,
+                        entries: list, groups: list, n: int, roster, *,
+                        stage: str, progress_base: float, progress_span: float,
+                        on_first_map=None) -> tuple:
+    """共享重判批协议执行器：逐组跑「首判 → 分歧条目动态多数投票 → 应用」。
+
+    归属抽样与角色匹配检查（chunk 边界复查）共用此执行器——窗口构建 / 分组 /
+    投票 / 提示词 / 配置几何全部同一套（各自只传目标组与参数）。
+
+    **target / context 严格分离（硬不变式）**：context 条目（窗口内未标
+    ``target`` 的条目）仅提供判断依据，**永不被修改**；只有 target 条目可被
+    改写（``speaker`` + 台词「仅去外层引号」的机械值）——不允许因上下文中
+    某条的 speaker 判断而改动 context 条目。三层保证：
+    ① 捆绑提示词明令只判 target、上下文仅辅助、角色名逐字复制；
+    ② 应用代码只写 target 下标（``result`` 是原始列表浅拷贝，投票采纳 /
+    去引号均按 target 下标定位，非 target 条目逐字节不动）；
+    ③ 窗口恒由**原始（pristine）列表**预建（首判 + 全部重试用同一窗口），
+    任何已应用的修正不回流进后续窗口。
+
+    协议：首判 → 分歧条目 ``votes=[原值, 首判]`` → 至多 3 次同窗口重试
+    → ``_pick_majority`` 严格多数（≥2 票且唯一领先）一出即停；无共识 / 调用
+    失败 → 保留原值（从不猜）。取消（``TaskCancelled``）上抛、零应用。
+    ``on_first_map(first_map, grp)``（可选）在每组首判后回调（归属抽样的
+    分桶仪表读数）；``stage`` 用于日志前缀，``progress_base/span`` 复现各
+    阶段的进度带（``progress = base + span·seq/组数``）。
+
+    返回 ``(列表, {checked, fixed, unwrapped})``——未应用任何修正时返回
+    原始列表对象本身（调用方据此保持对象身份）。
+    """
+    original = entries  # 每个窗口（首判 + 全部重跑）都从 ORIGINAL 构建
+    result = [dict(e) for e in original]
+    fixed = 0
+    unwrapped = 0
+    proc_start = time.monotonic()
+    window_chars = 0
+
+    for seq, grp in enumerate(groups, 1):
+        handle.check()  # cooperative cancel / pause before the group
+        handle.progress(progress_base + progress_span * seq / len(groups),
+                        f"{stage} {seq}/{len(groups)} 组")
+        grp_set = set(grp)
+        start, size = grp[0], grp[-1] - grp[0] + 1
+        span = set(range(start, start + size))
+        skip = span - grp_set  # in-span non-targets → context, never re-judged
+        context = json.dumps(build_batch_window(original, start, size, n, skip=skip),
+                             ensure_ascii=False, indent=2)
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": _batch_user_prompt(usr_template, context, len(grp), n, roster)},
+        ]
+        handle.llm_rate(0, 0.0)  # reset the 吞吐 gauge for this call
+        handle.log(f"{stage}第 {seq}/{len(groups)} 组（{len(grp)} 条目标）…")
+
+        # -- First pass: re-judge the whole group in one call -------------------
+        try:
+            full_map = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
+        except TaskCancelled:
+            raise  # a cancel raised mid-stream must propagate, not be swallowed
+        except Exception as e:  # noqa: BLE001 — unreadable first pass → keep originals
+            handle.log(f"  首批解析失败，本组保留原 speaker：{e}", "WARNING")
+            full_map = {}
+        first_map = {i: sp for i, (sp, _tx) in full_map.items()}
+        # The reply's optional "text" keys: applied only after strict validation below.
+        text_sigs: dict = {i: tx for i, (_sp, tx) in full_map.items() if tx}
+        window_chars += len(context)
+
+        if on_first_map is not None:
+            on_first_map(first_map, grp)
+
+        discrepant = [
+            t for t in grp
+            if (sp := first_map.get(t)) is not None and sp != original[t].get("speaker")
+        ]
+
+        if discrepant:
+            # -- Disagreement → dynamic majority voting (the shared protocol) --
+            handle.log(f"  检测到 {len(discrepant)} 条分歧，进入动态投票…")
+            # votes[t] = [原值, 首判, 重试1, (重试2), (重试3)]
+            votes: dict = {t: [original[t].get("speaker"), first_map[t]] for t in discrepant}
+
+            def retry_once(run: int, pending: list) -> list:
+                """Re-send this group's window (retry #run) and fold the new judgments
+                into the ``pending`` entries' votes; return the ones still without a
+                strict majority. Optional ``text`` keys fold into ``text_sigs`` (first
+                wins)."""
+                handle.check()
+                handle.llm_rate(0, 0.0)
+                try:
+                    full = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
+                except TaskCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 — a failed retry adds no votes
+                    handle.log(f"  重试第 {run} 次失败，无新票：{e}", "WARNING")
+                    full = {}
+                m = {i: sp for i, (sp, _tx) in full.items()}
+                for i, tx in full.items():
+                    if tx and i not in text_sigs:
+                        text_sigs[i] = tx
+                for t in pending:
+                    votes[t].append(m.get(t))  # a missing/failed entry contributes no vote
+                return [t for t in pending if _pick_majority(votes[t]) is None]
+
+            handle.log(f"  重试第 1 次（3 样本：原值 + 首判 + 重试结果）…")
+            still = retry_once(1, discrepant)
+            window_chars += len(context)
+            if still:
+                handle.log(f"  {len(still)} 条 1:1 无共识 → 重试第 2 次…")
+                still = retry_once(2, still)
+                window_chars += len(context)
+                if still:
+                    handle.log(f"  {len(still)} 条仍无共识 → 重试第 3 次（末次）…")
+                    still = retry_once(3, still)
+                    window_chars += len(context)
+                    if still:
+                        handle.log(f"  {len(still)} 条重试 3 次仍无共识，保留原 speaker")
+
+            # Apply: adopt the majority only if it beats the original; else keep original.
+            # 只写 target 下标——result 是原始列表浅拷贝，非 target 条目逐字节不动。
+            for t in discrepant:
+                winner = _pick_majority(votes[t])
+                orig_sp = original[t].get("speaker")
+                if winner is not None and winner != orig_sp:
+                    result[t]["speaker"] = winner  # only `speaker` changes
+                    fixed += 1
+                    handle.log(f"  条目 {t + 1}: {orig_sp} → {winner}")
+                # winner None (no consensus) or == original → the original is kept.
+        # (no disagreement → the group matches the originals; nothing to re-vote)
+
+        # The re-judgment prompt's optional "text" keys: the stored text unwrapped of
+        # its outer quotation marks. Applied only when the entry's FINAL speaker is a
+        # character and the reply matches the mechanically computed strip (the value
+        # written is the computed one — this stage can never rewrite text beyond the
+        # quote removal; instruct and every context neighbour stay untouched).
+        for t in grp:
+            sig = text_sigs.get(t)
+            if not sig or (result[t].get("speaker") or "") == "NARRATOR":
+                continue
+            expected = strip_outer_quotes(original[t].get("text") or "")
+            if not expected or sig != expected:
+                handle.log(
+                    f"  {t + 1}: 模型返回的 text 与「仅去外层引号」不符，忽略（text 保持原样）",
+                    "WARNING",
+                )
+                continue
+            if result[t].get("text") != expected:
+                result[t]["text"] = expected
+                unwrapped += 1
+                handle.log(f"  {t + 1}: 台词已去除外层引号")
+
+        handle.llm_chars(window_chars, time.monotonic() - proc_start)
+
+    checked = sum(len(g) for g in groups)
+    return (result if (fixed or unwrapped) else entries), {
+        "checked": checked, "fixed": fixed, "unwrapped": unwrapped,
+    }
+
+
 def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
                         entries: list, rate: float,
                         rng: "random.Random" | None = None) -> tuple:
@@ -1743,7 +2097,6 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
     n = max(0, int(generation.check_context_window or 0))
     batch = max(1, int(generation.check_batch_size or 0))
     original = entries  # every window (first pass + all re-runs) is built from ORIGINAL
-    result = [dict(e) for e in original]
     roster = build_roster(original)
     # Bundled defaults — the re-judgment prompts are no longer user-configurable.
     sys_prompt = check_prompts.DEFAULT_CHECK_SYSTEM_PROMPT
@@ -1763,134 +2116,28 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
         f"{len(risk_targets)}，共 {len(groups)} 组），复用重判批协议…"
     )
 
-    fixed = 0
-    unwrapped = 0
-    random_errors = 0  # gauge: first-pass re-judgment ≠ original, per bucket
-    risk_errors = 0
-    proc_start = time.monotonic()
-    window_chars = 0
+    # 分桶仪表读数（留在抽样侧）：首判改判 ≠ 原值 = 检出错误，按桶计数——
+    # 桶的读数 = 该桶的解析错误率，与后续投票结局无关。
+    bucket_errors = [0, 0]  # [纯随机桶, 风险桶]
 
-    for seq, grp in enumerate(groups, 1):
-        handle.check()  # cooperative cancel / pause before the group
-        handle.progress(1.0, f"归属抽样 {seq}/{len(groups)} 组")
-        grp_set = set(grp)
-        start, size = grp[0], grp[-1] - grp[0] + 1
-        span = set(range(start, start + size))
-        skip = span - grp_set  # in-span non-targets → context, never re-judged
-        context = json.dumps(build_batch_window(original, start, size, n, skip=skip),
-                             ensure_ascii=False, indent=2)
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": _batch_user_prompt(usr_template, context, len(grp), n, roster)},
-        ]
-        handle.llm_rate(0, 0.0)  # reset the 吞吐 gauge for this call
-        handle.log(f"归属抽样第 {seq}/{len(groups)} 组（{len(grp)} 条目标）…")
-
-        # -- First pass: re-judge the whole group in one call -------------------
-        try:
-            full_map = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
-        except TaskCancelled:
-            raise  # a cancel raised mid-stream must propagate, not be swallowed
-        except Exception as e:  # noqa: BLE001 — unreadable first pass → keep originals
-            handle.log(f"  首批解析失败，本组保留原 speaker：{e}", "WARNING")
-            full_map = {}
-        first_map = {i: sp for i, (sp, _tx) in full_map.items()}
-        # The reply's optional "text" keys: applied only after strict validation below.
-        text_sigs: dict = {i: tx for i, (_sp, tx) in full_map.items() if tx}
-        window_chars += len(context)
-
-        # Gauge accounting: a first-pass re-judgment ≠ original is a detected error,
-        # whatever the vote later decides (the bucket's reading is the parse error rate).
+    def _gauge(first_map: dict, grp: list) -> None:
         for t in grp:
             sp = first_map.get(t)
             if sp is None or sp == original[t].get("speaker"):
                 continue
             if t in random_set:
-                random_errors += 1
+                bucket_errors[0] += 1
             elif t in risk_set:
-                risk_errors += 1
+                bucket_errors[1] += 1
 
-        discrepant = [
-            t for t in grp
-            if (sp := first_map.get(t)) is not None and sp != original[t].get("speaker")
-        ]
-
-        if discrepant:
-            # -- Disagreement → dynamic majority voting (the shared protocol) --
-            handle.log(f"  检测到 {len(discrepant)} 条分歧，进入动态投票…")
-            # votes[t] = [原值, 首判, 重试1, (重试2), (重试3)]
-            votes: dict = {t: [original[t].get("speaker"), first_map[t]] for t in discrepant}
-
-            def retry_once(run: int, pending: list) -> list:
-                """Re-send this group's window (retry #run) and fold the new judgments
-                into the ``pending`` entries' votes; return the ones still without a
-                strict majority. Optional ``text`` keys fold into ``text_sigs`` (first
-                wins)."""
-                handle.check()
-                handle.llm_rate(0, 0.0)
-                try:
-                    full = parse_speaker_map_full(_llm_call(llm, generation, messages, handle), grp)
-                except TaskCancelled:
-                    raise
-                except Exception as e:  # noqa: BLE001 — a failed retry adds no votes
-                    handle.log(f"  重试第 {run} 次失败，无新票：{e}", "WARNING")
-                    full = {}
-                m = {i: sp for i, (sp, _tx) in full.items()}
-                for i, tx in full.items():
-                    if tx and i not in text_sigs:
-                        text_sigs[i] = tx
-                for t in pending:
-                    votes[t].append(m.get(t))  # a missing/failed entry contributes no vote
-                return [t for t in pending if _pick_majority(votes[t]) is None]
-
-            handle.log(f"  重试第 1 次（3 样本：原值 + 首判 + 重试结果）…")
-            still = retry_once(1, discrepant)
-            window_chars += len(context)
-            if still:
-                handle.log(f"  {len(still)} 条 1:1 无共识 → 重试第 2 次…")
-                still = retry_once(2, still)
-                window_chars += len(context)
-                if still:
-                    handle.log(f"  {len(still)} 条仍无共识 → 重试第 3 次（末次）…")
-                    still = retry_once(3, still)
-                    window_chars += len(context)
-                    if still:
-                        handle.log(f"  {len(still)} 条重试 3 次仍无共识，保留原 speaker")
-
-            # Apply: adopt the majority only if it beats the original; else keep original.
-            for t in discrepant:
-                winner = _pick_majority(votes[t])
-                orig_sp = original[t].get("speaker")
-                if winner is not None and winner != orig_sp:
-                    result[t]["speaker"] = winner  # only `speaker` changes
-                    fixed += 1
-                    handle.log(f"  条目 {t + 1}: {orig_sp} → {winner}")
-                # winner None (no consensus) or == original → the original is kept.
-        # (no disagreement → the group matches the originals; nothing to re-vote)
-
-        # The re-judgment prompt's optional "text" keys: the stored text unwrapped of
-        # its outer quotation marks. Applied only when the entry's FINAL speaker is a
-        # character and the reply matches the mechanically computed strip (the value
-        # written is the computed one — this stage can never rewrite text beyond the
-        # quote removal; instruct and every context neighbour stay untouched).
-        for t in grp:
-            sig = text_sigs.get(t)
-            if not sig or (result[t].get("speaker") or "") == "NARRATOR":
-                continue
-            expected = strip_outer_quotes(original[t].get("text") or "")
-            if not expected or sig != expected:
-                handle.log(
-                    f"  {t + 1}: 模型返回的 text 与「仅去外层引号」不符，忽略（text 保持原样）",
-                    "WARNING",
-                )
-                continue
-            if result[t].get("text") != expected:
-                result[t]["text"] = expected
-                unwrapped += 1
-                handle.log(f"  {t + 1}: 台词已去除外层引号")
-
-        handle.llm_chars(window_chars, time.monotonic() - proc_start)
-
+    result, rep = _run_rejudge_groups(
+        handle, llm, generation, sys_prompt, usr_template,
+        original, groups, n, roster,
+        stage="归属抽样", progress_base=0.98, progress_span=0.018,
+        on_first_map=_gauge,
+    )
+    fixed, unwrapped = rep["fixed"], rep["unwrapped"]
+    random_errors, risk_errors = bucket_errors
     stats["fixed"] = fixed
     stats["random_errors"] = random_errors
     stats["risk_errors"] = risk_errors
@@ -1900,7 +2147,7 @@ def spot_check_speakers(handle, llm: LLMConfig, generation: GenerationConfig,
             f"归属抽样完成：抽查 {stats['checked']} 条，更正 {fixed} 条 speaker"
             + (f"、{unwrapped} 条台词去引号" if unwrapped else "")
         )
-    return (result if (fixed or unwrapped) else entries), stats
+    return result, stats
 
 
 # ---------------------------------------------------------------------------
@@ -1986,12 +2233,32 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     Contract: first arg is the :class:`TaskHandle``; the second is the absolute path of
     the source ``.txt``. This is the per-file, concurrent form of the old text-paste
     worker: each file is its own independent task with its own LLM requests, status,
-    and output. Concurrency is bounded by the shared gate (``core.concurrency``) so a
-    large batch can't open more simultaneous LLM calls than
-    ``generation.max_concurrency``. The result is written to
+    and output. Concurrency is bounded by the shared gate (``core.concurrency``) —
+    a task holds ONE slot for the **LLM chunk-parse stage only**: file read /
+    decode / chunk-split happen before taking the slot (prep, so prefetched files
+    from an ordered dispatch can be ready before their turn), and the slot is
+    released the moment the chunk loop ends, so the four mechanical check stages
+    (whose re-judgment LLM calls are comparatively rare) run slot-free and a
+    prefetched file can take the freed slot immediately. The result is written to
     ``03_parsed_json/<source-stem>.json`` (one file per source, no scratch dir).
+    Progress is scaled so 100% means done: the parse stage owns [0, 0.9) and the
+    check stages own [0.9, 1.0] (boundary check [0.9, 0.96), re-validation
+    [0.96, 0.98), spot audit [0.98, 0.998)).
     ``llm`` / ``prompts`` / ``generation`` are the config section objects; empty
     ``prompts`` fall back to the bundled defaults.
+
+    First in the check phase, a chunk-boundary re-check (``boundary_check_speakers``,
+    ``generation.check_boundary_speakers`` — default on) re-judges the n entries
+    flanking each INTERNAL chunk boundary (n = ``check_context_window``) through
+    the same bundled re-judgment prompts and shared batch protocol: chunk cuts
+    sever cross-chunk context, so boundary entries parsed without the other side's
+    dialogue/character context are the classic speaker-misjudgment site. Context
+    entries in the window are judgment aids ONLY — never modified; only target
+    entries may change (and only ``speaker`` + the mechanical outer-quote strip).
+    Windows are prebuilt from the PRISTINE entry list, which is why this stage runs
+    BEFORE the split validator and the tag cleaner (both shift entry indices).
+    Gated off → skipped with one log line and zeroed ``boundary_*`` result fields.
+    No history file (no gauge semantics — the gauge belongs to the spot audit).
 
     After all chunks are parsed, entries whose stored text is wrapped in outer
     double quotes that still contain a ``…道：`` speech tag inside are treated as
@@ -2026,48 +2293,64 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     NEVER auto-reduced (the user decides manually from the settings page).
     ``rng`` (tests) injects a seeded ``random.Random`` for deterministic sampling.
     """
-    # Fail fast on a misconfigured model *before* taking a concurrency slot.
+    # Fail fast on a misconfigured model *before* doing any work.
     if not (llm.model_name or "").strip():
         raise RuntimeError("请先在「文本解析」页配置 LLM 模型名称（模型不能为空）。")
 
     src = Path(path)
-    # Wait for a concurrency slot, then do the (LLM-heavy) work while holding it.
-    handle.progress(0.0, "排队中（等待并发槽位）")
-    gate().acquire()
+    # -- 预备阶段（不占槽）：读文件 / 解码 / 分 chunk。廉价且零 LLM 调用，放在占槽
+    # 之前，让「有序投放 + 预取」的批次里预取任务可以提前备好、排队等槽（见
+    # api/script.py 的批次协调者）。
+    if not src.is_file():
+        raise RuntimeError(f"文件不存在：{src.name}")
+    raw = src.read_bytes()
+    if not raw:
+        raise RuntimeError(f"{src.name} 内容为空。")
     try:
-        if not src.is_file():
-            raise RuntimeError(f"文件不存在：{src.name}")
-        raw = src.read_bytes()
-        if not raw:
-            raise RuntimeError(f"{src.name} 内容为空。")
-        try:
-            text, _enc = decode_buffer(raw)
-        except ValueError as e:
-            raise RuntimeError(f"{src.name} 无法解码：{e}")
-        body = (text or "").strip()
-        if not body:
-            raise RuntimeError(f"{src.name} 无有效文本。")
+        text, _enc = decode_buffer(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{src.name} 无法解码：{e}")
+    body = (text or "").strip()
+    if not body:
+        raise RuntimeError(f"{src.name} 无有效文本。")
 
-        body = fix_mojibake(body)
-        handle.log(f"读入 {src.name}（{len(body)} 字）")
+    body = fix_mojibake(body)
+    handle.log(f"读入 {src.name}（{len(body)} 字）")
 
-        chunks = split_into_chunks(body, max_size=generation.chunk_size)
-        total = len(chunks)
-        if total == 0:
-            raise RuntimeError("未从文件切分出任何片段。")
-        handle.log(f"按段落/句子边界切分为 {total} 段（每段约 {generation.chunk_size} 字）")
-        handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
+    chunks = split_into_chunks(body, max_size=generation.chunk_size)
+    total = len(chunks)
+    if total == 0:
+        raise RuntimeError("未从文件切分出任何片段。")
+    handle.log(
+        f"切分为 {total} 段（目标均长约 {generation.chunk_size} 字，"
+        f"切点吸附最近合法结构边界）"
+    )
+    handle.log(f"模型：{llm.model_name} · 端点：{llm.base_url}")
+    handle.check()  # 排队前到达的取消/暂停就地生效
 
+    # -- LLM 分段解析阶段（持槽）：槽位只覆盖这一阶段——chunk 循环一结束就 release，
+    # 机械检查阶段（角色匹配检查 / 断句校验 / 标签删除 / 归属抽样）不占槽，
+    # 让后续预取任务及时补位。
+    handle.progress(0.0, "排队中（等待并发槽位）")
+    if not gate().acquire(stop_check=lambda: handle.cancelled):
+        raise TaskCancelled()  # 排队等待中被取消——未取槽，下面 finally 不得 release
+    handle.phase("parse")
+    slot_released = False
+    try:
         sys_prompt = prompts.system_prompt or DEFAULT_SYSTEM_PROMPT
         usr_template = prompts.user_prompt or DEFAULT_USER_PROMPT
 
         all_entries = []
+        chunk_ends = []  # 每段结束时的累计条目数——chunk 边界簿记（角色匹配检查用）
         processed_chars = 0  # 累计已处理原始字符数（处理速度 的分子），每完成一段累加
         proc_start = time.monotonic()  # 本文件开始逐段处理的时刻（处理速度分母冻结于每段完成）
         for i, chunk in enumerate(chunks, 1):
             handle.check()  # cooperative cancel / pause between chunks
             handle.log(f"处理第 {i}/{total} 段（{len(chunk)} 字）…")
-            handle.progress((i - 1) / total, f"处理第 {i}/{total} 段")
+            # The LLM parse stage owns [0, 0.9) of the progress bar — 0.9..1.0 is
+            # reserved for the (slot-free) mechanical check stages, so a running
+            # task never reads as 100% before it is actually done.
+            handle.progress(0.9 * (i - 1) / total, f"处理第 {i}/{total} 段")
             handle.llm_rate(0, 0.0)  # reset the 字/s gauge per chunk (0 until the stream reports)
             previous = all_entries if all_entries else None
             entries = process_chunk(
@@ -2084,6 +2367,7 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
                 banned_tokens=generation.banned_tokens,
             )
             all_entries.extend(entries)
+            chunk_ends.append(len(all_entries))
             handle.log(f"  得到 {len(entries)} 条")
             # 每段完成后上报"累计原始字符数 + 到本段为止的处理耗时"，让处理速度（Σ字÷Σ耗时）
             # 按段刷新、段间保持不变（耗时冻结于本段完成时刻，而非实时时钟，故不会持续衰减）。
@@ -2093,6 +2377,26 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
 
         if not all_entries:
             raise RuntimeError("未生成任何脚本条目。")
+
+        # LLM 分段解析完成 → 释放槽位（预取补位点：后续排队任务立即拿到槽开始解析）。
+        # 四机械检查阶段的 LLM 重判调用从此不再计入并发上限——有意语义：文件进入
+        # 机械检查即让出解析槽，避免等待造成 LLM 资源空闲。
+        gate().release()
+        slot_released = True
+        handle.phase("check")
+        handle.progress(0.9, "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 归属抽样）")
+
+        # 角色匹配检查（检查段最前——断句校验拆条、标签删除删条都会移动下标，
+        # 本阶段窗口必须取自 pristine 列表）：用跨边界窗口重判每个内部 chunk
+        # 边界两侧各 n 条的 speaker（上下文仅辅助，只有 target 可被修改）。
+        if generation.check_boundary_speakers:
+            all_entries, boundary_stats = boundary_check_speakers(
+                handle, llm, generation, all_entries, chunk_ends,
+            )
+        else:
+            # 开关关闭：整体跳过并留一行日志（防静默被误读为阶段缺失），结果字段保持 0。
+            handle.log("角色匹配检查已关闭（配置）——本任务跳过该阶段")
+            boundary_stats = {"checked": 0, "fixed": 0}
 
         # 断句失败校验（机械旁白合并之前——拆出的旁白段随后照常合并）：外层双引号
         # 包裹、引号内含「…道：」标签的条目 = 疑似断句失败 → 带上下文窗口重跑解析
@@ -2173,6 +2477,9 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "output_name": out_name,
             "count": len(all_entries),
             "merged_narrator": merged_pairs,
+            # 角色匹配检查（解析内 chunk 边界重判；开关关闭时为 0）
+            "boundary_checked": boundary_stats["checked"],
+            "boundary_fixed": boundary_stats["fixed"],
             "suspicious": suspicious,
             "suspicious_fixed": suspicious_fixed,
             # 纯归属标签清理：确定性删除的独立短标签条数（零 LLM 成本；开关关闭时为 0）
@@ -2191,4 +2498,9 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "input_chars": len(body),
         }
     finally:
-        gate().release()
+        # Exactly one release per path: success path already released before the
+        # check stages (slot_released=True); any abort DURING the parse stage
+        # (cancel / error) releases here; the acquire-abort path (stop_check) and
+        # the prep-stage failures never took a slot and must not release.
+        if not slot_released:
+            gate().release()

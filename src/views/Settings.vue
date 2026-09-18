@@ -137,7 +137,7 @@ async function save() {
         <CardHeader>
           <CardTitle class="flex items-center gap-2"><Palette class="h-5 w-5" />外观主题</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent class="space-y-4">
           <div class="flex gap-2">
             <Button
               v-for="t in THEMES"
@@ -147,6 +147,17 @@ async function save() {
             >
               <component :is="t.icon" class="h-4 w-4" />{{ t.label }}
             </Button>
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">解析日志显示</Label>
+              <Switch v-model="draft.ui.show_parse_logs" />
+            </div>
+            <p class="text-xs text-muted-foreground">
+              开启 = 文本解析页显示「解析进度」日志区（每文件实时日志 + 流式反馈，三性能指标在日志区内）；
+              关闭（默认）= 隐藏整个日志区，三性能指标移到「开始处理」按钮下方。
+              每文件行内的进度条 / 速度 / 状态始终显示，不受此开关影响。
+            </p>
           </div>
         </CardContent>
       </Card>
@@ -258,7 +269,11 @@ async function save() {
               </span>
             </div>
           </div>
-          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">角色匹配检查</Label>
+              <Switch v-model="draft.generation.check_boundary_speakers" />
+            </div>
             <div class="flex items-center justify-between">
               <Label class="font-normal">断句失败校验</Label>
               <Switch v-model="draft.generation.revalidate_splits" />
@@ -269,8 +284,10 @@ async function save() {
             </div>
           </div>
           <p class="text-xs text-muted-foreground">
-            解析内的两个检查阶段：断句失败校验（疑似断句失败的条目逐条重判）与纯归属标签删除
-            （独立短标签条确定性删除，不经 LLM）。关闭 = 解析时跳过该阶段并记录日志。
+            解析内的三个检查阶段：角色匹配检查（chunk 切割会切断跨段上下文，用跨 chunk 上下文窗口
+            重判边界两侧条目，上下文仅辅助判断、只有目标条目可被修改）、断句失败校验（疑似断句失败的
+            条目逐条重判）与纯归属标签删除（独立短标签条确定性删除，不经 LLM）。关闭 = 解析时跳过该
+            阶段并记录日志。
           </p>
         </CardContent>
       </Card>

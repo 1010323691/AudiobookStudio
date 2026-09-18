@@ -467,6 +467,8 @@ export interface TaskSnapshot {
   created: number
   started: number
   finished: number
+  /** Monotonic creation order (backend `itertools.count`) — batch order after reload. */
+  seq: number
 }
 export type TaskControl = 'cancel' | 'pause' | 'resume' | 'retry'
 
@@ -532,12 +534,14 @@ export interface AppConfig {
     revalidate_splits: boolean
     /** 纯归属标签条删除开关（解析内阶段；关闭 = 跳过该阶段并记录日志）。 */
     delete_saying_tags: boolean
-    /** 解析内重判批大小（断句失败校验 / 归属抽样共用）；不在设置页露出。 */
+    /** 角色匹配检查开关（解析内阶段，重判 chunk 边界两侧条目；关闭 = 跳过该阶段并记录日志）。 */
+    check_boundary_speakers: boolean
+    /** 解析内重判批大小（角色匹配检查 / 断句失败校验 / 归属抽样共用）；不在设置页露出。 */
     check_batch_size: number
-    /** 解析内重判上下文窗口（断句失败校验 / 归属抽样共用）；不在设置页露出。 */
+    /** 解析内重判上下文窗口（角色匹配检查 / 断句失败校验 / 归属抽样共用）；不在设置页露出。 */
     check_context_window: number
   }
-  ui: { theme: string }
+  ui: { theme: string; show_parse_logs: boolean }
 }
 
 /** A recursively-partial ``AppConfig`` — mirrors the backend's deep-merge ``update_config``

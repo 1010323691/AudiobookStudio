@@ -14,7 +14,7 @@ import pytest
 
 from backend.core import config as core_config
 from backend.core import paths as core_paths
-from backend.core.config import AppConfig, GenerationConfig, TTSConfig, _deep_update
+from backend.core.config import AppConfig, GenerationConfig, TTSConfig, UIConfig, _deep_update
 
 
 # --------------------------------------------------------------------------- #
@@ -69,11 +69,13 @@ def test_tts_config_planner_check_defaults():
 # --------------------------------------------------------------------------- #
 
 def test_generation_config_check_stage_defaults():
-    # 断句失败校验 / 纯归属标签条清理 default ON (existing behavior unchanged); the
-    # re-judgment batch geometry moved here from the deleted ``speaker_check`` section.
+    # 断句失败校验 / 纯归属标签条清理 / 角色匹配检查 default ON (existing behavior
+    # unchanged); the re-judgment batch geometry moved here from the deleted
+    # ``speaker_check`` section.
     g = GenerationConfig()
     assert g.revalidate_splits is True
     assert g.delete_saying_tags is True
+    assert g.check_boundary_speakers is True
     assert g.check_batch_size == 20
     assert g.check_context_window == 4
     assert g.spot_check_rate == 0.05
@@ -96,6 +98,35 @@ def test_app_config_round_trips():
     assert back.tts.pause_between_speakers_ms == 500
     assert back.tts.design_model == "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     assert back.persona_prompts is not None
+
+
+# --------------------------------------------------------------------------- #
+# UIConfig: 解析日志显示开关（解析页日志区显隐 + 三指标位置）
+# --------------------------------------------------------------------------- #
+
+def test_ui_config_show_parse_logs_default_off():
+    # 默认关：解析页隐藏「解析进度」日志区，三指标移到「开始处理」按钮下方。
+    u = UIConfig()
+    assert u.show_parse_logs is False
+    assert u.theme == "system"
+
+
+def test_ui_config_round_trips_show_parse_logs():
+    data = AppConfig().model_dump()
+    data["ui"]["show_parse_logs"] = True
+    back = AppConfig.model_validate(data)
+    assert back.ui.show_parse_logs is True
+    # 再次落盘/重读不丢字段（schema 稳定）。
+    again = AppConfig.model_validate(back.model_dump())
+    assert again.ui.show_parse_logs is True
+
+
+def test_ui_config_missing_field_falls_back_to_default():
+    # 旧工作空间配置缺该字段 → Pydantic 默认值填充（False），读取链不报错。
+    data = AppConfig().model_dump()
+    del data["ui"]["show_parse_logs"]
+    cfg = AppConfig.model_validate(data)
+    assert cfg.ui.show_parse_logs is False
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +234,19 @@ def test_update_config_writes_workspace_and_forces_pointer(sandbox):
     # The value landed in the workspace config; the ROOT template is untouched:
     assert _read(ws / "config" / "app.json")["tts"]["batch_concurrency"] == 5
     assert _read(sandbox / "app.json")["paths"]["working_dir"] == str(ws)
+
+
+def test_update_config_persists_ui_show_parse_logs(sandbox):
+    # 设置页保存「解析日志显示」→ 工作空间配置落盘（根模板不动）。
+    ws = sandbox / "MyBook"
+    core_config.init_workspace_config(ws)  # seeds ws/config/app.json
+    core_config.set_workspace_pointer(str(ws))
+
+    cfg = core_config.update_config({"ui": {"show_parse_logs": True}})
+    assert cfg.ui.show_parse_logs is True
+    assert _read(ws / "config" / "app.json")["ui"]["show_parse_logs"] is True
+    # 再读（缓存已更新）保持 True。
+    assert core_config.get_config().ui.show_parse_logs is True
 
 
 def test_init_workspace_config_copies_template_and_sets_pointer(sandbox):
