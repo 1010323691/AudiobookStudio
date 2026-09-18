@@ -76,9 +76,6 @@ const busySplit = ref(false)
 const splitResult = ref<BookSplitResult | null>(null)
 const busySmart = ref(false)
 const smartResult = ref<BookSmartSplitResult | null>(null)
-const asZip = ref(false)
-// 零章节时用户选择「不处理，按整本继续」（whole_book 分册）。
-const wholeBookArmed = ref(false)
 // 章节序号警告（缺号/重号/乱序）被「不处理，继续」关闭（非阻断，仅为提示）。
 const seqWarningDismissed = ref(false)
 // 智能识别覆盖分析前，原始排版识别到的章节数（章节分析卡「已覆盖」注记用）。
@@ -86,13 +83,20 @@ const smartOriginalCount = ref<number | null>(null)
 const error = ref('')
 
 const zeroChapters = computed(() => !!analysis.value && analysis.value.chapter_count === 0)
-const showWholeBookPrompt = computed(() => !!analysis.value && zeroChapters.value && !wholeBookArmed.value)
-const wholeBookArmedView = computed(() => !!analysis.value && zeroChapters.value && wholeBookArmed.value)
+// 零章节整本分册已完成（提示条从「选择」切换为「已按整本处理」注记）。
+const wholeBookDone = computed(() => zeroChapters.value && !!splitResult.value)
 const showSeqWarning = computed(
   () => !!analysis.value && !zeroChapters.value && analysis.value.sequence.hasIssues && !seqWarningDismissed.value,
 )
+// 分册 = 按智能识别结果（智能识别完成后才可分册）。
 const splitEnabled = computed(
-  () => !!analysis.value && (analysis.value.chapter_count > 0 || wholeBookArmed.value) && !busySplit.value && workspaceSet.value,
+  () =>
+    !!formatResult.value &&
+    !!smartResult.value &&
+    !!analysis.value &&
+    analysis.value.chapter_count > 0 &&
+    !busySplit.value &&
+    workspaceSet.value,
 )
 // 智能识别：需要排版产物 + 至少一个章节；任何环节忙碌时禁用。
 const smartEnabled = computed(
@@ -122,7 +126,6 @@ function resetDownstream() {
   splitResult.value = null
   smartResult.value = null
   error.value = ''
-  wholeBookArmed.value = false
   seqWarningDismissed.value = false
   smartOriginalCount.value = null
 }
@@ -183,35 +186,40 @@ watch(
   },
 )
 
-function armWholeBook() {
-  wholeBookArmed.value = true
-}
-
 function proceedAnyway() {
   seqWarningDismissed.value = true
 }
 
+// 分册 = 按智能识别结果拆分：后端重跑确定性修复（同输入 → 同结果），写出与
+// 智能识别完全相同的「第 NNN 章 标题.txt」文件（不产生第二套命名）。
 async function split() {
-  if (!splitEnabled.value || !formatResult.value || busySplit.value) return
+  if (!splitEnabled.value || !formatResult.value) return
   busySplit.value = true
   error.value = ''
-  const whole = zeroChapters.value && wholeBookArmed.value
-  // 智能识别执行后，分册 = 按智能识别结果拆分：后端重跑确定性修复，写出与
-  // 智能识别完全相同的「第 NNN 章 标题.txt」文件（不产生第二套命名）。
-  const smart = !whole && !!smartResult.value
   try {
-    const r = await splitBook(formatResult.value.output_path, { asZip: asZip.value, wholeBook: whole, smart })
+    const r = await splitBook(formatResult.value.output_path, { smart: true })
     splitResult.value = r
-    toast(
-      whole
-        ? { title: '分册完成', variant: 'success', description: `已生成整本文件 ${r.files[0]?.name ?? ''}` }
-        : smart
-          ? { title: '分册完成', variant: 'success', description: `已按智能识别结果生成 ${r.file_count} 个分册文件` }
-          : { title: '分册完成', variant: 'success', description: `生成 ${r.file_count} 个分册文件` },
-    )
+    toast({ title: '分册完成', variant: 'success', description: `已按智能识别结果生成 ${r.file_count} 个分册文件` })
   } catch (e: any) {
     error.value = e?.message || '分册失败'
     toast({ title: '分册失败', variant: 'destructive', description: error.value })
+  } finally {
+    busySplit.value = false
+  }
+}
+
+// 零章节「不处理，按整本继续」：直接写单个 `<base> 全书.txt`（唯一不经智能识别的分册路径）。
+async function runWholeBook() {
+  if (!formatResult.value || !analysis.value || !workspaceSet.value || busySplit.value) return
+  busySplit.value = true
+  error.value = ''
+  try {
+    const r = await splitBook(formatResult.value.output_path, { wholeBook: true })
+    splitResult.value = r
+    toast({ title: '整本分册完成', variant: 'success', description: `已生成整本文件 ${r.files[0]?.name ?? ''}` })
+  } catch (e: any) {
+    error.value = e?.message || '整本分册失败'
+    toast({ title: '整本分册失败', variant: 'destructive', description: error.value })
   } finally {
     busySplit.value = false
   }
@@ -224,7 +232,7 @@ async function runSmart() {
   busySmart.value = true
   error.value = ''
   try {
-    const r = await smartSplitBook(formatResult.value.output_path, { asZip: asZip.value })
+    const r = await smartSplitBook(formatResult.value.output_path)
     smartResult.value = r
     // 用修复结果覆盖原始排版识别：此后「章节分析」卡展示修复后的 1..N 结构
     //（缺号/重号/乱序警告随之消失），「开始分册」也按这份结果拆分文件。
@@ -352,15 +360,6 @@ function download(p: string) {
         <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': busyFormat || busyAnalyze }" />
         {{ busyFormat ? '排版中…' : busyAnalyze ? '章节分析中…' : '开始排版' }}
       </Button>
-      <div class="flex items-center gap-2">
-        <Label class="font-normal">同时打包</Label>
-        <Switch v-model="asZip" />
-        <span class="text-xs text-muted-foreground">额外生成一个 .zip</span>
-      </div>
-      <Button @click="split" :disabled="!splitEnabled">
-        <Scissors class="h-4 w-4" />
-        {{ busySplit ? '分册中…' : (wholeBookArmedView ? '分册（整本）' : (smartResult ? '分册（智能识别结果）' : '开始分册')) }}
-      </Button>
       <Button
         @click="runSmart"
         :disabled="!smartEnabled"
@@ -369,6 +368,10 @@ function download(p: string) {
       >
         <Sparkles class="h-4 w-4" />
         {{ busySmart ? '智能识别中…' : '智能识别' }}
+      </Button>
+      <Button @click="split" :disabled="!splitEnabled">
+        <Scissors class="h-4 w-4" />
+        {{ busySplit ? '分册中…' : '分册（智能识别结果）' }}
       </Button>
       <Button
         variant="outline"
@@ -381,19 +384,21 @@ function download(p: string) {
 
     <Alert v-if="error" variant="destructive">{{ error }}</Alert>
 
-    <!-- 零章节：整本继续 / 重新上传 二选一 -->
-    <Alert v-else-if="showWholeBookPrompt" variant="warning">
+    <!-- 零章节：整本继续 / 重新上传 二选一（整本分册完成后切换为注记） -->
+    <Alert v-else-if="zeroChapters && !wholeBookDone" variant="warning">
       <AlertTriangle class="h-4 w-4 shrink-0" />
       <div class="space-y-2">
         <p>{{ analysis?.error }}</p>
         <div class="flex gap-2">
-          <Button size="sm" @click="armWholeBook">不处理，按整本继续</Button>
+          <Button size="sm" :disabled="busySplit || !formatResult || !workspaceSet" @click="runWholeBook">
+            不处理，按整本继续
+          </Button>
           <Button size="sm" variant="outline" @click="resetPage">重新上传原文</Button>
         </div>
       </div>
     </Alert>
-    <Alert v-else-if="wholeBookArmedView" variant="info">
-      已按整本处理：全部文本将写为单个文件 <code class="text-xs">{{ analysis?.base }} 全书.txt</code>。
+    <Alert v-else-if="wholeBookDone" variant="info">
+      已按整本处理：全部文本已写为单个文件 <code class="text-xs">{{ splitResult?.files[0]?.name }}</code>。
     </Alert>
 
     <!-- 排版结果 -->
@@ -514,10 +519,7 @@ function download(p: string) {
       </CardHeader>
       <CardContent>
         <p class="text-sm text-muted-foreground">
-          未检测到任何章节（系统识别的格式：{{ analysis.expected_format }}）。
-          <template v-if="wholeBookArmed">
-            将输出单个文件：<code class="text-xs">{{ analysis.base }} 全书.txt</code>
-          </template>
+          未检测到任何章节（系统识别的格式：{{ analysis.expected_format }}）。可「不处理，按整本继续」或重新上传原文。
         </p>
       </CardContent>
     </Card>
@@ -554,10 +556,7 @@ function download(p: string) {
           </TableBody>
         </Table>
       </CardContent>
-      <CardFooter class="justify-between">
-        <Button v-if="splitResult.zip_path" variant="outline" size="sm" @click="downloadFile('02_split_text', splitResult.zip_path!)">
-          <Download class="h-4 w-4" />下载 zip
-        </Button>
+      <CardFooter>
         <Button size="sm" @click="goNext">前往下一步（文本解析）<ArrowRight class="h-4 w-4" /></Button>
       </CardFooter>
     </Card>
@@ -665,10 +664,7 @@ function download(p: string) {
           推断拆分（低置信）与已删除章节请对照上方报告人工核对。
         </p>
       </CardContent>
-      <CardFooter class="justify-between">
-        <Button v-if="smartResult.zip_path" variant="outline" size="sm" @click="downloadFile('02_split_text', smartResult.zip_path!)">
-          <Download class="h-4 w-4" />下载 zip
-        </Button>
+      <CardFooter>
         <Button size="sm" @click="goNext">前往下一步（文本解析）<ArrowRight class="h-4 w-4" /></Button>
       </CardFooter>
     </Card>

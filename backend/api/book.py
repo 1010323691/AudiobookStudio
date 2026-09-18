@@ -1,13 +1,16 @@
 """Book-splitting endpoints (module: 分册, the split half of 排版与分册).
 
-``POST /api/book/analyze`` previews the split (chapters + per-chapter filenames,
-no files written); ``POST /api/book/split`` writes ONE file per chapter to the
-workspace's ``02_split_text/`` (or a single ``<base> 全书.txt`` when
-``whole_book=True``), optionally a STORE zip as well. Both honour the "no
-chapters -> stop, never force-split" invariant — only an explicit ``whole_book``
-request bypasses it. ``POST /api/book/smart-split`` (智能识别) mechanically
-repairs the chapter structure and writes renumbered ``第 NNN 章 标题.txt``
-files into the same directory, always reporting every inferred action.
+``POST /api/book/analyze`` previews the chapter structure (chapters + per-chapter
+filenames, no files written). ``POST /api/book/split`` writes files to the
+workspace's ``02_split_text/`` — either ONE file per repaired chapter
+(``smart=true``: re-runs the deterministic repair, byte-identical to
+``/smart-split``) or a single ``<base> 全书.txt`` (``whole_book=true``, the
+zero-chapter fallback); plain original-structure splitting has been removed.
+``POST /api/book/smart-split`` (智能识别) mechanically repairs the chapter
+structure and writes renumbered ``第 NNN 章 标题.txt`` files into the same
+directory, always reporting every inferred action. Both honour the "no chapters
+-> stop, never force-split" invariant — only an explicit ``whole_book`` request
+bypasses it.
 """
 from __future__ import annotations
 
@@ -28,14 +31,12 @@ class AnalyzeRequest(BaseModel):
 class SplitRequest(BaseModel):
     path: str
     base: str | None = None  # override the base (file) name
-    as_zip: bool = False
     whole_book: bool = False  # write the entire text as one ``<base> 全书.txt``
     smart: bool = False  # split by the SMART-REPAIRED structure (智能识别结果)
 
 
 class SmartSplitRequest(BaseModel):
     path: str
-    as_zip: bool = False
 
 
 def _prepare(path: str) -> dict:
@@ -111,48 +112,37 @@ def split(req: SplitRequest) -> dict:
         # \r\n on Windows and corrupt the round-trip guarantee.
         out_path.write_bytes(data)
         written = [{"name": name, "path": str(out_path), "chars": analysis["totalChars"]}]
-        zip_entries = [(name, data)]
+    elif not req.smart:
+        # 普通「按原识别结构分册」已从 UI 与 API 移除：分册只按智能识别结果
+        # （smart=true）或零章节整本（whole_book=true）。
+        raise HTTPException(
+            400, "分册须按智能识别结果（smart=true）或整本（whole_book=true）进行。"
+        )
     else:
+        # 按智能识别结果分册：重跑确定性修复（同输入 → 同结果），写出与
+        # /smart-split 完全相同的「第 NNN 章 标题.txt」文件——不产生第二套
+        # 命名，02_split_text/ 里只有一套章节文件。
         if not chapters:
             raise HTTPException(
-                400, "未检测到章节，无法分册。请先在页面选择「不处理，按整本继续」或重新上传原文。"
+                400, "未检测到章节，无法分册。请先在提示条中选择「不处理，按整本继续」或重新上传原文。"
             )
-        if req.smart:
-            # 按智能识别结果分册：重跑确定性修复（同输入 → 同结果），写出与
-            # /smart-split 完全相同的「第 NNN 章 标题.txt」文件——不产生第二套
-            # 命名，02_split_text/ 里只有一套章节文件。
-            repair = B.smart_repair(prep["text"], chapters)
-            if repair["status"] == "error":
-                raise HTTPException(400, repair.get("error") or "智能识别失败，请检查原文。")
-            chapters = repair["chapters"]
-            filenames = B.make_smart_filenames(chapters)
-        else:
-            filenames = B.make_chapter_filenames(base, chapters)
+        repair = B.smart_repair(prep["text"], chapters)
+        if repair["status"] == "error":
+            raise HTTPException(400, repair.get("error") or "智能识别失败，请检查原文。")
+        chapters = repair["chapters"]
+        filenames = B.make_smart_filenames(chapters)
         written = []
-        zip_entries = []
         for ch, fname in zip(chapters, filenames):
             data = B.chapter_content(analysis, ch).encode("utf-8")
             out_path = layout.split_text / fname
             out_path.write_bytes(data)
             written.append({"name": fname, "path": str(out_path), "chars": ch["chars"]})
-            zip_entries.append((fname, data))
 
-    result: dict = {
+    return {
         "output_dir": str(layout.split_text),
         "file_count": len(written),
         "files": written,
     }
-    if req.as_zip:
-        if not req.whole_book and req.smart:
-            # Same content as /smart-split → same zip name, so 02_split_text/
-            # keeps a single smart zip (no second, conflicting archive).
-            zip_name = B.sanitize_file_name(f"{base} 智能识别.zip")
-        else:
-            zip_name = f"{base}.zip"
-        zip_path = layout.split_text / zip_name
-        B.build_zip(zip_entries, zip_path)
-        result["zip_path"] = str(zip_path)
-    return result
 
 
 @router.post("/smart-split")
@@ -176,16 +166,13 @@ def smart_split(req: SmartSplitRequest) -> dict:
         raise HTTPException(400, repair.get("error") or "智能识别失败，请检查原文。")
 
     layout = get_layout()
-    base = prep["base"]
     filenames = B.make_smart_filenames(repair["chapters"])
     written = []
-    zip_entries = []
     for ch, fname in zip(repair["chapters"], filenames):
         data = B.chapter_content(analysis, ch).encode("utf-8")
         out_path = layout.split_text / fname
         out_path.write_bytes(data)
         written.append({"name": fname, "path": str(out_path), "chars": ch["chars"]})
-        zip_entries.append((fname, data))
 
     result: dict = {
         "status": repair["status"],
@@ -210,8 +197,4 @@ def smart_split(req: SmartSplitRequest) -> dict:
         "original_count": repair["original_count"],
         "expected_format": B.EXPECTED_CHAPTER_FORMAT,
     }
-    if req.as_zip:
-        zip_path = layout.split_text / B.sanitize_file_name(f"{base} 智能识别.zip")
-        B.build_zip(zip_entries, zip_path)
-        result["zip_path"] = str(zip_path)
     return result

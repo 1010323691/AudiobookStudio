@@ -86,7 +86,6 @@ export interface BookSplitResult {
   output_dir: string
   file_count: number
   files: BookSplitFile[]
-  zip_path?: string
 }
 
 // ------------------------------ book · smart split ------------------------------
@@ -128,7 +127,6 @@ export interface BookSmartSplitResult {
   output_dir: string
   file_count: number
   files: BookSplitFile[]
-  zip_path?: string
   chapters: SmartSplitChapter[]
   report: {
     actions: SmartRepairAction[]
