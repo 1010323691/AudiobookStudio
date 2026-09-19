@@ -209,6 +209,11 @@ class GenerationConfig(BaseModel):
     # 纯标点条目吸收（解析内第六阶段，确定性零 LLM 成本）：整条无任何词字符的条目
     # （独立「……」/「？」等）并入相邻 NARRATOR 条目（标题守卫），无 NARRATOR 邻接则删除。
     absorb_punct_entries: bool = True
+    # 同人段落合并（解析内机械后处理，确定性零 LLM 成本；置于超长机械分段**之前**）：
+    # 连续同 speaker 条目按词字符数合并（块+段 ≤100 或较短一方 ≤10 强制），边界无收尾
+    # 标点补「。」，instruct 取词字符多者，章标题两侧不合并。≤10 强制合并可造出 >
+    # max_paragraph_chars 的块，由随后的机械分段切回（200 字硬保证不变）。
+    merge_same_speaker: bool = True
 
 
 class AppConfig(BaseModel):

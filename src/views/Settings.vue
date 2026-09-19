@@ -313,6 +313,10 @@ async function save() {
               <Label class="font-normal">纯标点条目吸收</Label>
               <Switch v-model="draft.generation.absorb_punct_entries" />
             </div>
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">同人段落合并</Label>
+              <Switch v-model="draft.generation.merge_same_speaker" />
+            </div>
           </div>
           <p class="text-xs text-muted-foreground">
             解析内的五个检查阶段：角色匹配检查（chunk 切割会切断跨段上下文，用跨 chunk 上下文窗口
@@ -320,7 +324,11 @@ async function save() {
             条目逐条重判）、纯归属标签删除（独立短标签条确定性删除，不经 LLM）、超长段落检查
             （超过右侧字数上限的条目先带上下文重跑 LLM 重切，仍超长则按句界 / 子句界 / 定宽机械
             切开——硬保证最终没有任何段落超过上限）、纯标点条目吸收（整条无内容的「……」类条目
-            并入相邻 NARRATOR，无邻接则删除）。关闭 = 解析时跳过该阶段并记录日志。
+            并入相邻 NARRATOR，无邻接则删除）。同人段落合并为机械后处理（不经 LLM）：连续同
+            说话人的条目按词字符数合并（合计 ≤100 字，或较短一方 ≤10 字强制合并），边界无收尾
+            标点补「。」，instruct 取文字多的一方，章标题两侧不合并；它运行在超长机械分段
+            **之前**，其强制合并可能造出的超长块由随后的机械分段切回，段落上限硬保证不受影响。
+            关闭 = 解析时跳过该阶段并记录日志。
           </p>
         </CardContent>
       </Card>

@@ -571,6 +571,11 @@ export interface AppConfig {
     /** 纯标点条目吸收开关（解析内阶段 B，确定性零 LLM 成本）：无词字符条目并入相邻
      *  NARRATOR（标题守卫），无邻接则删除。 */
     absorb_punct_entries: boolean
+    /** 同人段落合并开关（解析内机械后处理，确定性零 LLM 成本）：连续同 speaker 条目
+     *  按词字符数合并（块+段 ≤100 字，或较短一方 ≤10 字强制），边界无收尾标点补「。」，
+     *  instruct 取词字符多者，章标题两侧不合并。置于超长机械分段**之前**——其 ≤10 强制
+     *  合并可能造出超上限块，由随后的机械分段切回（段落上限硬保证不变）。 */
+    merge_same_speaker: boolean
   }
   ui: {
     theme: string

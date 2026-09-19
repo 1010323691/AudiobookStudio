@@ -51,7 +51,7 @@ from backend.engines.script import (
     is_suspicious_entry_text,
     long_entry_indices,
     long_paragraph_resplit,
-    merge_adjacent_narrator,
+    merge_adjacent_same_speaker,
     parse_speaker,
     parse_speaker_map_full,
     process_chunk,
@@ -702,10 +702,10 @@ def test_process_chunk_fidelity_unrecoverable_keeps_best(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# 相邻旁白机械合并（merge_adjacent_narrator）
+# 同人段落机械合并（merge_adjacent_same_speaker：连续同 speaker，词字符口径）
 # --------------------------------------------------------------------------- #
 
-def test_merge_narrator_merges_adjacent_run():
+def test_merge_same_speaker_merges_adjacent_run():
     entries = [
         {"speaker": "NARRATOR", "text": "夜色沉了下来", "instruct": "a"},
         {"speaker": "NARRATOR", "text": "风穿过巷子", "instruct": "b"},
@@ -713,63 +713,136 @@ def test_merge_narrator_merges_adjacent_run():
         {"speaker": "NARRATOR", "text": "灯亮了", "instruct": "d"},
     ]
     original = [dict(e) for e in entries]
-    out, n = merge_adjacent_narrator(entries, is_chapter_title)
-    # first entry's instruct survives the merge; the run is one entry; BOB breaks it
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
+    # 边界无收尾标点补「。」；instruct 取词字符多者（6>5 → a）；BOB 打断连续段
     assert n == 1
     assert out == [
-        {"speaker": "NARRATOR", "text": "夜色沉了下来风穿过巷子", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "夜色沉了下来。风穿过巷子", "instruct": "a"},
         {"speaker": "BOB", "text": f"{LQ}回来。{RQ}", "instruct": "c"},
         {"speaker": "NARRATOR", "text": "灯亮了", "instruct": "d"},
     ]
     assert entries == original  # 输入列表不被改动
 
 
-def test_merge_narrator_chains_and_keeps_first_instruct():
+def test_merge_same_speaker_chains_and_keeps_first_instruct():
     entries = [
         {"speaker": "NARRATOR", "text": "一", "instruct": "slow"},
         {"speaker": "NARRATOR", "text": "二", "instruct": "fast"},
         {"speaker": "NARRATOR", "text": "三", "instruct": "loud"},
     ]
-    out, n = merge_adjacent_narrator(entries, is_chapter_title)
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
+    # 三个 1 字段平手 → instruct 取最左（slow）；每个内部边界各补一个「。」
     assert n == 2
-    assert out == [{"speaker": "NARRATOR", "text": "一二三", "instruct": "slow"}]
+    assert out == [{"speaker": "NARRATOR", "text": "一。二。三", "instruct": "slow"}]
 
 
-def test_merge_narrator_keeps_titles_standalone():
+def test_merge_same_speaker_keeps_titles_standalone():
     entries = [
         {"speaker": "NARRATOR", "text": "前章结尾"},
         {"speaker": "NARRATOR", "text": "第十章 舞会"},
         {"speaker": "NARRATOR", "text": "舞会开始了"},
     ]
-    out, n = merge_adjacent_narrator(entries, is_chapter_title)
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
     assert n == 0  # 标题行的前后两侧一律不合并
     assert [e["text"] for e in out] == ["前章结尾", "第十章 舞会", "舞会开始了"]
 
 
-def test_merge_narrator_caps_merged_length():
+def test_merge_same_speaker_caps_merged_word_chars():
+    # 词字符口径：甲×3900 + 乙×200 = 4100 > 4000 且较短方 200 > 10 → 不合并
     a = {"speaker": "NARRATOR", "text": "甲" * 3900}
     b = {"speaker": "NARRATOR", "text": "乙" * 200}
-    out, n = merge_adjacent_narrator([a, b], is_chapter_title, max_len=4000)
-    assert n == 0  # 3900 + 200 = 4100 ≥ 4000 -> 不合并
-    assert out == [a, b]
-
-
-def test_merge_narrator_default_cap_blocks_oversize():
-    # 缺省上限 100 字：60 + 60 = 120 ≥ 100 -> 不合并
-    a = {"speaker": "NARRATOR", "text": "甲" * 60}
-    b = {"speaker": "NARRATOR", "text": "乙" * 60}
-    out, n = merge_adjacent_narrator([a, b], is_chapter_title)
+    out, n = merge_adjacent_same_speaker([a, b], is_chapter_title, max_chars=4000)
     assert n == 0
     assert out == [a, b]
 
 
-def test_merge_narrator_merges_short_run_by_default():
-    # 缺省上限 100 字：40 + 40 = 80 < 100 -> 合并
+def test_merge_same_speaker_default_cap_blocks_oversize():
+    # 缺省上限 100 词字符：60 + 60 = 120 > 100 且较短方 60 > 10 → 不合并
+    a = {"speaker": "NARRATOR", "text": "甲" * 60}
+    b = {"speaker": "NARRATOR", "text": "乙" * 60}
+    out, n = merge_adjacent_same_speaker([a, b], is_chapter_title)
+    assert n == 0
+    assert out == [a, b]
+
+
+def test_merge_same_speaker_merges_short_run_by_default():
+    # 缺省上限 100 词字符：40 + 40 = 80 ≤ 100 → 合并（边界补「。」）
     a = {"speaker": "NARRATOR", "text": "甲" * 40}
     b = {"speaker": "NARRATOR", "text": "乙" * 40}
-    out, n = merge_adjacent_narrator([a, b], is_chapter_title)
+    out, n = merge_adjacent_same_speaker([a, b], is_chapter_title)
     assert n == 1
-    assert out == [{"speaker": "NARRATOR", "text": "甲" * 40 + "乙" * 40}]
+    assert out == [{"speaker": "NARRATOR", "text": "甲" * 40 + "。" + "乙" * 40}]
+
+
+def test_merge_same_speaker_forced_merge_short_member():
+    # ≤10 强制合并：较短一方 5 字 → 即使合并后 > 100 也必合并
+    a = {"speaker": "NARRATOR", "text": "甲" * 100}
+    b = {"speaker": "NARRATOR", "text": "乙" * 5}
+    out, n = merge_adjacent_same_speaker([a, b], is_chapter_title)
+    assert n == 1
+    assert out == [{"speaker": "NARRATOR", "text": "甲" * 100 + "。" + "乙" * 5}]
+
+
+def test_merge_same_speaker_forced_merge_grows_long_block():
+    # 贪心：块已 100 字，后续 5 字段较短方 ≤10 → 强制并入（块 → 105）；
+    # 再后 50 字段：块 105+50=155>100 且较短方 50>10 → 封块、开新块
+    entries = [
+        {"speaker": "BOB", "text": "丙" * 100, "instruct": "x"},
+        {"speaker": "BOB", "text": "丁" * 5, "instruct": "y"},
+        {"speaker": "BOB", "text": "戊" * 50, "instruct": "z"},
+    ]
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
+    assert n == 1
+    assert len(out) == 2
+    assert out[0]["text"] == "丙" * 100 + "。" + "丁" * 5
+    assert out[1]["text"] == "戊" * 50
+
+
+def test_merge_same_speaker_greedy_absorbs_while_within_cap():
+    # 贪心：块+段 ≤100 持续并入；超过即封块
+    entries = [
+        {"speaker": "BOB", "text": "甲" * 40, "instruct": "a"},
+        {"speaker": "BOB", "text": "乙" * 40, "instruct": "b"},
+        {"speaker": "BOB", "text": "丙" * 40, "instruct": "c"},
+    ]
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
+    # 甲(40)+乙(40)=80≤100 并入 → 块 80；丙(40)：80+40=120>100 且较短方 40>10 → 封块
+    assert n == 1
+    assert len(out) == 2
+    assert out[0]["text"] == "甲" * 40 + "。" + "乙" * 40
+    assert out[1]["text"] == "丙" * 40
+
+
+def test_merge_same_speaker_block_becomes_title_blocks_further_merge():
+    # 章标题恒判、无豁免：运行块一旦成为标题即封口（自定义 title_test 命中合并后形态
+    # "楔。子"——楔+子 边界补「。」后的实际形态）
+    def t_test(t):
+        return t == "楔。子"
+    entries = [
+        {"speaker": "NARRATOR", "text": "楔", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "子", "instruct": "b"},
+        {"speaker": "NARRATOR", "text": "很长的一段文字内容在这里面", "instruct": "c"},
+    ]
+    out, n = merge_adjacent_same_speaker(entries, t_test)
+    assert n == 1
+    assert len(out) == 2
+    assert out[0]["text"] == "楔。子"
+    assert out[1]["text"] == "很长的一段文字内容在这里面"
+
+
+def test_merge_same_speaker_instruct_takes_most_word_chars():
+    # instruct 取词字符数最多的成员（非首条）
+    entries = [
+        {"speaker": "BOB", "text": "短", "instruct": "a"},
+        {"speaker": "BOB", "text": "这段文字要长得多一些才行", "instruct": "b"},
+        {"speaker": "BOB", "text": "中", "instruct": "c"},
+    ]
+    out, n = merge_adjacent_same_speaker(entries, is_chapter_title)
+    # 短(1)+长(12)=13≤100 并入；+中(1)：13+1=14≤100 并入 → 一条
+    # 词字符最多 = 长(12) → instruct b
+    assert n == 2
+    assert len(out) == 1
+    assert out[0]["instruct"] == "b"
 
 
 # --------------------------------------------------------------------------- #
@@ -1254,6 +1327,8 @@ def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch,
     # 第 2 条（直引号包裹 + 说道：）重写为单条；第 1 条（弯引号 + 冷笑道：）拆为两段，
     # 拆出的旁白段恰是独立纯归属标签（林某冷笑道。——无引号）→ 被确定性标签清理删除
     # （紧邻台词条目），不再进入机械合并；负例（知道，无冒号）保持原样。
+    # 同人合并（全说话人）：标签删除后「二哥还没出来吗？」与「知道了。」同属林某 → 并 1 对；
+    # 「嗯，去吧。」与「嗯。」同属李四 → 并 1 对；边界已有收尾标点（？/。）故不补「。」。
     source = (
         "夜色像潮水一样漫进街巷。\n"
         f"林某冷笑道：{LQ}二哥还没出来吗？{RQ}\n"
@@ -1300,11 +1375,11 @@ def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch,
     )  # spot_check_rate=0：默认 0.05 会在此跑归属抽样，打破下面的调用数断言
 
     assert calls["n"] == 5  # 1 解析 + 2×2 校验
-    assert result["count"] == 6
+    assert result["count"] == 4  # 6 → 标签删除 1（林某冷笑道。）→ 同人合并 2 对（林某 / 李四各并 1）
     assert result["suspicious"] == 2
     assert result["suspicious_fixed"] == 2
     assert result["tags_deleted"] == 1  # 拆出的旁白段 = 独立纯标签（无引号）→ 删除
-    assert result["merged_narrator"] == 0  # 标签删除后无相邻旁白可合并
+    assert result["merged_same_speaker"] == 2  # 林某对 / 李四对连续同 speaker → 各并 1 对
     assert result["speakers"] == ["NARRATOR", "李四", "林某"]
     assert result["output_name"] == "chapter.json"
     assert result["input_chars"] == len(source.strip())
@@ -1312,11 +1387,9 @@ def test_generate_file_e2e_revalidates_suspicious_entries(tmp_path, monkeypatch,
     out = json.loads((workspace / "03_parsed_json" / "chapter.json").read_text("utf-8"))
     assert [(e["speaker"], e["text"]) for e in out] == [
         ("NARRATOR", "夜色像潮水一样漫进街巷。"),  # 纯标签段已删除，开头旁白保持原样
-        ("林某", "二哥还没出来吗？"),
-        ("林某", f"{LQ}知道了。{RQ}"),
-        ("李四", "嗯，去吧。"),                                # 直引号包裹 → 单条重写
-        ("李四", f"{SQ}嗯。{SQ}"),
-        ("NARRATOR", f"{LQ}他知道了。{RQ}"),                   # 负例（知道，无冒号）原样
+        ("林某", f"二哥还没出来吗？{LQ}知道了。{RQ}"),  # 连续同 speaker → 合并（边界已有 ？无补「。」）
+        ("李四", f"嗯，去吧。{SQ}嗯。{SQ}"),            # 直引号重写 + 原「嗯。」同人合并（边界已有 。无补）
+        ("NARRATOR", f"{LQ}他知道了。{RQ}"),           # 负例（知道，无冒号）原样
     ]
     assert out[0]["instruct"] == "a"
     assert result["entries"] == out
@@ -1396,8 +1469,8 @@ def test_generate_file_delete_tags_off_keeps_tags(tmp_path, monkeypatch, workspa
 
     assert calls["n"] == 1
     assert result["tags_deleted"] == 0
-    assert result["count"] == 2  # 保留的标签条与紧邻旁白合并（机械合并照常运行）
-    assert result["merged_narrator"] == 1
+    assert result["count"] == 2  # 保留的标签条与紧邻旁白合并（同人合并照常运行）
+    assert result["merged_same_speaker"] == 1
     assert any("已关闭（配置）" in msg for _lv, msg in handle.logs)
     out = json.loads((workspace / "03_parsed_json" / "tag3.json").read_text("utf-8"))
     assert [(e["speaker"], e["text"]) for e in out] == [
@@ -1503,7 +1576,7 @@ def test_generate_file_e2e_pure_tag_delete(tmp_path, monkeypatch, workspace):
     assert calls["n"] == 1  # 除解析外零 LLM 调用（断句校验零命中、标签清理纯机械）
     assert result["count"] == 2
     assert result["tags_deleted"] == 1
-    assert result["merged_narrator"] == 0
+    assert result["merged_same_speaker"] == 0
     assert result["suspicious"] == 0
 
     out = json.loads((workspace / "03_parsed_json" / "tag.json").read_text("utf-8"))
@@ -1560,7 +1633,7 @@ def test_generate_file_e2e_pure_tag_gone_before_spot(tmp_path, monkeypatch, work
     assert "瞪眼怒道" not in spot_payloads[0]
     assert result["spot_checked"] == 3
     assert result["spot_fixed"] == 0  # 零分歧 → 无改判
-    assert result["merged_narrator"] == 0
+    assert result["merged_same_speaker"] == 0
 
     out = json.loads((workspace / "03_parsed_json" / "tag2.json").read_text("utf-8"))
     assert [(e["speaker"], e["text"]) for e in out] == [
@@ -2006,14 +2079,14 @@ def test_generate_file_e2e_spot_check(tmp_path, monkeypatch, workspace):
     # 修正已随基文件写出——翻牌条目本身是角色，永不被合并，下标不受影响
     out = json.loads((workspace / "03_parsed_json" / "chapter.json").read_text("utf-8"))
     assert out[flip]["speaker"] == wrong
-    # 其余条目 = 翻牌后的列表经机械旁白合并（spot 阶段在合并之前——与引擎同一确定性链）
+    # 其余条目 = 翻牌后的列表经同人段落合并（spot 阶段在合并之前——与引擎同一确定性链）
     post = [dict(e) for e in parse_entries]
     post[flip]["speaker"] = wrong
-    expected, _merged = merge_adjacent_narrator(post, is_chapter_title)
+    expected, _merged = merge_adjacent_same_speaker(post, is_chapter_title)
     assert [(e["speaker"], e["text"]) for e in out] == \
         [(e["speaker"], e["text"]) for e in expected]
     assert result["count"] == len(expected)
-    assert result["merged_narrator"] == _merged
+    assert result["merged_same_speaker"] == _merged
     # 六个 result 字段
     assert result["spot_checked"] == len(targets)
     assert result["spot_fixed"] == 1
@@ -2119,10 +2192,12 @@ def _expected_entries() -> list:
     ]
 
 
-# 被测阶段之外的检查阶段全部关闭（调用数才能钉死）
+# 被测阶段之外的检查阶段全部关闭（调用数才能钉死）；同人段落合并同样关闭——
+# 边界重判可改出连续同 speaker 对，合并在其**后**运行会坍缩基文件条目数、干扰
+# 「out == 原始 6 条目」的断言（合并本身有专测，不在此处掺入）。
 _STAGES_OFF = dict(
     revalidate_splits=False, delete_saying_tags=False, spot_check_rate=0.0,
-    check_long_paragraphs=False, absorb_punct_entries=False,
+    check_long_paragraphs=False, absorb_punct_entries=False, merge_same_speaker=False,
 )
 
 
@@ -2370,12 +2445,14 @@ def test_boundary_stage_ordering_before_revalidate(tmp_path, monkeypatch, worksp
     handle, result, calls = _boundary_e2e(
         tmp_path, monkeypatch, workspace, rejudge,
         parse_replies=(p1_susp, PARSE_REPLY_P2),
-        delete_saying_tags=False, spot_check_rate=0.0, check_context_window=2)
+        delete_saying_tags=False, spot_check_rate=0.0, check_context_window=2,
+        merge_same_speaker=False)  # 本测锁定边界/断句阶段顺序；合并在其后运行会坍缩
+    # 基文件条目数（E0+E1+E2 同为 林某），干扰对 E1/E2 逐条的断言——合并本身有专测
     # 断句失败校验保持开启（默认）；2 解析 + 边界(首判 + 重试) + 断句(2 次同票)
     assert calls["n"] == 6
     assert result["boundary_checked"] == 4 and result["boundary_fixed"] == 1
     assert result["suspicious"] == 1 and result["suspicious_fixed"] == 1
-    assert result["count"] == 6 and result["merged_narrator"] == 0
+    assert result["count"] == 6 and result["merged_same_speaker"] == 0
 
     # 边界窗口（pristine）：E1 仍是原始 NARRATOR
     b_items = {it["index"]: it for it in _window_from(boundary_users[0], "\n\nRe-judge")}
@@ -2723,8 +2800,55 @@ def test_generate_file_long_paragraph_mech_fallback(tmp_path, monkeypatch, works
     assert out[0]["speaker"] == "NARRATOR" and out[1]["speaker"] == "NARRATOR"
     assert out[0]["instruct"] == "a" and out[1]["instruct"] == ""
     assert out[2] == {"speaker": "林某", "text": "我先走了。", "instruct": "c"}
-    # 机械合并不会回粘（切段和 213 > 100）
-    assert result["merged_narrator"] == 0
+    # 同人合并在机械分段**之前**运行：合并时看到的是切分前的 [NARRATOR 长条, 林某 台词]
+    # （无连续同 speaker 对），切段是末段产物、合并看不到 → 不会回粘（硬保证由末段守住）
+    assert result["merged_same_speaker"] == 0
+
+
+def test_generate_file_merge_before_split_forced_over200(tmp_path, monkeypatch, workspace):
+    # 顺序钉死「合并在切段**前**」：≤10 强制合并（5 ≤ 10；总字数 215 > 100，≤100
+    # 条件不满足、只有强制路径能并）把 210 字段并成 216 字同人块（>200），末段机械
+    # 分段切回 ≤200——若合并在切段之后，会把切段粘回 216 直接破硬保证。
+    long_a = "甲" * 210   # 210 词字符（>200）
+    short_b = "乙" * 5     # 5 词字符（≤10 → 触发强制合并）
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": long_a, "instruct": "a"},
+        {"speaker": "NARRATOR", "text": short_b, "instruct": "b"},
+    ], ensure_ascii=False)
+    # 重切回复 = 原样单条（同人独白过不了多主体门）→ 投票采纳后仍超长 → 交给机械分段
+    resplit_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": long_a, "instruct": "a"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        chunk = user.rsplit("SOURCE TEXT:", 1)[1].strip()
+        if chunk == long_a:
+            return _BodyResp(_chat_payload(resplit_reply))
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "forced.txt"
+    src.write_bytes((long_a + "\n" + short_b + "\n").encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(chunk_size=5000, revalidate_splits=False,
+                         delete_saying_tags=False, spot_check_rate=0.0,
+                         check_boundary_speakers=False),
+    )
+    assert calls["n"] == 3  # 1 解析 + 2 重切（2:0 采纳原样）
+    assert result["long_checked"] == 1 and result["long_fixed"] == 1
+    assert result["merged_same_speaker"] == 1  # 仅 ≤10 强制路径（215 > 100）
+    assert result["long_split"] == 1  # 合并造出的 >200 块由末段切回
+    assert result["count"] == 2  # 216 字 → 定宽切 [200, 16]
+    out = json.loads((workspace / "03_parsed_json" / "forced.json").read_text("utf-8"))
+    assert all(len(e["text"].strip()) <= 200 for e in out)  # 硬保证
+    assert _SKEL("".join(e["text"] for e in out)) == _SKEL(long_a + short_b)  # 骨架无损
+    assert all(e["speaker"] == "NARRATOR" for e in out)
+    assert out[0]["instruct"] == "a" and out[1]["instruct"] == ""
 
 
 def test_generate_file_long_paragraph_off_skips_stage(tmp_path, monkeypatch, workspace):

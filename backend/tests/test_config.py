@@ -90,12 +90,15 @@ def test_generation_config_check_stage_defaults():
     assert g.check_long_paragraphs is True
     assert g.max_paragraph_chars == 200
     assert g.absorb_punct_entries is True
+    # 同人段落合并（机械后处理，置于超长机械分段之前）default ON
+    assert g.merge_same_speaker is True
     # round-trip（自定义值不丢）
     g2 = GenerationConfig(**json.loads(
         json.dumps(g.model_dump(), ensure_ascii=False)))
     assert g2.check_long_paragraphs is g.check_long_paragraphs
     assert g2.max_paragraph_chars == g.max_paragraph_chars
     assert g2.absorb_punct_entries is g.absorb_punct_entries
+    assert g2.merge_same_speaker is g.merge_same_speaker
 
 
 # --------------------------------------------------------------------------- #

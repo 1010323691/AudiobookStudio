@@ -31,7 +31,7 @@ from ..core.paths import get_layout
 from ..core.tasks import TaskCancelled
 from .book import decode_buffer
 from .script_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
-from .text import is_chapter_title
+from .text import ends_sentence, is_chapter_title
 
 IMPLEMENTED = True
 
@@ -920,53 +920,88 @@ def process_chunk(handle, llm, model_name, chunk, chunk_num, total_chunks,
     return entries
 
 
-def merge_adjacent_narrator(entries, title_test, max_len=100):
-    """机械合并相邻 NARRATOR 条目（解析后的确定性后处理，不经 LLM）。
+def merge_adjacent_same_speaker(entries, title_test, max_chars=100, short_cap=10):
+    """机械合并**连续同 speaker** 条目（解析后的确定性后处理，不经 LLM；NARRATOR 与角色同规则）。
 
-    相邻两条同讲者条目会让 TTS 多插一次同人停顿（``pause_same_speaker_ms``）和一个
-    段边界；把连续旁白合成一条，内容不变（text = 两条 text 直接拼接，instruct 取前条）。
-    只合并 NARRATOR：角色台词可能是被拆开的同一句，合并会拉长单行并改变韵律。
+    相邻两条同讲者条目会让 TTS 多插一次同人停顿（``pause_same_speaker_ms``）和一个段边界；
+    合并成一条是内容保真的（除边界补「。」外不改任何字符）。自旧「仅 NARRATOR」版推广到
+    **任意说话人**：角色连续短台词也合并（≤10 强制合并会吞掉对白刻意留白——韵律权衡，
+    ``merge_same_speaker`` 开关可一键回退）。
 
-    章标题守卫：标题行的**前后两侧**都不合并——章节边界处的停顿（上章旁白尾 → 标题 →
-    新章旁白头）正是可听的章节分界，合并会把两章粘在一起。合并出的条目不可能构成新
-    标题（两个非标题拼接不会 ≤40 字且整体匹配标题式），故链式合并只需对新并入的条做
-    标题判定。
+    字数口径 = 词字符数（``_skeleton`` 骨架长度：只留字母/数字/CJK，排除标点/空白/引号）——
+    与「不计标点、空格/换行」一致，**非原文长度**：
+    - 相邻两段同人：合并后总字数 ≤ ``max_chars``（缺省 100）→ 合并；
+    - **强制合并**：较短一方 ≤ ``short_cap``（缺省 10）→ 必合并（即使 > ``max_chars``）；
+    - ≥3 段同人从左到右贪心：维护已合并块，后续段满足（块+该段 ≤ ``max_chars``）或
+      （较短一方 ≤ ``short_cap``）则并入，否则封块、以该段开新块。
 
-    合并后长度须 < ``max_len``（缺省 100 字——100 字行的 TTS 超时预算已相当宽裕；
-    紧上限让合并行保持短小：单行失败代价小、节奏更细，也顺带杜绝无界链式合并造出
-    渲染不完的行）。返回 ``(新条目列表, 合并的对数)``；输入列表不被改动。
+    合并产物：``speaker`` 不变；``text`` 首尾相接、**边界若前段尾（去尾空白）无收尾标点**
+    （``ends_sentence``：。！？…及闭引号等）则补一个「。」（逐边界判定）；``instruct`` 取块内
+    **词字符数最多**的成员（平手取最左）。
+
+    章标题守卫：标题行**前后两侧**都不合并（章节边界处的停顿正是可听的章节分界）。**恒判、
+    无豁免**——旧不变量「两个非标题拼接不构成 ≤40 字标题」为假（反例 ``"楔"``+``"子"`` 各自
+    非标题、强制合并成 ``"楔子"`` = 章标题），故**每次吸收前**都对运行块文本跑 ``title_test``
+    （``is_chapter_title`` >40 字短路，成本可忽略）：块一旦成为标题即封口、不再并入。
+
+    字数上限用词字符、机械分段的 200 硬保证用原文长度（两档口径不同，勿「统一」）；**强制
+    合并可造出 >200 字块**，200 硬保证由**本阶段之后**的机械分段（``split_long_entries``）切回
+    ——本函数只保证内容保真 + 说话人归组，不负责 200 上界。
+
+    返回 ``(新条目列表, 合并对数)``（合并对数 = 吸收步数，3 条并 1 条 = 2，同旧口径）；
+    输入列表不被改动。
     """
     out = []
     merged = 0
-    pending = None  # 运行中的合并条目，与后续每条重新比对（链式合并）
-    i, n = 0, len(entries)
-    while i < n:
-        if pending is None:
-            e = dict(entries[i])  # shallow copy — the input stays pristine
-            is_merged = False
+    # 运行块 = [条目 dict(浅拷贝), 块词字符数, 最佳成员词字符数, 最佳 instruct 原值, 是否已合并]
+    block = None
+
+    def _wc(t):
+        return len(_skeleton(t))
+
+    def _settle(b):
+        # 单条目块原样保留（不注入/不改 instruct）；合并块把 instruct 设为词字符最多
+        # 成员的值——该成员无 instruct 键则删去本键（不凭空造值）。
+        if not b[4]:
+            return
+        if b[3] is None:
+            b[0].pop("instruct", None)
         else:
-            e, pending, is_merged = pending, None, True
-        nxt = entries[i + 1] if i + 1 < n else None
-        # 合并出的条目不可能构成新标题（两个非标题拼接不会 ≤40 字且整体匹配标题式），
-        # 故已合并的 e 免做标题判定；新并入的 nxt 恒判（守卫标题前后两侧）。
-        e_is_title = False if is_merged else title_test(e.get("text") or "")
+            b[0]["instruct"] = b[3]
+
+    for e in entries:
+        text = e.get("text") or ""
+        nxt_wc = _wc(text)
+        if block is None:
+            # [条目 dict(浅拷贝), 块词字符数, 最佳成员词字符数, 最佳 instruct 原值, 是否已合并]
+            block = [dict(e), nxt_wc, nxt_wc, e.get("instruct"), False]
+            continue
+        b_text = block[0].get("text") or ""
+        b_wc = block[1]
         if (
-            nxt is not None
-            and (e.get("speaker") or "") == "NARRATOR"
-            and (nxt.get("speaker") or "") == "NARRATOR"
-            and (nxt.get("text") or "")
-            and not (e_is_title or title_test(nxt.get("text") or ""))
-            and len((e.get("text") or "") + (nxt.get("text") or "")) < max_len
+            text
+            and (e.get("speaker") or "") == (block[0].get("speaker") or "")
+            and not title_test(b_text)
+            and not title_test(text)
+            and (b_wc + nxt_wc <= max_chars or min(b_wc, nxt_wc) <= short_cap)
         ):
-            e["text"] = (e.get("text") or "") + (nxt.get("text") or "")
-            pending = e  # the merged entry is re-examined against the next entry (chain)
+            # 并入：块尾（去尾空白）无收尾标点则边界补「。」（逐边界判定）
+            stripped_tail = b_text.rstrip()
+            boundary = "。" if (stripped_tail and not ends_sentence(stripped_tail)) else ""
+            block[0]["text"] = b_text + boundary + text
+            block[1] = b_wc + nxt_wc  # 词字符可加（「。」是标点，不入骨架）
+            if nxt_wc > block[2]:
+                block[2] = nxt_wc
+                block[3] = e.get("instruct")
+            block[4] = True
             merged += 1
-            i += 1  # nxt was absorbed into the pending entry
         else:
-            out.append(e)
-            i += 1
-    if pending is not None:
-        out.append(pending)  # defensive: the loop always consumes a pending entry
+            _settle(block)
+            out.append(block[0])
+            block = [dict(e), nxt_wc, nxt_wc, e.get("instruct"), False]
+    if block is not None:
+        _settle(block)
+        out.append(block[0])
     return out, merged
 
 
@@ -1823,9 +1858,11 @@ def split_long_entries(entries: list, max_chars: int, title_test) -> tuple:
     instruct 继承（instruct 只给首段——声音指导随段重复会重复朗读），**非级联**
     单遍（切出的段恒 ≤ ``max_chars``，不会再触发）。
 
-    与 ``merge_adjacent_narrator``（<100 字上限）的交互安全：本阶段在其**之后**
-    运行、只切 > ``max_chars``（默认 200）的条目 → 相邻段和 > 200 > 100，切出的段
-    绝不会被回粘合并回去。硬保证：返回后没有任何条目（strip 后）超过 ``max_chars``。
+    与 ``merge_adjacent_same_speaker``（词字符 ≤100 / ≤10 强制合并）的交互：同人合并在
+    本阶段**之前**运行，其 ≤10 强制合并可能造出超过 ``max_chars``（默认 200）的同人块
+    ——本阶段是管线**末段**，负责把这类超限块切回 ≤ ``max_chars``。切出的段绝不会被
+    回粘（本阶段是最后一步，其后无合并）。硬保证：返回后没有任何条目（strip 后）
+    超过 ``max_chars``。
 
     返回 ``(entries, split_count)`` —— 更新后的列表（无修改时原列表对象）、
     被切分的条目数（切出的段总数 = 原条目数 + 各段增量，不在返回值里——日志带
@@ -2798,10 +2835,32 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             handle.log("纯标点条目吸收已关闭（配置）——本任务跳过该阶段")
             punct_absorbed, punct_deleted = 0, 0
 
-        # 超长段落检查·机械分段兜底（管线末段，吸收之后——speaker 已定稿，切段
-        # 只继承父条目 speaker / instruct；硬保证：最终没有任何条目超过
-        # max_paragraph_chars。切出的相邻段之和 > max > 100，不会被随后的
-        # 相邻旁白合并回粘——<100 合并条件不可能回粘）。
+        # 同人段落合并（确定性零 LLM 成本；必须在超长机械分段**之前**——≤10 强制
+        # 合并可造出 > max_paragraph_chars 的同人块，由随后的机械分段切回，保住
+        # 200 字硬保证；顺序反了会回粘机械分段自己切出的同人短段）：连续同 speaker
+        # 条目按词字符数合并（块+段 ≤100 或较短一方 ≤10 强制），边界无收尾标点补
+        # 「。」，instruct 取词字符多者，章标题两侧不合并（恒判、无豁免）。
+        if generation.merge_same_speaker:
+            all_entries, merged_pairs = merge_adjacent_same_speaker(
+                all_entries, is_chapter_title,
+            )
+            if merged_pairs:
+                handle.log(
+                    f"同人段落合并：合并 {merged_pairs} 对连续同 speaker 条目"
+                    f"（章标题两侧不合并，零 LLM 成本）"
+                )
+            else:
+                # 零命中也留一行日志：与其余阶段同一纪律——静默退出会被误读成阶段缺失。
+                handle.log("同人段落合并：0 对连续同 speaker 条目（无合并，零 LLM 调用）")
+        else:
+            # 开关关闭：整体跳过并留一行日志，结果字段保持 0。
+            handle.log("同人段落合并已关闭（配置）——本任务跳过该阶段")
+            merged_pairs = 0
+
+        # 超长段落检查·机械分段兜底（管线**末段**，同人合并之后——speaker 已定稿，
+        # 切段只继承父条目 speaker / instruct；硬保证：最终没有任何条目超过
+        # max_paragraph_chars。同人合并的 ≤10 强制合并可能造出超限块，由本阶段
+        # 切回；切出的段绝不会被回粘（本阶段是最后一步，其后无合并）。
         if generation.check_long_paragraphs:
             all_entries, long_split = split_long_entries(
                 all_entries, max_para, is_chapter_title,
@@ -2818,12 +2877,6 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
                 )
         else:
             long_split = 0
-
-        # 机械后处理：相邻旁白合并（确定性，不经 LLM；章标题两侧不合并）——去掉 TTS
-        # 会在相邻旁白之间多插的同人停顿与段边界。
-        all_entries, merged_pairs = merge_adjacent_narrator(all_entries, is_chapter_title)
-        if merged_pairs:
-            handle.log(f"机械合并 {merged_pairs} 对相邻旁白（章标题两侧不合并）")
 
         out_name = f"{src.stem}.json"
         out_path = get_layout().parsed_json / out_name
@@ -2853,7 +2906,8 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "output_path": str(out_path),
             "output_name": out_name,
             "count": len(all_entries),
-            "merged_narrator": merged_pairs,
+            # 同人段落合并：合并的连续同 speaker 条目对数（merge_same_speaker 关闭时为 0）
+            "merged_same_speaker": merged_pairs,
             # 角色匹配检查（解析内 chunk 边界重判；开关关闭时为 0）
             "boundary_checked": boundary_stats["checked"],
             "boundary_fixed": boundary_stats["fixed"],
