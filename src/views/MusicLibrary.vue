@@ -5,6 +5,7 @@ import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useToast } from '@/components/ui/toast'
 import { useTaskStore } from '@/stores/task'
 import {
+  applySuggestions,
   batchDelete,
   batchEnable,
   batchTags,
@@ -42,6 +43,7 @@ import TableHeader from '@/components/ui/TableHeader.vue'
 import TableRow from '@/components/ui/TableRow.vue'
 import MiniAudioPlayer from '@/components/ui/MiniAudioPlayer.vue'
 import {
+  BadgeCheck,
   Disc3,
   Loader2,
   Pencil,
@@ -212,6 +214,8 @@ async function doUpload() {
       try {
         await uploadMusic(f)
         ok++
+        // 实时：每首上传完成立即刷新列表（不等整批结束）。
+        await refresh()
       } catch (e: any) {
         toast({
           title: '上传失败',
@@ -221,7 +225,6 @@ async function doUpload() {
       }
     }
     if (ok) toast({ title: '上传完成', variant: 'success', description: `成功 ${ok} / ${files.length} 首` })
-    await refresh()
   } finally {
     uploading.value = false
   }
@@ -345,10 +348,13 @@ async function doAiSuggestBatch() {
   aiBatchBusy.value = true
   try {
     const r = await suggestTagsBatch(names)
+    // 实时：SSE 流在全部任务终态时已关闭——启动后立即同步任务表，
+    // 新 PENDING/RUNNING 壳即刻挂进行（「识别中…」），并随 hasActive 重开流。
+    await taskStore.refresh()
     toast({
       title: `AI 识别已启动（${r.tracks.length} 首）`,
       variant: 'default',
-      description: '候选结果出来后可在编辑标签弹层查看并确认采用（仅依据文件名 + 描述，LLM 不读取音频）。',
+      description: '候选完成后点「AI 推荐采用」一键采用（仅未打标曲目），或在编辑标签弹层逐曲确认（仅依据文件名 + 描述，LLM 不读取音频）。',
     })
   } catch (e: any) {
     toast({ title: 'AI 识别启动失败', variant: 'destructive', description: e?.message || '' })
@@ -363,6 +369,39 @@ function cancelAiTask(name: string) {
 function retryAiTask(name: string) {
   const t = aiTasks.value.failed.get(name)
   if (t) void taskStore.control(t.id, 'retry')
+}
+
+// AI 推荐采用：一键采用「有 AI 候选 且 未打任何标签」的选中曲目（绝不覆盖
+// 人工已选标签）；采用后消费该曲候选（与弹层确认同语义）。
+const aiApplyBusy = ref(false)
+function trackHasTags(name: string): boolean {
+  const tr = lib.value?.tracks[name]
+  return !!tr && CATEGORIES.some((c) => (tr.tags?.[c]?.length ?? 0) > 0)
+}
+const adoptableNames = computed(() =>
+  selectedNames.value.filter((n) => suggestionHasTags(n) && !trackHasTags(n)),
+)
+async function doAiApply() {
+  const names = selectedNames.value
+  if (aiApplyBusy.value || !adoptableNames.value.length) return
+  aiApplyBusy.value = true
+  try {
+    const r = await applySuggestions(names)
+    await refresh()
+    const parts: string[] = []
+    if (r.applied.length) parts.push(`已采用 ${r.applied.length} 首`)
+    if (r.skipped_manual.length) parts.push(`${r.skipped_manual.length} 首已有手动标签（未覆盖）`)
+    if (r.missing.length) parts.push(`${r.missing.length} 首不存在`)
+    toast({
+      title: r.applied.length ? 'AI 推荐已采用' : '无可采用的 AI 推荐',
+      variant: r.applied.length ? 'success' : 'default',
+      description: parts.join('；') || '选中曲目没有 AI 候选，或已有手动标签。',
+    })
+  } catch (e: any) {
+    toast({ title: 'AI 推荐采用失败', variant: 'destructive', description: e?.message || '' })
+  } finally {
+    aiApplyBusy.value = false
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,12 +607,17 @@ watch(
 // 在途 AI 任务按 label 派生重挂，无本地 job 列表）
 // ---------------------------------------------------------------------------
 
+// 手动刷新 = 库口径 + 任务口径（不依赖 F5：在途 AI 任务同样重新挂回行状态）。
+async function refreshAll() {
+  await Promise.all([taskStore.refresh(), refresh()])
+}
+
 onMounted(async () => {
   await taskStore.refresh()
   void refresh()
 })
 onActivated(() => {
-  if (lib.value) void refresh()
+  if (lib.value) void refreshAll()
 })
 </script>
 
@@ -594,7 +638,8 @@ onActivated(() => {
         <CardTitle class="flex items-center gap-2"><Disc3 class="h-5 w-5" />曲目</CardTitle>
         <CardDescription>
           勾选后可批量加/删标签、启用/禁用、删除，或一键 AI 识别标签（仅依据文件名 + 描述，
-          LLM 不读取音频；候选需确认后才生效）。标签分四类：场景 / 气氛 / 情绪 / 自定义
+          LLM 不读取音频；候选需确认后才生效——「AI 推荐采用」一键采用未打标曲目的候选，
+          不覆盖已手动选择的标签）。标签分四类：场景 / 气氛 / 情绪 / 自定义
           （自动匹配按 气氛 3 · 场景 2 · 情绪 1 · 自定义 1 加权）。
         </CardDescription>
       </CardHeader>
@@ -628,7 +673,7 @@ onActivated(() => {
                 <option v-for="o in filterOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
               </select>
             </div>
-            <Button variant="outline" size="sm" :disabled="loading" @click="refresh">
+            <Button variant="outline" size="sm" :disabled="loading" @click="refreshAll">
               <RefreshCw class="h-3.5 w-3.5" :class="loading ? 'animate-spin' : ''" />刷新
             </Button>
             <span class="ml-auto text-xs text-muted-foreground">
@@ -674,6 +719,15 @@ onActivated(() => {
             <span class="h-4 w-px bg-border" />
             <Button variant="outline" size="sm" :disabled="aiBatchBusy" @click="doAiSuggestBatch">
               <Sparkles class="h-3.5 w-3.5" />AI 推荐（{{ selectedNames.length }} 首）
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              :disabled="aiApplyBusy || !adoptableNames.length"
+              :title="adoptableNames.length ? '采用「有 AI 候选 且 未打标签」的选中曲目（不覆盖手动标签）' : '选中曲目里没有可采用的 AI 候选（需有候选且未打任何标签）'"
+              @click="doAiApply"
+            >
+              <BadgeCheck class="h-3.5 w-3.5" />AI 推荐采用（{{ adoptableNames.length }} 首）
             </Button>
             <Button variant="ghost" size="sm" @click="clearSelection">清空选择</Button>
           </div>
@@ -766,7 +820,7 @@ onActivated(() => {
                     v-else-if="suggestionHasTags(name)"
                     variant="secondary"
                     class="border-amber-500/30 bg-amber-500/15 text-amber-600 text-xs dark:text-amber-400"
-                    :title="`AI 候选：${suggestionSummary(name)}（编辑标签查看并确认采用）`"
+                    :title="`AI 候选：${suggestionSummary(name)}（「AI 推荐采用」一键采用，或编辑标签确认）`"
                   >
                     <Sparkles class="mr-1 h-3 w-3" />AI 已推荐
                   </Badge>

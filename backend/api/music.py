@@ -141,6 +141,10 @@ class SuggestTagsReq(BaseModel):
     description: str | None = None
 
 
+class ApplySuggestionsReq(BaseModel):
+    names: list[str]
+
+
 # --------------------------------------------------------------------------- #
 # library
 # --------------------------------------------------------------------------- #
@@ -341,6 +345,76 @@ def batch_delete(body: BatchNames) -> dict:
         else:
             skipped.append({"name": n, "reason": reason})
     return {"deleted": deleted, "skipped": skipped, "missing": missing}
+
+
+@router.post("/tracks/apply-suggestions")
+def apply_suggestions(body: ApplySuggestionsReq) -> dict:
+    """Adopt the cached AI tag candidates (``music_tag_suggestions.json``) for
+    the given tracks — the「AI 推荐采用」one-click confirmation.
+
+    A track is only touched when it has a candidate WITH tags AND no manual
+    tags at all (四类全空) — a user decision is NEVER overwritten (tracks with
+    manual tags are reported in ``skipped_manual`` and keep their candidate).
+    Applied tracks consume their candidate (same semantics as a user-confirmed
+    PUT with tags). Guards: per-name traversal 400 -> empty selection 400;
+    missing tracks are reported, not an error (batch-endpoint precedent)."""
+    names: list[str] = []
+    for n in body.names or []:
+        try:
+            bare = music_engine.validate_music_name(n)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if bare not in names:
+            names.append(bare)
+    if not names:
+        raise HTTPException(400, "请选择要采用 AI 推荐的音乐。")
+    idx = music_engine.load_index()
+    sugg = music_engine.load_suggestions().get("tracks") or {}
+    apply_map: dict[str, dict] = {}
+    skipped_manual: list[str] = []
+    no_suggestion: list[str] = []
+    missing: list[str] = []
+    for n in names:
+        tr = idx["tracks"].get(n)
+        if not isinstance(tr, dict) or not (_library_dir() / n).is_file():
+            missing.append(n)
+            continue
+        entry = sugg.get(n)
+        cand = entry.get("tags") if isinstance(entry, dict) else None
+        if not isinstance(cand, dict) or not any(cand.get(c) for c in ("scene", "mood", "emotion")):
+            no_suggestion.append(n)
+            continue
+        tags = tr.get("tags")
+        if isinstance(tags, dict) and any(tags.get(c) for c in music_engine.TAG_CATEGORIES):
+            # The user already made a tag decision — never overwrite it.
+            skipped_manual.append(n)
+            continue
+        apply_map[n] = cand
+    applied: list[str] = []
+    if apply_map:
+        def _mutate(idx2: dict) -> None:
+            # Re-check under the index lock: a manual tag edit made microseconds
+            # earlier still wins (the no-overwrite rule holds at write time too).
+            for n, cand in apply_map.items():
+                tr = idx2["tracks"].get(n)
+                if not isinstance(tr, dict):
+                    continue
+                tags = tr.get("tags")
+                if isinstance(tags, dict) and any(tags.get(c) for c in music_engine.TAG_CATEGORIES):
+                    continue
+                tr["tags"] = music_engine.normalize_track_tags(cand, idx2["tags"])
+                applied.append(n)
+
+        music_engine.update_index(_mutate)
+        for n in applied:
+            # The candidate is consumed (same as a user-confirmed PUT with tags).
+            music_engine.clear_suggestion(n)
+    return {
+        "applied": applied,
+        "skipped_manual": skipped_manual,
+        "no_suggestion": no_suggestion,
+        "missing": missing,
+    }
 
 
 # --------------------------------------------------------------------------- #

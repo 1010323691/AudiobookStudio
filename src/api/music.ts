@@ -10,6 +10,7 @@ import type {
   TrackTags,
   SuggestTagsResult,
   SuggestBatchResult,
+  ApplySuggestionsResult,
 } from '@/types'
 
 /** The full index (tag registry + all tracks). */
@@ -108,4 +109,11 @@ export function suggestTags(name: string, description?: string): Promise<Suggest
  *  cache — nothing is applied to track tags until the user confirms. */
 export function suggestTagsBatch(names: string[]): Promise<SuggestBatchResult> {
   return http.post<SuggestBatchResult>('/api/music/suggest-tags-batch', { names })
+}
+
+/** Adopt cached AI candidates (the「AI 推荐采用」confirmation): only tracks
+ *  with a candidate AND no manual tags are touched — a user decision is never
+ *  overwritten; applied tracks consume their candidate. */
+export function applySuggestions(names: string[]): Promise<ApplySuggestionsResult> {
+  return http.post<ApplySuggestionsResult>('/api/music/tracks/apply-suggestions', { names })
 }

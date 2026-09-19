@@ -656,6 +656,14 @@ export interface SuggestBatchResult {
   task_ids: string[]
   tracks: { name: string; task_id: string }[]
 }
+/** Response of ``POST /api/music/tracks/apply-suggestions`` (adopt cached AI
+ *  candidates — only tracks with candidates AND no manual tags are touched). */
+export interface ApplySuggestionsResult {
+  applied: string[]
+  skipped_manual: string[]
+  no_suggestion: string[]
+  missing: string[]
+}
 
 // ------------------------------ bgm（背景音乐：章节匹配 + 混音） ------------------------------
 /** LLM chapter-atmosphere analysis (one chapter of ``chapter_music_analysis.json``). */

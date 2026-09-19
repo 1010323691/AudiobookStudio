@@ -829,6 +829,72 @@ def test_update_track_tags_consumes_suggestion(sandbox):
 
 
 # --------------------------------------------------------------------------- #
+# API: apply-suggestions（AI 推荐采用 — untagged tracks only, never overwrites
+# a manual decision）
+# --------------------------------------------------------------------------- #
+
+def test_apply_suggestions_untagged_only(sandbox):
+    _upload("a.mp3")  # candidate + untagged -> applied + candidate consumed
+    _upload("b.mp3")  # manual tags THEN a fresh candidate -> NEVER overwritten
+    _upload("c.mp3")  # no candidate at all -> no_suggestion
+    _upload("d.mp3")  # candidate with a stale (since-removed) name -> custom fold
+    # b.mp3: the user made a manual tag decision first…
+    api_music.update_track("b.mp3", api_music.TrackUpdate(tags={"emotion": ["希望"]}))
+    # …then ran AI recognition again (the batch endpoint does not block tagged
+    # tracks) -> b now has manual tags AND a live candidate.
+    music_engine.update_suggestions(
+        lambda d: d["tracks"].update({
+            "a.mp3": {"tags": {"scene": ["战斗"], "mood": ["紧张"], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+            "b.mp3": {"tags": {"scene": [], "mood": ["轻松"], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+            "d.mp3": {"tags": {"scene": ["已改名的标签"], "mood": [], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+        }))
+    r = api_music.apply_suggestions(
+        api_music.ApplySuggestionsReq(names=["a.mp3", "b.mp3", "c.mp3", "d.mp3"]))
+    assert r["applied"] == ["a.mp3", "d.mp3"]
+    assert r["skipped_manual"] == ["b.mp3"]
+    assert r["no_suggestion"] == ["c.mp3"]
+    assert r["missing"] == []
+    idx = music_engine.load_index()
+    # applied: the candidates are written into the track tags as-is (in-vocab)
+    assert idx["tracks"]["a.mp3"]["tags"]["scene"] == ["战斗"]
+    assert idx["tracks"]["a.mp3"]["tags"]["mood"] == ["紧张"]
+    # a stale candidate name is folded into custom (same as a user-confirmed PUT)
+    assert idx["tracks"]["d.mp3"]["tags"]["scene"] == []
+    assert idx["tracks"]["d.mp3"]["tags"]["custom"] == ["已改名的标签"]
+    # b.mp3: manual tags byte-identical, candidate KEPT (still confirmable)
+    assert idx["tracks"]["b.mp3"]["tags"]["emotion"] == ["希望"]
+    assert idx["tracks"]["b.mp3"]["tags"]["mood"] == []
+    sugg = music_engine.load_suggestions()["tracks"]
+    assert "a.mp3" not in sugg and "d.mp3" not in sugg  # consumed
+    assert "b.mp3" in sugg  # untouched
+
+
+def test_apply_suggestions_guards_and_dedupe(sandbox):
+    _upload("a.mp3")
+    music_engine.update_suggestions(
+        lambda d: d["tracks"].__setitem__("a.mp3", {
+            "tags": {"scene": ["战斗"], "mood": [], "emotion": []},
+            "suggested_at": "t0", "model": "m"}))
+    with pytest.raises(HTTPException) as e:
+        api_music.apply_suggestions(api_music.ApplySuggestionsReq(names=[]))
+    assert e.value.status_code == 400
+    for bad in ("../evil.mp3", "a/b.mp3", "song.flac"):
+        with pytest.raises(HTTPException) as e:
+            api_music.apply_suggestions(api_music.ApplySuggestionsReq(names=[bad]))
+        assert e.value.status_code == 400
+    # missing tracks are reported, not an error (batch-endpoint precedent);
+    # duplicates are applied once.
+    r = api_music.apply_suggestions(
+        api_music.ApplySuggestionsReq(names=["a.mp3", "a.mp3", "ghost.mp3"]))
+    assert r["applied"] == ["a.mp3"]
+    assert r["missing"] == ["ghost.mp3"]
+    assert "a.mp3" not in music_engine.load_suggestions()["tracks"]  # consumed
+
+
+# --------------------------------------------------------------------------- #
 # suggest_track_tags worker e2e (fake LLM, real TaskManager + shared LLM gate)
 # --------------------------------------------------------------------------- #
 
