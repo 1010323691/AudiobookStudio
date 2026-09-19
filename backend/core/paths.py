@@ -23,6 +23,7 @@ template, and logging is console-only. Nothing here ever deletes anything.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 # backend/core/paths.py  ->  parents[0]=core  parents[1]=backend  parents[2]=<project>
@@ -116,8 +117,36 @@ def is_workspace_set() -> bool:
     return _workspace_path() is not None
 
 
+# -- get_layout memoization ------------------------------------------------------
+# ``get_layout()`` sits on every hot path (the 待合成 poll resolves one layout per package
+# AND per completed segment), and each uncached call re-reads the root ``app.json`` pointer
+# plus re-runs the 11 mkdir probes. The pointer only changes when the root file itself is
+# rewritten (``set_workspace_pointer`` / ``clear_workspace`` both rewrite it), so the file's
+# ``(mtime_ns, size)`` is a faithful invalidation key: steady state costs ONE stat per call.
+# The ``ensured`` flag remembers whether the cached layout's skeleton was planted — a stale-
+# pointer entry (the folder was gone when cached) plants it exactly once if the folder
+# comes back, instead of re-running the probes on every hit.
+_MISSING_KEY = object()
+_layout_lock = threading.Lock()
+_layout_cache: Layout | None = None
+_layout_cache_key = _MISSING_KEY  # a real key is (st_mtime_ns, st_size)
+_layout_ensured = False
+
+
+def _root_pointer_key():
+    """The cache key: the root ``app.json``'s ``(mtime_ns, size)``; a sentinel while the
+    file does not exist yet (a fresh sandbox before the first pointer write)."""
+    from .config import TEMPLATE_FILE  # local import: config imports paths at top level
+
+    try:
+        st = TEMPLATE_FILE.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _MISSING_KEY
+
+
 def get_layout() -> Layout:
-    """Return the Layout for the configured workspace.
+    """Return the Layout for the configured workspace (memoized on the root file).
 
     The workspace root (artifact dirs + logs + config) is created idempotently only
     when a working directory is actually set AND the folder still exists — an unset
@@ -127,19 +156,53 @@ def get_layout() -> Layout:
     the dashboard then reports the missing folder (``exists: false``) and the write
     endpoints refuse with a clear 409 until the user re-selects the (moved) folder.
     Relative ``working_dir`` values resolve against ``PROJECT_ROOT``.
-    """
-    from .config import _workspace_path  # local import to avoid a cycle
 
-    workspace = _workspace_path()
-    if workspace is None:
-        return Layout(None)
-    layout = Layout(workspace)
-    if workspace.exists():
-        # Live folder (newly created by the workspace endpoint, or an existing
-        # project) -> create any missing subdirs. A missing folder is the stale-
-        # pointer case: stay inert so nothing is planted at the old location.
-        layout.ensure()
+    Memoization: the pointer is re-read only when the root file's ``mtime_ns``/``size``
+    change (every real pointer set/clear rewrites it); otherwise the cached ``Layout``
+    is returned as-is — it is never mutated after creation. A cached stale-pointer entry
+    whose folder reappears runs ``ensure()`` exactly once (same skeleton-planting as an
+    uncached call), after which the mkdir probes stop.
+    """
+    global _layout_cache, _layout_cache_key, _layout_ensured
+    key = _root_pointer_key()
+    with _layout_lock:
+        layout = _layout_cache
+        if layout is not None and _layout_cache_key == key:
+            if (layout.workspace is not None and not _layout_ensured
+                    and layout.workspace.exists()):
+                # Stale-pointer entry whose folder came back: plant the skeleton once.
+                layout.ensure()
+                _layout_ensured = True
+            return layout
+        from .config import _workspace_path  # local import to avoid a cycle
+
+        workspace = _workspace_path()
+        if workspace is None:
+            layout, ensured = Layout(None), True
+        else:
+            layout = Layout(workspace)
+            if workspace.exists():
+                # Live folder (newly created by the workspace endpoint, or an existing
+                # project) -> create any missing subdirs.
+                layout.ensure()
+                ensured = True
+            else:
+                # A missing folder is the stale-pointer case: stay inert so nothing is
+                # planted at the old location.
+                ensured = False
+        _layout_cache, _layout_cache_key, _layout_ensured = layout, key, ensured
     return layout
+
+
+def reset_layout_cache() -> None:
+    """Drop the memoized layout; the next ``get_layout()`` re-reads the pointer.
+
+    A test / debug seam — a real pointer change already invalidates via the root file's
+    ``mtime_ns``/``size``. Mirrors ``core.config.reset_config_cache``.
+    """
+    global _layout_cache, _layout_cache_key, _layout_ensured
+    with _layout_lock:
+        _layout_cache, _layout_cache_key, _layout_ensured = None, _MISSING_KEY, False
 
 
 # Sentinel: a 角色配音 request to operate over *every* parsed JSON at once

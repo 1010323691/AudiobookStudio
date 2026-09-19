@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -29,8 +30,10 @@ def sandbox(monkeypatch, tmp_path):
         json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8"
     )
     core_config.reset_config_cache()
+    core_paths.reset_layout_cache()  # module state outlives the monkeypatched TEMPLATE_FILE
     yield tmp_path
     core_config.reset_config_cache()
+    core_paths.reset_layout_cache()
 
 
 @pytest.fixture
@@ -167,6 +170,77 @@ def test_get_layout_is_idempotent_across_calls(sandbox, set_pointer):
     second = core_paths.get_layout()
     assert first.workspace == second.workspace
     assert first.input == second.input
+
+
+def test_get_layout_cache_hit_does_not_replant_after_workspace_deleted(sandbox, set_pointer):
+    """A cached hit must NOT re-run ``ensure()``: once the workspace folder is gone
+    (moved / deleted), later calls stay inert and must not resurrect the skeleton at the
+    old location (the pre-cache behavior was guarded by ``exists()``; the memoization keeps
+    it via the ``ensured`` flag instead of re-statting + re-mkdir'ing on every call)."""
+    ws = sandbox / "MyBook"
+    ws.mkdir()
+    set_pointer(str(ws))
+    core_paths.get_layout()  # plants the skeleton and memoizes (ensured)
+    for name in core_paths.WORKSPACE_DIR_NAMES:
+        assert (ws / name).is_dir()
+    shutil.rmtree(ws)  # the folder vanishes under the pointer
+    for _ in range(3):  # repeated cached hits
+        core_paths.get_layout()
+    assert not (ws / "01_input").exists()  # no ghost skeleton replanted
+    assert not (ws / "logs").exists()
+    assert not (ws / "config").exists()
+
+
+def test_get_layout_stale_pointer_folder_comeback_plants_skeleton_once(sandbox, set_pointer):
+    """A cached stale-pointer entry (the folder was gone when it was memoized) plants the
+    skeleton EXACTLY ONCE when the folder comes back — same skeleton-planting as an uncached
+    call, but no mkdir probes on the subsequent hits."""
+    ws = sandbox / "Gone"
+    set_pointer(str(ws))  # pointer to a folder that does not exist
+    layout = core_paths.get_layout()
+    assert layout.workspace == ws
+    assert not (ws / "01_input").exists()  # stale: nothing planted
+    ws.mkdir()  # the folder comes back (the moved project was restored / recreated)
+    layout2 = core_paths.get_layout()  # cached entry -> plants the skeleton once
+    assert layout2 is layout  # the same memoized object, now ensured
+    for name in core_paths.WORKSPACE_DIR_NAMES:
+        assert (ws / name).is_dir()
+    assert (ws / "logs").is_dir()
+    assert (ws / "config").is_dir()
+    # Further hits: still the same object, no exception, no re-planting.
+    assert core_paths.get_layout() is layout
+
+
+def test_get_layout_pointer_change_invalidates_cache(sandbox, set_pointer):
+    """Every real pointer set/clear rewrites the root ``app.json`` — the new
+    ``(mtime_ns, size)`` key must invalidate the memoized layout (no ``reset_*`` call)."""
+    ws1 = sandbox / "one"
+    ws1.mkdir()
+    ws2 = sandbox / "another-longer-name"  # different length -> different root-file size too
+    ws2.mkdir()
+    set_pointer(str(ws1))
+    first = core_paths.get_layout()
+    assert first.workspace == ws1
+    set_pointer(str(ws2))  # rewrites the root app.json -> a new cache key
+    second = core_paths.get_layout()
+    assert second.workspace == ws2
+    for name in core_paths.WORKSPACE_DIR_NAMES:  # the new workspace's skeleton is planted
+        assert (ws2 / name).is_dir()
+    set_pointer("")  # clearing the pointer invalidates as well
+    third = core_paths.get_layout()
+    assert third.workspace is None
+    assert core_paths.get_layout().workspace is None  # the inert hit stays inert
+
+
+def test_reset_layout_cache_forces_reread(sandbox, set_pointer):
+    ws = sandbox / "ws"
+    ws.mkdir()
+    set_pointer(str(ws))
+    first = core_paths.get_layout()
+    core_paths.reset_layout_cache()
+    second = core_paths.get_layout()  # re-resolves from the pointer
+    assert second.workspace == ws
+    assert second.input == first.input
 
 
 # -- predicates / invariants ---------------------------------------------------

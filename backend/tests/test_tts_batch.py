@@ -144,6 +144,7 @@ def workspace(monkeypatch, tmp_path):
     monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
     (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
     core_config.reset_config_cache()
+    core_paths.reset_layout_cache()  # module state outlives the monkeypatched TEMPLATE_FILE
     ws = tmp_path / "Book"
     core_config.set_workspace_pointer(str(ws))
     (ws / "03_parsed_json").mkdir(parents=True, exist_ok=True)
@@ -157,6 +158,7 @@ def workspace(monkeypatch, tmp_path):
     )
     yield ws
     core_config.reset_config_cache()
+    core_paths.reset_layout_cache()
 
 
 def _fake_run_worker(captured):
@@ -949,6 +951,116 @@ def test_is_done_requires_ok_and_file(workspace):
     assert tts_batch.is_done(None) is False
 
 
+# -- done_indices (the batched per-package done-set: one listdir, is_done parity) --
+
+def test_done_indices_relative_fast_path(workspace):
+    """Entries stored in the normal relative form (directly inside the package dir) are
+    answered from the single lazy directory listing — same verdicts as per-entry is_done."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "0001.mp3").write_bytes(b"fake")
+    (out / "0003.mp3").write_bytes(b"fake")
+    entries = {
+        0: {"ok": True, "path": "05_audio_chunk/s/0001.mp3"},   # file on disk -> done
+        1: {"ok": True, "path": "05_audio_chunk/s/0002.mp3"},   # ok but file missing
+        2: {"ok": True, "path": "05_audio_chunk/s/0003.mp3"},   # file on disk -> done
+        3: {"ok": False, "path": "05_audio_chunk/s/0001.mp3"},  # a failure is not done
+        4: {"ok": True, "path": ""},                            # no path
+        5: None,
+    }
+    assert tts_batch.done_indices(entries, out, ws) == {0, 2}
+
+
+def test_done_indices_legacy_absolute_fallback(workspace):
+    """Absolute stored values (the pre-migration form) skip the fast path and fall back to
+    the exact per-entry is_done rule."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / "0001.mp3"
+    f.write_bytes(b"fake")
+    entries = {
+        0: {"ok": True, "path": str(f)},                   # inside the workspace -> done
+        1: {"ok": True, "path": str(out / "missing.mp3")}, # file gone
+    }
+    assert tts_batch.done_indices(entries, out, ws) == {0}
+
+
+def test_done_indices_external_absolute_fallback(workspace):
+    """An absolute path OUTSIDE the workspace is judged as-is by is_done (a global /
+    external resource), never dropped by the fast path's prefix rule."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    ext = ws.parent / "outside.mp3"  # the project root — outside the workspace
+    ext.write_bytes(b"fake")
+    entries = {
+        0: {"ok": True, "path": str(ext)},                  # exists -> done
+        1: {"ok": True, "path": str(ws.parent / "gone.mp3")},  # missing
+    }
+    assert tts_batch.done_indices(entries, out, ws) == {0}
+
+
+def test_done_indices_escaping_relative_fallback(workspace):
+    """Relative values that do not sit directly inside the package dir can never be
+    fast-pathed (no prefix match) and take the exact per-entry is_done fallback:
+    a ``..`` value escaping the workspace is rejected (PathOutsideWorkspace -> False),
+    and a ``..`` value normalizing elsewhere in the workspace is judged by existence."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "0001.mp3").write_bytes(b"fake")
+    entries = {
+        0: {"ok": True, "path": "05_audio_chunk/s/../../0001.mp3"},   # -> ws/0001.mp3: absent
+        1: {"ok": True, "path": "05_audio_chunk/../02_split_text/x.txt"},  # another dir: absent
+        2: {"ok": True, "path": "../../outside.mp3"},                 # escapes the ws -> False
+    }
+    assert tts_batch.done_indices(entries, out, ws) == set()
+    # The same ``..`` hop that lands on a REAL file elsewhere in the ws counts as done —
+    # the fallback is is_done entry-for-entry, not a blanket rejection of ``..``.
+    (ws / "0001.mp3").write_bytes(b"fake")
+    assert tts_batch.done_indices({0: entries[0]}, out, ws) == {0}
+
+
+def test_done_indices_directory_named_like_mp3_counts_as_done(workspace):
+    """Path.exists() is True for a *directory* named like a segment file; the name-set
+    fast path must agree (deliberately no is_file filter on the listing)."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "0001.mp3").mkdir()  # a DIRECTORY named like an mp3
+    entries = {0: {"ok": True, "path": "05_audio_chunk/s/0001.mp3"}}
+    assert tts_batch.done_indices(entries, out, ws) == {0}
+
+
+def test_done_indices_missing_out_dir_is_empty(workspace):
+    """A package dir that does not exist yields no done entries (nothing exists — the same
+    as per-entry exists() all False), without raising."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "ghost"  # never created
+    entries = {
+        0: {"ok": True, "path": "05_audio_chunk/ghost/0001.mp3"},
+        1: {"ok": True, "path": str(out / "0002.mp3")},
+    }
+    assert tts_batch.done_indices(entries, out, ws) == set()
+
+
+def test_done_indices_no_workspace_uses_is_done_fallback(workspace):
+    """With no workspace the fast path is unavailable: every entry takes the exact
+    per-entry is_done rule (absolute values judged as-is)."""
+    ws = workspace
+    out = ws / "05_audio_chunk" / "s"
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / "0001.mp3"
+    f.write_bytes(b"fake")
+    entries = {
+        0: {"ok": True, "path": str(f)},
+        1: {"ok": True, "path": "05_audio_chunk/s/0002.mp3"},  # relative + no ws -> not done
+    }
+    assert tts_batch.done_indices(entries, out, None) == {0}
+
+
 def test_plan_to_synthesize_resume_skips_done():
     assert tts_batch.plan_to_synthesize({0, 1, 2}, {0, 1}) == {2}
 
@@ -1567,6 +1679,54 @@ def test_batch_status_multi_counts(workspace):
     assert batch_status(None, ["s.json"])["files"][0]["complete"] is True
 
 
+def test_batch_status_multi_digest_cache_hit_and_reset(workspace):
+    """The multi-file rows are per-package digests keyed on (workspace, src, manifest,
+    pkg dir, voice_config) file stats: an unchanged second call serves the cache, each
+    call returns a FRESH row (mutating one must not leak into later calls), and
+    ``reset_batch_status_cache`` drops the digest for a clean recompute."""
+    from backend.api import tts as api_tts
+    _seed_second_file(workspace)
+    _seed_voice_config(workspace, {
+        "A": {"type": "clone", "ref_audio": "04_voice_profiles/a.wav"},
+        "C": {"type": "clone", "ref_audio": "04_voice_profiles/c.wav"},
+    })
+    r1 = api_tts.batch_status(None, ["s.json", "t.json"])
+    r1["files"][0]["missing"] = ["HACKED"]   # mutate the returned row …
+    r1["files"][0]["completed"] = 99
+    r2 = api_tts.batch_status(None, ["s.json", "t.json"])  # … a cache hit must not see it
+    assert (r2["files"][0]["completed"], r2["files"][0]["missing"]) == (0, ["B"])
+    assert (r2["files"][1]["total"], r2["files"][1]["completed"]) == (2, 0)
+    api_tts.reset_batch_status_cache()  # the seam: force a clean recompute
+    r3 = api_tts.batch_status(None, ["s.json", "t.json"])
+    assert (r3["files"][0]["total"], r3["files"][0]["completed"],
+            r3["files"][0]["missing"]) == (2, 0, ["B"])
+    assert r3["files"][0] is not r2["files"][0]
+
+
+def test_batch_status_multi_digest_cache_serves_unchanged_calls(workspace, monkeypatch):
+    """The 3s-poll steady state: with no file change between calls, the expensive row
+    builder runs ONCE per package — later calls are served from the digest cache."""
+    from backend.api import tts as api_tts
+    _seed_second_file(workspace)
+    built: list[str] = []
+    real = api_tts._file_batch_status
+
+    def counting(name, layout, vc, out_dir=None):
+        built.append(name)
+        return real(name, layout, vc, out_dir=out_dir)
+
+    monkeypatch.setattr(api_tts, "_file_batch_status", counting)
+    for _ in range(3):  # three polls, nothing changes
+        r = api_tts.batch_status(None, ["s.json", "t.json"])
+        assert (r["files"][0]["total"], r["files"][0]["completed"]) == (2, 0)
+    assert built == ["s.json", "t.json"]  # computed once, served twice from the cache
+    # A real change (a done package lands on disk) invalidates the digest …
+    _seed_done_package(workspace, "s", [(0, "A", "hello", "0001.mp3"),
+                                        (1, "B", "world", "0002.mp3")])
+    assert api_tts.batch_status(None, ["s.json"])["files"][0]["complete"] is True
+    assert built[-1] == "s.json"  # … so exactly s.json's row was recomputed
+
+
 def test_batch_status_multi_rejects_all(workspace):
     from fastapi import HTTPException
 
@@ -1582,6 +1742,7 @@ def test_batch_status_multi_no_workspace_degrades(monkeypatch, tmp_path):
     monkeypatch.setattr(core_config, "TEMPLATE_FILE", tmp_path / "app.json")
     (tmp_path / "app.json").write_text(json.dumps({"paths": {"working_dir": ""}}), encoding="utf-8")
     core_config.reset_config_cache()
+    core_paths.reset_layout_cache()
     try:
         from backend.api.tts import batch_status
         r = batch_status(None, ["a.json", "b.json"])

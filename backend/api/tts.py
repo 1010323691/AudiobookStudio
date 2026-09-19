@@ -698,7 +698,39 @@ def _read_voice_config(layout) -> dict:
         return {}
 
 
-def _file_batch_status(name: str, layout, voice_config: dict) -> dict:
+# -- per-package batch-status digest cache --------------------------------------
+# The 待合成 list is polled every 3 s with ALL rows in ONE request, and each row is a pure
+# function of the four files behind it — so cache the computed row keyed by their
+# ``(mtime_ns, size)``: the source parsed JSON (rewritten only by re-parsing), the package
+# manifest (a live run rewrites it at least every 2 s), the package dir (NTFS bumps a
+# directory's mtime on any child add/remove — a new mp3, a user-deleted one, a batch-reset
+# rmtree), and voice_config.json (rewritten per character by the 角色配音 stages). The
+# workspace string in the key keeps two workspaces with identical package names/stats from
+# sharing entries. A hit returns a copy (the fresh-dict contract); a miss computes the row
+# exactly as before (the state judgment is unchanged) and pays it only once per real change.
+_STATUS_CACHE: dict = {}
+_STATUS_CACHE_LOCK = threading.Lock()
+_STATUS_CACHE_MAX = 512
+
+
+def reset_batch_status_cache() -> None:
+    """Drop the per-package batch-status cache (a test / debug seam — the file stats already
+    invalidate on every real change). Mirrors ``core.config.reset_config_cache``."""
+    with _STATUS_CACHE_LOCK:
+        _STATUS_CACHE.clear()
+
+
+def _stat_key(p) -> tuple | None:
+    """A path's ``(mtime_ns, size)``, or ``None`` when it cannot be stat'ed (a file that
+    vanishes between keying and computing degrades to a miss on the next poll, never a crash)."""
+    try:
+        st = Path(p).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _file_batch_status(name: str, layout, voice_config: dict, out_dir: Path | None = None) -> dict:
     """One row of the multi-file 待合成 list (``GET /batch-status?scripts=…``).
 
     Per file: segment completion (same rule as the single-file endpoint — ``completed`` = a
@@ -707,6 +739,9 @@ def _file_batch_status(name: str, layout, voice_config: dict) -> dict:
     whose every synthesizable segment is done (the 已合成 badge; a file with no synthesizable
     segments never gets it). Degrades to a zero row when the file is missing / corrupt /
     empty, or no workspace is set.
+
+    ``out_dir`` (the package dir) switches the completion count to the batched
+    ``Batch.count_completion(out_dir=…)`` existence check; omitted, the per-entry rule runs.
     """
     out = {"name": name, "total": 0, "completed": 0, "remaining": 0,
            "complete": False, "speakers": 0, "ready": 0, "missing": []}
@@ -720,7 +755,8 @@ def _file_batch_status(name: str, layout, voice_config: dict) -> dict:
     if not isinstance(data, list) or not data:
         return out
     segs = Batch._build_segments(data)
-    c = Batch.count_completion(segs, Batch.load_manifest(layout.audio_chunk / Batch.package_for(src)))
+    pkg_dir = out_dir or layout.audio_chunk / Batch.package_for(src)
+    c = Batch.count_completion(segs, Batch.load_manifest(pkg_dir), out_dir=pkg_dir)
     out["total"], out["completed"], out["remaining"] = c["total"], c["completed"], c["remaining"]
     out["complete"] = c["total"] > 0 and c["completed"] == c["total"]
     order: list[str] = []
@@ -731,6 +767,31 @@ def _file_batch_status(name: str, layout, voice_config: dict) -> dict:
     out["ready"] = len(ready)
     out["missing"] = [sp for sp in order if sp not in set(ready)]
     return out
+
+
+def _cached_file_batch_status(name: str, layout, voice_config: dict) -> dict:
+    """``_file_batch_status`` with the (mtime_ns, size)-keyed digest cache (see module note)."""
+    if layout.audio_chunk is None:  # no workspace: the row degrades to zeros — nothing to key
+        return _file_batch_status(name, layout, voice_config)
+    src = resolve_parsed_json(name)
+    pkg_dir = layout.audio_chunk / Batch.package_for(src)
+    key = (str(layout.workspace) or "", name,
+           _stat_key(src),
+           _stat_key(pkg_dir / "manifest.json"),
+           _stat_key(pkg_dir),
+           _stat_key(layout.voice_profiles / "voice_config.json"))
+    with _STATUS_CACHE_LOCK:
+        row = _STATUS_CACHE.get(key)
+        if row is not None:
+            return {**row, "missing": list(row["missing"])}
+    row = _file_batch_status(name, layout, voice_config, out_dir=pkg_dir)
+    with _STATUS_CACHE_LOCK:
+        _STATUS_CACHE[key] = row
+        if len(_STATUS_CACHE) > _STATUS_CACHE_MAX:  # evict the oldest inserted (dict order)
+            _STATUS_CACHE.pop(next(iter(_STATUS_CACHE)))
+    # A MISS returns a copy too: the stored row must stay pristine (the pre-cache contract
+    # was a fresh dict per call — a caller mutating the first row must not poison the cache).
+    return {**row, "missing": list(row["missing"])}
 
 
 # ``scripts`` MUST be declared as a QUERY param: in this FastAPI version a bare
@@ -759,7 +820,7 @@ def batch_status(script: str | None = None,
         if any(s == ALL_PARSED_JSON for s in scripts):
             raise HTTPException(status_code=400, detail="“全部文件”只用于「角色配音」——请逐个列出解析 JSON。")
         vc = _read_voice_config(layout) if layout.parsed_json is not None else {}
-        return {"files": [_file_batch_status(n, layout, vc) for n in scripts]}
+        return {"files": [_cached_file_batch_status(n, layout, vc) for n in scripts]}
     if layout.parsed_json is None:  # no workspace: nothing to read (read-only, degrades)
         return {"total": 0, "completed": 0, "remaining": 0}
     src = resolve_parsed_json(script)
@@ -772,7 +833,8 @@ def batch_status(script: str | None = None,
     if not isinstance(data, list) or not data:
         return {"total": 0, "completed": 0, "remaining": 0}
     out_dir = layout.audio_chunk / Batch.package_for(src)
-    return Batch.count_completion(Batch._build_segments(data), Batch.load_manifest(out_dir))
+    return Batch.count_completion(Batch._build_segments(data), Batch.load_manifest(out_dir),
+                                  out_dir=out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -913,14 +975,16 @@ def _package_merge_status(name: str, layout) -> dict:
         except Exception:  # noqa: BLE001 — a corrupt source just degrades to the manifest
             data = None
         if isinstance(data, list) and data:
-            c = Batch.count_completion(Batch._build_segments(data), manifest)
+            c = Batch.count_completion(Batch._build_segments(data), manifest,
+                                       out_dir=layout.audio_chunk / name)
             out["total"] = c["total"]
             out["completed"] = c["completed"]
             out["remaining"] = c["remaining"]
             out["complete"] = c["total"] > 0 and c["completed"] == c["total"]
             return out
     out["total"] = len(manifest)  # degrade: source JSON missing / corrupt / empty
-    out["completed"] = sum(1 for e in manifest.values() if Batch.is_done(e))
+    out["completed"] = len(Batch.done_indices(manifest, layout.audio_chunk / name,
+                                              layout.workspace))
     out["remaining"] = out["total"] - out["completed"]
     out["complete"] = out["total"] > 0 and out["completed"] == out["total"]
     return out

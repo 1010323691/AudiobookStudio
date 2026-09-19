@@ -19,6 +19,7 @@ down, or every segment failed) — a per-segment failure is a recorded, non-fata
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -431,11 +432,14 @@ def load_manifest(out_dir) -> dict:
         return {}
     if not isinstance(data, list):
         return {}
-    # Lazy migration: legacy manifests stored absolute paths (the workspace's location at
-    # write time). Convert any that still point inside the workspace to the relative form
-    # and rewrite the file, so the project keeps working after the workspace moves.
-    _n, migrated = pathio.migrate_entries_in(p, get_layout().workspace, "list", ("path",))
-    data = migrated if migrated is not None else data
+    # Lazy migration (single read): legacy manifests stored absolute paths (the workspace's
+    # location at write time). Convert any that still point inside the workspace to the
+    # relative form and rewrite the file, so the project keeps working after the workspace
+    # moves. ``migrate_entries`` + ``rewrite_json_file`` on the already-parsed list is the
+    # in-memory form of ``migrate_entries_in`` (which would re-read the same file).
+    n = pathio.migrate_entries(data, get_layout().workspace, ("path",))
+    if n:
+        pathio.rewrite_json_file(p, data)
     by_index = {}
     for e in data:
         if isinstance(e, dict) and "index" in e:
@@ -471,6 +475,54 @@ def is_done(entry) -> bool:
         return p.exists()
     except (OSError, TypeError):
         return False
+
+
+def done_indices(old_entries: dict, out_dir, ws) -> set[int]:
+    """The done manifest entries (``ok`` AND the file still on disk) as a set of indices.
+
+    The same judgment as :func:`is_done`, batched for a whole package: entries whose stored
+    path lives directly inside ``out_dir`` (the normal relative form
+    ``05_audio_chunk/<pkg>/NNNN.mp3``) are answered from ONE lazy directory listing instead
+    of one stat per entry; every other shape (legacy absolute, external, ``..``, another
+    directory, or no workspace) falls back to the exact per-entry :func:`is_done`, so the
+    result is identical entry-for-entry. A missing ``out_dir`` yields ``{}`` (nothing
+    exists — the same as per-entry ``exists()`` on a gone directory).
+    """
+    done: set[int] = set()
+    rel_out = pathio.to_workspace_relative(str(out_dir), ws) if ws is not None else None
+    if rel_out is None:
+        for i, e in old_entries.items():
+            if is_done(e):
+                done.add(i)
+        return done
+    # NTFS is case-insensitive (exists() folds case); POSIX is not.
+    fold = str.casefold if os.name == "nt" else (lambda s: s)
+    prefix = rel_out + "/"
+    names: set | None = None  # lazy: one os.listdir for the whole package
+    for i, e in old_entries.items():
+        if not (isinstance(e, dict) and e.get("ok")):
+            continue
+        v = e.get("path")
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if not pathio._is_abs(v):
+            vn = pathio._norm(v)
+            if not pathio._escapes(vn) and vn.startswith(prefix):
+                base = vn[len(prefix):]
+                if base and "/" not in base:
+                    if names is None:
+                        try:
+                            # No is_file filter on purpose: Path.exists() is True for a
+                            # directory named like an mp3 too — the set must match it.
+                            names = {fold(n) for n in os.listdir(out_dir)}
+                        except OSError:
+                            names = set()
+                    if fold(base) in names:
+                        done.add(i)
+                    continue
+        if is_done(e):  # legacy / external / escaping value: the exact per-entry rule
+            done.add(i)
+    return done
 
 
 def plan_to_synthesize(all_indices, done_set, indices=None):
@@ -539,14 +591,22 @@ def build_manifest(all_segments, old_entries, run_results, root=None):
     return manifest
 
 
-def count_completion(all_segments, manifest_by_index) -> dict:
+def count_completion(all_segments, manifest_by_index, out_dir=None) -> dict:
     """``{total, completed, remaining}`` for a script — completed = done (ok + file exists).
 
     ``total`` is the number of non-empty (synthesizable) segments; the ``synthesize`` result and
     the read-only ``/batch-status`` endpoint both derive their numbers from this.
+
+    ``out_dir`` (the package dir) switches the existence check to the batched
+    :func:`done_indices` (one directory listing for every ``ok`` entry instead of one stat per
+    entry — identical judgment); omitted, the per-entry :func:`is_done` loop runs verbatim.
     """
     total = len(all_segments)
-    completed = sum(1 for s in all_segments if is_done(manifest_by_index.get(s["index"])))
+    if out_dir is not None:
+        done = done_indices(manifest_by_index, out_dir, get_layout().workspace)
+        completed = sum(1 for s in all_segments if s["index"] in done)
+    else:
+        completed = sum(1 for s in all_segments if is_done(manifest_by_index.get(s["index"])))
     return {"total": total, "completed": completed, "remaining": total - completed}
 
 
@@ -616,7 +676,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
     all_segments = _build_segments(script)
     all_indices = {s["index"] for s in all_segments}
     old_entries = load_manifest(out_dir)
-    done_set = {i for i in all_indices if is_done(old_entries.get(i))}
+    done_set = done_indices(old_entries, out_dir, ws) & all_indices
     to_do = plan_to_synthesize(all_indices, done_set, indices)
     segments = [s for s in all_segments if s["index"] in to_do]
     run_total = len(segments)
@@ -958,7 +1018,7 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
             f.by_index = {s["index"]: s for s in f.all_segments}
             f.old_entries = load_manifest(f.out_dir)
             all_indices = {s["index"] for s in f.all_segments}
-            done_set = {i for i in all_indices if is_done(f.old_entries.get(i))}
+            done_set = done_indices(f.old_entries, f.out_dir, ws) & all_indices
             f.pending = sorted(plan_to_synthesize(all_indices, done_set))
             f.all_count = len(f.all_segments)
             # Pre-run completion snapshot (进度指标 baseline: this file's done 段/字).
