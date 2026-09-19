@@ -36,6 +36,10 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.core import paths as core_paths
+from backend.core.concurrency import gate
+from backend.core.tasks import TaskCancelled
+from backend.engines.script import _llm_chat_completion
+from backend.engines.voices import extract_json_object
 
 log = logging.getLogger("audiobook.music")
 
@@ -308,3 +312,230 @@ def update_index(mutator) -> dict:
         mutator(idx)
         save_index(idx)
         return idx
+
+
+# --------------------------------------------------------------------------- #
+# AI tag suggestions cache (music_tag_suggestions.json — candidates only)
+#
+# Batch AI tag recognition (one Task per track, module ``music-ai-tags``)
+# writes its CANDIDATE tags here — never into the index. Track tags change
+# only when the user confirms in the UI (PUT /tracks/{name} with tags, which
+# also consumes the entry). Orphan entries (track deleted afterwards) are
+# harmless dead weight — the UI joins rows against the index and the API
+# filters them out of GET /library (same orphan policy as BGM assignments).
+# --------------------------------------------------------------------------- #
+
+_SUGGESTIONS_NAME = "music_tag_suggestions.json"
+
+_SUGGESTIONS_LOCK = threading.RLock()
+
+
+def _suggestions_path() -> Path:
+    return _library_dir() / _SUGGESTIONS_NAME
+
+
+def _default_suggestions() -> dict:
+    return {"version": 1, "tracks": {}}
+
+
+def _coerce_suggestions(data) -> dict:
+    """Coerce parsed JSON into a well-formed suggestions cache (degrading
+    corrupt shapes)."""
+    if not isinstance(data, dict):
+        return _default_suggestions()
+    out = _default_suggestions()
+    tracks = data.get("tracks")
+    if isinstance(tracks, dict):
+        for name, entry in tracks.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            out["tracks"][name] = {
+                "tags": _coerce_suggestion_tags(entry.get("tags")),
+                "suggested_at": entry.get("suggested_at") if isinstance(entry.get("suggested_at"), str) else "",
+                "model": entry.get("model") if isinstance(entry.get("model"), str) else "",
+            }
+    return out
+
+
+def _coerce_suggestion_tags(tags) -> dict[str, list[str]]:
+    """The three LLM buckets (scene/mood/emotion), lists of strings. The
+    suggestions cache holds the LLM's RAW candidates — no registry filtering
+    here (the registry may legitimately outdate a cached suggestion; the
+    vocabulary filter already happened at LLM reply time)."""
+    out: dict[str, list[str]] = {}
+    for cat in ("scene", "mood", "emotion"):
+        vals = tags.get(cat) if isinstance(tags, dict) else None
+        out[cat] = [v for v in vals if isinstance(v, str) and v.strip()] if isinstance(vals, list) else []
+    return out
+
+
+def load_suggestions() -> dict:
+    """Read the suggestions cache. Missing -> empty cache in memory (NOT
+    written to disk — reads never write). Corrupt -> degraded + WARNING."""
+    p = _suggestions_path()
+    if not p.exists():
+        return _default_suggestions()
+    try:
+        data = json.loads(p.read_bytes().decode("utf-8"))
+        return _coerce_suggestions(data)
+    except Exception as e:
+        log.warning("AI 标签推荐缓存损坏，降级为空缓存：%s", e)
+        return _default_suggestions()
+
+
+def save_suggestions(data: dict) -> None:
+    """Atomically write the suggestions cache (write_bytes + os.replace)."""
+    d = _library_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=".music_suggest_", suffix=".tmp", dir=str(d))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.replace(tmp, _suggestions_path())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update_suggestions(mutator) -> dict:
+    """Atomic read -> mutate -> write transaction on the suggestions cache
+    (parallel AI tasks each rewrite the whole file — the voice_config.json /
+    08_bgm analysis precedent)."""
+    with _SUGGESTIONS_LOCK:
+        data = load_suggestions()
+        mutator(data)
+        save_suggestions(data)
+        return data
+
+
+def clear_suggestion(name: str) -> None:
+    """Drop one track's candidate entry (the user made a tag decision).
+    No-op when absent — reads never write, the file is only touched when an
+    entry actually exists."""
+    if name in (load_suggestions().get("tracks") or {}):
+        update_suggestions(lambda d: d["tracks"].pop(name, None))
+
+
+# --------------------------------------------------------------------------- #
+# AI tag recommendation prompts / parsing (shared by the sync single-track
+# endpoint and the per-track Task worker — text-only: filename + description
+# + vocabulary, the LLM never reads the audio)
+# --------------------------------------------------------------------------- #
+
+#: Per-bucket caps for LLM-suggested tags (防 LLM 造词/过量).
+SUGGESTION_CAPS = {"scene": 2, "mood": 3, "emotion": 2}
+
+
+def build_suggestion_prompts(stem: str, description: str,
+                             registry: dict[str, list[str]]) -> tuple[str, str]:
+    """(system, user) prompt for tag suggestion from the file NAME (``stem``)
+    + user DESCRIPTION + the tag vocabulary."""
+    vocab = {c: registry.get(c, []) for c in TAG_CATEGORIES if c != "custom"}
+    vocab_text = "\n".join(f"{c}: {'、'.join(v)}" for c, v in vocab.items())
+    system = (
+        "你是有声书背景音乐标签助手。根据音乐文件名和用户描述，从给定词表中选择标签。"
+        "只能从词表中选择，禁止创造新词。输出 JSON：{\"scene\": [...], \"mood\": [...], "
+        "\"emotion\": [...]}，scene 最多 2 个、mood 最多 3 个、emotion 最多 2 个，"
+        "选不出就留空数组。只输出 JSON，不要解释。"
+    )
+    user = f"文件名：{stem}\n用户描述：{description or '（无）'}\n\n词表：\n{vocab_text}"
+    return system, user
+
+
+def parse_suggestion_reply(content: str, registry: dict[str, list[str]]) -> dict | None:
+    """Parse an LLM suggestion reply (a JSON OBJECT — ``extract_json_object``)
+    into the three tag buckets, keeping ONLY in-vocabulary names per category
+    and capping each bucket (anti word-coining / overflow). ``None`` when the
+    reply is not a JSON object (the caller retries)."""
+    data = extract_json_object(content)
+    if not isinstance(data, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    for cat in ("scene", "mood", "emotion"):
+        vals = data.get(cat)
+        vocab = [v for v in (registry.get(cat) or []) if isinstance(v, str)]
+        keep: list[str] = []
+        if isinstance(vals, list):
+            for v in vals:
+                if isinstance(v, str) and v.strip() and v.strip() in vocab and v.strip() not in keep:
+                    keep.append(v.strip())
+        out[cat] = keep[: SUGGESTION_CAPS[cat]]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Task worker: one-track AI tag recognition (module ``music-ai-tags``)
+# --------------------------------------------------------------------------- #
+
+def suggest_track_tags(handle, name: str, llm_cfg) -> dict:
+    """Task worker: LLM-recommend tags for ONE track (2 attempts, same prompt
+    semantics as the sync single-track endpoint).
+
+    Slot scope = the whole task (no check phase): the LLM call holds one shared
+    LLM slot (``gate()``); a cancel while queued aborts without taking a slot.
+    A total failure fails the TASK (the UI offers 重试) — unlike the chapter
+    mood analysis, which never blocks a chapter (empty-tag record).
+
+    The candidates land in ``music_tag_suggestions.json`` (only this track's
+    entry is rewritten); the index is NOT touched — the user confirms in the
+    UI before anything reaches the track's tags.
+    """
+    handle.check()
+    lib_dir = _library_dir()
+    if not (lib_dir / name).is_file():
+        raise RuntimeError(f"音乐库中找不到 {name}。")
+    if not llm_cfg.model_name:
+        raise RuntimeError("尚未配置 LLM 模型（设置 → LLM → model_name）。")
+
+    idx = load_index()
+    tr = idx["tracks"].get(name)
+    description = ((tr or {}).get("description") or "").strip()
+    system, user = build_suggestion_prompts(Path(name).stem, description, idx["tags"])
+
+    handle.progress(0.05, "排队中（等待并发槽位）")
+    if not gate().acquire(stop_check=lambda: handle.cancelled):
+        raise TaskCancelled()  # 排队中被取消——未取槽，不进入 try、不 release
+    try:
+        parsed: dict | None = None
+        last_err: str | None = None
+        for attempt in range(2):
+            handle.check()  # TaskCancelled 永不重试、直接上抛
+            handle.log(f"LLM 识别标签（第 {attempt + 1}/2 次）…")
+            try:
+                content, _finish, _usage = _llm_chat_completion(
+                    llm_cfg.base_url, llm_cfg.api_key, llm_cfg.model_name,
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+                    temperature=0.2, top_p=0.9, presence_penalty=0.0, max_tokens=300,
+                )
+            except TaskCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 — 2 次全败 → 任务失败（可重试）
+                last_err = str(e)
+                continue
+            parsed = parse_suggestion_reply(content, idx["tags"])
+            if parsed is not None:
+                break
+            last_err = "回复不可解析"
+            parsed = None
+
+        if parsed is None:
+            raise RuntimeError(f"AI 推荐失败（{last_err}），请重试或手动打标。")
+
+        update_suggestions(
+            lambda d: d["tracks"].__setitem__(name, {
+                "tags": parsed,
+                "suggested_at": datetime.now().isoformat(timespec="seconds"),
+                "model": llm_cfg.model_name,
+            })
+        )
+        parts = [f"{c} {', '.join(parsed[c])}" for c in ("scene", "mood", "emotion") if parsed[c]]
+        handle.log("识别完成：" + ("、".join(parts) if parts else "（无标签）"))
+        handle.progress(1.0, "完成")
+        return parsed
+    finally:
+        gate().release()  # acquire 成功才进入 try——排队中被取消的路径未取槽、不到这里

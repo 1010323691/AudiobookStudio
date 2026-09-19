@@ -9,6 +9,7 @@ import type {
   MusicTagCategory,
   TrackTags,
   SuggestTagsResult,
+  SuggestBatchResult,
 } from '@/types'
 
 /** The full index (tag registry + all tracks). */
@@ -100,4 +101,11 @@ export function deleteTag(category: MusicTagCategory, name: string): Promise<{ t
  *  reads the audio). Results are in-vocabulary candidates for user confirmation. */
 export function suggestTags(name: string, description?: string): Promise<SuggestTagsResult> {
   return http.post<SuggestTagsResult>('/api/music/suggest-tags', { name, description })
+}
+
+/** One-click batch AI recognition: one Task per selected track (shared LLM
+ *  gate, per-track progress/cancel). Candidates land in the suggestions
+ *  cache — nothing is applied to track tags until the user confirms. */
+export function suggestTagsBatch(names: string[]): Promise<SuggestBatchResult> {
+  return http.post<SuggestBatchResult>('/api/music/suggest-tags-batch', { names })
 }

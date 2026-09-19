@@ -624,11 +624,22 @@ export interface MusicTrack {
   tags: TrackTags
   added_at: string
 }
+/** One entry of ``music_library/music_tag_suggestions.json`` — AI candidate
+ *  tags pending user confirmation (the batch AI recognition never writes the
+ *  index; candidates only). */
+export interface MusicSuggestion {
+  tags: Partial<Record<MusicTagCategory, string[]>>
+  suggested_at: string
+  model: string
+}
 /** Response of ``GET /api/music/library``. */
 export interface MusicLibrary {
   version: number
   tags: Record<MusicTagCategory, string[]>
   tracks: Record<string, MusicTrack>
+  /** Pending AI candidates (existing tracks only — orphans of deleted
+   *  tracks are filtered out server-side). */
+  suggestions?: Record<string, MusicSuggestion>
 }
 /** Response of a music delete / batch-delete (some names may be skipped). */
 export interface MusicDeleteResult {
@@ -639,6 +650,11 @@ export interface MusicDeleteResult {
 /** Response of ``POST /api/music/suggest-tags`` (AI candidate tags, text-only). */
 export interface SuggestTagsResult {
   tags: Record<MusicTagCategory, string[]>
+}
+/** Response of ``POST /api/music/suggest-tags-batch`` (one Task per track). */
+export interface SuggestBatchResult {
+  task_ids: string[]
+  tracks: { name: string; task_id: string }[]
 }
 
 // ------------------------------ bgm（背景音乐：章节匹配 + 混音） ------------------------------

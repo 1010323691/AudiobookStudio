@@ -7,7 +7,14 @@
 * ``api.music`` endpoints called directly (no HTTP layer): upload 409/400,
   preview traversal 400, locked-reference delete skip, batch ops, tag
   management with analysis-cache propagation, and suggest-tags (fake LLM:
-  in-vocabulary filtering, caps, 400 model-empty, 502 failure).
+  in-vocabulary filtering, caps, 400 model-empty, 502 failure);
+* the AI suggestion cache (``music_tag_suggestions.json`` — candidates only):
+  IO (missing-not-written / corrupt downgrade / ``write_bytes`` no CRLF /
+  atomic abort), prompt/parse pure functions, ``clear_suggestion`` semantics,
+  ``/library`` orphan filtering, and tag-decision consumption;
+* ``suggest_track_tags`` worker e2e (fake LLM, real TaskManager + shared LLM
+  gate): success writes only its own candidate entry / 2-fail task-failed /
+  model-empty fast-fail / missing file / cancel-while-queued zero writes.
 
 The library dir is a project-root constant (``core_paths.MUSIC_LIBRARY_DIR``),
 so every filesystem test monkeypatches it into a sandbox — the engine reads it
@@ -18,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,8 +33,10 @@ import pytest
 from fastapi import HTTPException, UploadFile
 
 from backend.api import music as api_music
+from backend.core import concurrency
 from backend.core import config as core_config
 from backend.core import paths as core_paths
+from backend.core.tasks import TERMINAL, TaskStatus, get_task_manager
 from backend.engines import music as music_engine
 
 
@@ -47,8 +57,48 @@ def sandbox(monkeypatch, tmp_path):
     ws = tmp_path / "Book"
     ws.mkdir(parents=True)
     core_config.set_workspace_pointer(str(ws))
+    gate_limit = concurrency.gate().limit
     yield {"root": tmp_path, "ws": ws, "lib": tmp_path / "music_library"}
+    # The suggest_track_tags worker tests run real tasks on the shared LLM gate:
+    # cancel any still-active AI-tag task and drain the gate before the next test.
+    mgr = get_task_manager()
+    for t in list(mgr.list()):
+        if t.module == "music-ai-tags" and t.status not in TERMINAL:
+            try:
+                mgr.control(t.id, "cancel")
+            except KeyError:
+                pass
+    deadline = time.time() + 5
+    stuck = []
+    while time.time() < deadline:
+        stuck = [t for t in mgr.list()
+                 if t.module == "music-ai-tags" and t.status not in TERMINAL]
+        if not stuck and concurrency.gate().active == 0:
+            break
+        time.sleep(0.05)
+    assert not stuck, f"music-ai-tags tasks leaked: {[t.label for t in stuck]}"
+    assert concurrency.gate().active == 0
+    concurrency.set_concurrency(gate_limit)
     core_config.reset_config_cache()
+
+
+def _wait_until(pred, timeout: float = 8.0, step: float = 0.02) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return
+        time.sleep(step)
+    raise AssertionError(f"condition not met within {timeout}s")
+
+
+def _wait_terminal(mgr, tid: str, timeout: float = 8.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        t = mgr.get(tid)
+        if t.status in TERMINAL:
+            return t.status
+        time.sleep(0.02)
+    raise AssertionError(f"task {tid} not terminal within {timeout}s")
 
 
 def _upload(name: str, data: bytes = b"fake-audio-bytes") -> dict:
@@ -615,3 +665,272 @@ def test_suggest_tags_non_dict_reply_502(sandbox, monkeypatch):
     with pytest.raises(HTTPException) as ei:
         api_music.suggest_tags(api_music.SuggestTagsReq(name="a.mp3"))
     assert ei.value.status_code == 502
+
+
+# --------------------------------------------------------------------------- #
+# AI suggestion prompts / parsing (shared by the sync endpoint and the worker)
+# --------------------------------------------------------------------------- #
+
+def test_build_suggestion_prompts_pinned():
+    registry = music_engine._default_index()["tags"]
+    system, user = music_engine.build_suggestion_prompts("battle_01", "激烈的鼓点", registry)
+    assert "只能从词表中选择，禁止创造新词" in system
+    assert "scene 最多 2 个、mood 最多 3 个、emotion 最多 2 个" in system
+    # the file STEM (no extension) + description feed the user prompt
+    assert user.startswith("文件名：battle_01\n用户描述：激烈的鼓点")
+    assert "词表：" in user
+    assert "scene: 日常、战斗、冒险" in user  # registry order, 、-joined
+    assert "mood: 轻松、温馨" in user
+    assert "emotion: 希望、喜悦" in user
+    # empty description -> （无）
+    _, user2 = music_engine.build_suggestion_prompts("calm_01", "", registry)
+    assert "用户描述：（无）" in user2
+
+
+def test_parse_suggestion_reply_filters_caps_and_dedup():
+    registry = music_engine._default_index()["tags"]
+    reply = (
+        '```json\n'
+        '{"scene": [" 战斗 ", "战斗", "编造的"], "mood": ["紧张", "热血", "史诗", "恐怖"], '
+        '"emotion": ["愤怒", "希望", "喜悦"]}\n'
+        '```'
+    )
+    out = music_engine.parse_suggestion_reply(reply, registry)
+    assert out == {
+        "scene": ["战斗"],           # stripped + deduped, out-of-vocab dropped
+        "mood": ["紧张", "热血", "史诗"],   # cap 3 (恐怖 dropped, first-seen order)
+        "emotion": ["愤怒", "希望"],       # cap 2
+    }
+
+
+def test_parse_suggestion_reply_non_object_is_none():
+    registry = music_engine._default_index()["tags"]
+    assert music_engine.parse_suggestion_reply("[1, 2]", registry) is None
+    assert music_engine.parse_suggestion_reply("这不是 JSON", registry) is None
+    assert music_engine.parse_suggestion_reply('"只是一个字符串"', registry) is None
+
+
+# --------------------------------------------------------------------------- #
+# suggestions cache (music_tag_suggestions.json — candidates only)
+# --------------------------------------------------------------------------- #
+
+def test_load_suggestions_missing_not_written(sandbox):
+    assert music_engine.load_suggestions() == {"version": 1, "tracks": {}}
+    assert not (sandbox["lib"] / "music_tag_suggestions.json").exists()  # reads never write
+
+
+def test_load_suggestions_corrupt_degrades(sandbox):
+    d = sandbox["lib"]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "music_tag_suggestions.json").write_bytes(b"{not json")
+    assert music_engine.load_suggestions() == {"version": 1, "tracks": {}}
+    (d / "music_tag_suggestions.json").write_bytes(b"[1, 2, 3]")
+    assert music_engine.load_suggestions() == {"version": 1, "tracks": {}}
+
+
+def test_coerce_suggestions_degrades_corrupt_shapes():
+    data = {
+        "version": 1,
+        "tracks": {
+            "a.mp3": {"tags": {"scene": ["战斗", 42, "  "], "mood": "bad", "emotion": None},
+                      "suggested_at": 7, "model": None},
+            "b.mp3": "not-a-dict",
+        },
+    }
+    out = music_engine._coerce_suggestions(data)
+    assert out["tracks"]["a.mp3"] == {"tags": {"scene": ["战斗"], "mood": [], "emotion": []},
+                                      "suggested_at": "", "model": ""}
+    assert "b.mp3" not in out["tracks"]
+    assert music_engine._coerce_suggestions([1, 2]) == {"version": 1, "tracks": {}}
+
+
+def test_save_suggestions_write_bytes_no_crlf(sandbox):
+    music_engine.save_suggestions({
+        "version": 1,
+        "tracks": {"战斗曲.mp3": {"tags": {"scene": ["战斗"], "mood": ["紧张"], "emotion": []},
+                                  "suggested_at": "t0", "model": "m"}},
+    })
+    raw = (sandbox["lib"] / "music_tag_suggestions.json").read_bytes()
+    assert b"\r\n" not in raw  # write_bytes — no Windows newline translation
+    data = json.loads(raw.decode("utf-8"))
+    assert data["tracks"]["战斗曲.mp3"]["tags"]["mood"] == ["紧张"]
+
+
+def test_update_suggestions_abort_writes_nothing(sandbox):
+    def boom(d):
+        raise RuntimeError("abort")
+
+    with pytest.raises(RuntimeError):
+        music_engine.update_suggestions(boom)
+    assert not (sandbox["lib"] / "music_tag_suggestions.json").exists()
+
+
+def test_clear_suggestion_noop_when_absent(sandbox):
+    music_engine.clear_suggestion("a.mp3")
+    assert not (sandbox["lib"] / "music_tag_suggestions.json").exists()  # no entry -> no write
+
+
+def test_clear_suggestion_removes_only_named_entry(sandbox):
+    _upload("a.mp3")
+    _upload("b.mp3")
+    music_engine.update_suggestions(
+        lambda d: d["tracks"].update({
+            "a.mp3": {"tags": {"scene": ["战斗"], "mood": [], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+            "b.mp3": {"tags": {"scene": [], "mood": ["紧张"], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+        }))
+    music_engine.clear_suggestion("a.mp3")
+    tracks = music_engine.load_suggestions()["tracks"]
+    assert list(tracks) == ["b.mp3"]
+
+
+# --------------------------------------------------------------------------- #
+# API: /library suggestions + tag decision consumes the candidate
+# --------------------------------------------------------------------------- #
+
+def test_library_suggestions_filtered_to_existing_tracks(sandbox):
+    _upload("a.mp3")
+    _upload("b.mp3")
+    music_engine.save_suggestions({
+        "version": 1,
+        "tracks": {
+            "a.mp3": {"tags": {"scene": ["战斗"], "mood": [], "emotion": []},
+                       "suggested_at": "t0", "model": "m"},
+            # orphan of a deleted track — hidden, never removed
+            "ghost.mp3": {"tags": {"scene": [], "mood": ["紧张"], "emotion": []},
+                           "suggested_at": "t0", "model": "m"},
+        },
+    })
+    r = api_music.get_library()
+    assert set(r["suggestions"]) == {"a.mp3"}
+    assert r["suggestions"]["a.mp3"]["tags"]["scene"] == ["战斗"]
+    assert r["tracks"]["a.mp3"]["tags"] == music_engine._empty_track_tags()  # candidates NOT applied
+
+
+def test_update_track_tags_consumes_suggestion(sandbox):
+    _upload("a.mp3")
+
+    def seed():
+        music_engine.update_suggestions(
+            lambda d: d["tracks"].__setitem__("a.mp3", {
+                "tags": {"scene": ["战斗"], "mood": [], "emotion": []},
+                "suggested_at": "t0", "model": "m"}))
+
+    # a tags patch = the user made a tag decision -> the candidate is consumed
+    seed()
+    api_music.update_track("a.mp3", api_music.TrackUpdate(tags={"mood": ["紧张"]}))
+    assert "a.mp3" not in music_engine.load_suggestions()["tracks"]
+
+    # a non-tags patch leaves the candidate in place
+    seed()
+    api_music.update_track("a.mp3", api_music.TrackUpdate(enabled=False))
+    assert "a.mp3" in music_engine.load_suggestions()["tracks"]
+
+
+# --------------------------------------------------------------------------- #
+# suggest_track_tags worker e2e (fake LLM, real TaskManager + shared LLM gate)
+# --------------------------------------------------------------------------- #
+
+def test_suggest_track_tags_success_writes_only_own_entry(sandbox, monkeypatch):
+    _upload("a.mp3")
+    _upload("b.mp3")
+    core_config.update_config({"llm": {"model_name": "test-model"}})
+    reply = ('{"scene": ["战斗", "编造的"], "mood": ["紧张", "热血", "史诗", "恐怖"], '
+             '"emotion": ["愤怒", "希望", "喜悦"]}')
+    fake, calls = _fake_llm(reply)
+    monkeypatch.setattr(music_engine, "_llm_chat_completion", fake)
+    cfg = core_config.get_config()
+    mgr = get_task_manager()
+    tid = mgr.create("music-ai-tags", "AI 推荐标签：a.mp3",
+                     music_engine.suggest_track_tags, "a.mp3", cfg.llm).id
+    assert _wait_terminal(mgr, tid) == "succeeded"
+    assert calls["n"] == 1
+    t = mgr.get(tid)
+    # vocabulary filter + caps applied (same semantics as the sync endpoint)
+    assert t.result == {"scene": ["战斗"], "mood": ["紧张", "热血", "史诗"], "emotion": ["愤怒", "希望"]}
+    # candidates land ONLY in the suggestions cache, only this track's entry
+    sugg = music_engine.load_suggestions()["tracks"]
+    assert list(sugg) == ["a.mp3"]
+    assert sugg["a.mp3"]["tags"] == t.result
+    assert sugg["a.mp3"]["model"] == "test-model" and sugg["a.mp3"]["suggested_at"]
+    # the index is NOT touched — nothing reaches track tags until user confirmation
+    idx = music_engine.load_index()
+    assert idx["tracks"]["a.mp3"]["tags"] == music_engine._empty_track_tags()
+    assert idx["tracks"]["b.mp3"]["tags"] == music_engine._empty_track_tags()
+    assert concurrency.gate().active == 0  # slot released
+
+
+def test_suggest_track_tags_all_fail_task_failed(sandbox, monkeypatch):
+    _upload("a.mp3")
+    core_config.update_config({"llm": {"model_name": "test-model"}})
+    fake, calls = _fake_llm(RuntimeError("boom"))
+    monkeypatch.setattr(music_engine, "_llm_chat_completion", fake)
+    cfg = core_config.get_config()
+    mgr = get_task_manager()
+    tid = mgr.create("music-ai-tags", "AI 推荐标签：a.mp3",
+                     music_engine.suggest_track_tags, "a.mp3", cfg.llm).id
+    assert _wait_terminal(mgr, tid) == "failed"
+    assert calls["n"] == 2  # both attempts made, then the task fails (UI offers 重试)
+    assert "AI 推荐失败" in mgr.get(tid).error and "boom" in mgr.get(tid).error
+    assert not (sandbox["lib"] / "music_tag_suggestions.json").exists()  # zero writes
+    assert concurrency.gate().active == 0
+
+
+def test_suggest_track_tags_unparseable_replies_failed(sandbox, monkeypatch):
+    _upload("a.mp3")
+    core_config.update_config({"llm": {"model_name": "test-model"}})
+    fake, calls = _fake_llm("这不是 JSON")
+    monkeypatch.setattr(music_engine, "_llm_chat_completion", fake)
+    cfg = core_config.get_config()
+    mgr = get_task_manager()
+    tid = mgr.create("music-ai-tags", "AI 推荐标签：a.mp3",
+                     music_engine.suggest_track_tags, "a.mp3", cfg.llm).id
+    assert _wait_terminal(mgr, tid) == "failed"
+    assert calls["n"] == 2
+    assert "回复不可解析" in mgr.get(tid).error
+
+
+def test_suggest_track_tags_model_empty_fast_fail(sandbox):
+    _upload("a.mp3")
+    assert not core_config.get_config().llm.model_name
+    cfg = core_config.get_config()
+    mgr = get_task_manager()
+    tid = mgr.create("music-ai-tags", "AI 推荐标签：a.mp3",
+                     music_engine.suggest_track_tags, "a.mp3", cfg.llm).id
+    assert _wait_terminal(mgr, tid) == "failed"
+    assert "尚未配置 LLM 模型" in mgr.get(tid).error
+
+
+def test_suggest_track_tags_missing_file_failed(sandbox):
+    core_config.update_config({"llm": {"model_name": "test-model"}})
+    cfg = core_config.get_config()
+    mgr = get_task_manager()
+    tid = mgr.create("music-ai-tags", "AI 推荐标签：ghost.mp3",
+                     music_engine.suggest_track_tags, "ghost.mp3", cfg.llm).id
+    assert _wait_terminal(mgr, tid) == "failed"
+    assert "音乐库中找不到" in mgr.get(tid).error
+
+
+def test_suggest_track_tags_cancel_while_queued(sandbox, monkeypatch):
+    _upload("a.mp3")
+    core_config.update_config({"llm": {"model_name": "test-model"}})
+    monkeypatch.setattr(music_engine, "_llm_chat_completion", _fake_llm("{}"))
+    g = concurrency.gate()
+    concurrency.set_concurrency(1)
+    g.acquire()  # the test holds the only slot
+    try:
+        cfg = core_config.get_config()
+        mgr = get_task_manager()
+        t0 = time.time()
+        tid = mgr.create("music-ai-tags", "AI 推荐标签：a.mp3",
+                         music_engine.suggest_track_tags, "a.mp3", cfg.llm).id
+        _wait_until(lambda: mgr.get(tid).status is TaskStatus.RUNNING, timeout=3)
+        mgr.control(tid, "cancel")
+        _wait_until(lambda: mgr.get(tid).status is TaskStatus.CANCELLED, timeout=3)
+        assert time.time() - t0 < 2.5  # one stop_check poll (0.2 s) + overhead
+        assert g.active == 1  # the worker never took the slot (no release underflow)
+        assert not (sandbox["lib"] / "music_tag_suggestions.json").exists()  # 零落盘
+    finally:
+        g.release()
+        assert g.active == 0

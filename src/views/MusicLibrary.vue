@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // 音乐库（全局资源，工作空间外、跨工程共享）——曲目上传 / 试听 / 打标 / AI 推荐 /
 // 批量操作 / 标签管理。页面不经 WorkspaceGateAlert（与工作空间无关）。
-import { computed, onActivated, onMounted, reactive, ref } from 'vue'
+import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useToast } from '@/components/ui/toast'
+import { useTaskStore } from '@/stores/task'
 import {
   batchDelete,
   batchEnable,
@@ -14,12 +15,13 @@ import {
   musicPreviewUrl,
   renameTag,
   suggestTags,
+  suggestTagsBatch,
   updateTrack,
   uploadMusic,
 } from '@/api/music'
 import { pickFiles } from '@/utils/fileops'
 import { formatDuration } from '@/utils/format'
-import type { MusicLibrary, MusicTagCategory, TrackTags } from '@/types'
+import type { MusicLibrary, MusicSuggestion, MusicTagCategory, TaskSnapshot, TrackTags } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -145,6 +147,54 @@ function toggleSelectAll(e: Event) {
 }
 function clearSelection() {
   for (const k of Object.keys(selected)) delete selected[k]
+}
+
+// ---------------------------------------------------------------------------
+// AI 识别任务派生（module music-ai-tags，label「AI 推荐标签：{name}」）
+// 行任务按 label 尾部「：{name}」归位（与 BGM 页 stemOfLabel 同形）：
+// 在途（非终态）取 seq 升序首个；失败取 seq 降序最新（重试走同一任务 id）。
+// ---------------------------------------------------------------------------
+
+const taskStore = useTaskStore()
+const AI_MODULE = 'music-ai-tags'
+const AI_TERMINAL = new Set(['cancelled', 'succeeded', 'failed'])
+
+function aiTrackOfLabel(label: string): string {
+  // 与后端 _inflight_ai_names 的 re.search(r"：(.+)$") 同一口径：取第一个「：」后全部。
+  const i = label.indexOf('：')
+  return i >= 0 ? label.slice(i + 1) : ''
+}
+
+const aiTasks = computed(() => {
+  const active = new Map<string, TaskSnapshot>()
+  const failed = new Map<string, TaskSnapshot>()
+  for (const t of taskStore.tasks) {
+    if (t.module !== AI_MODULE) continue
+    const name = aiTrackOfLabel(t.label)
+    if (!name) continue
+    if (t.status === 'failed') {
+      const cur = failed.get(name)
+      if (!cur || t.seq > cur.seq) failed.set(name, t)
+    } else if (!AI_TERMINAL.has(t.status)) {
+      const cur = active.get(name)
+      if (!cur || t.seq < cur.seq) active.set(name, t)
+    }
+  }
+  return { active, failed }
+})
+
+function suggestionOf(name: string): MusicSuggestion | undefined {
+  return lib.value?.suggestions?.[name]
+}
+function suggestionHasTags(name: string): boolean {
+  const s = suggestionOf(name)
+  return !!s && CATEGORIES.some((c) => (s.tags?.[c]?.length ?? 0) > 0)
+}
+function suggestionSummary(name: string): string {
+  const s = suggestionOf(name)
+  if (!s) return ''
+  const parts = CATEGORIES.flatMap((c) => s.tags?.[c] ?? [])
+  return parts.length ? parts.join('、') : '（无标签）'
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +336,35 @@ async function doBatchDelete() {
   }
 }
 
+// AI 一键识别所选（每曲一任务，共享 LLM 闸）：候选进 suggestions 缓存，
+// 用户逐曲确认后才写标签；失败行可重试（重试走同一任务 id）。
+const aiBatchBusy = ref(false)
+async function doAiSuggestBatch() {
+  const names = selectedNames.value
+  if (aiBatchBusy.value || !names.length) return
+  aiBatchBusy.value = true
+  try {
+    const r = await suggestTagsBatch(names)
+    toast({
+      title: `AI 识别已启动（${r.tracks.length} 首）`,
+      variant: 'default',
+      description: '候选结果出来后可在编辑标签弹层查看并确认采用（仅依据文件名 + 描述，LLM 不读取音频）。',
+    })
+  } catch (e: any) {
+    toast({ title: 'AI 识别启动失败', variant: 'destructive', description: e?.message || '' })
+  } finally {
+    aiBatchBusy.value = false
+  }
+}
+function cancelAiTask(name: string) {
+  const t = aiTasks.value.active.get(name)
+  if (t) void taskStore.control(t.id, 'cancel')
+}
+function retryAiTask(name: string) {
+  const t = aiTasks.value.failed.get(name)
+  if (t) void taskStore.control(t.id, 'retry')
+}
+
 // ---------------------------------------------------------------------------
 // 标签编辑弹层（页内自写 overlay，Voices.vue 先例）
 // ---------------------------------------------------------------------------
@@ -305,7 +384,7 @@ const customDraft = ref('')
 function emptyTags(): TrackTags {
   return { scene: [], mood: [], emotion: [], custom: [] }
 }
-function ensureTags(t: Record<string, string[]> | null | undefined): TrackTags {
+function ensureTags(t: Partial<Record<string, string[]>> | null | undefined): TrackTags {
   const out = emptyTags()
   if (t) {
     for (const c of CATEGORIES) {
@@ -323,6 +402,13 @@ function openEditor(name: string) {
   aiTags.value = null
   aiNote.value = ''
   customDraft.value = ''
+  // 批量 AI 已产出候选（suggestions 缓存）→ 直接预填，不再调用 LLM；
+  // 点「AI 推荐」按钮仍可随时重新生成（覆盖预填）。
+  const s = suggestionOf(name)
+  if (s && CATEGORIES.some((c) => (s.tags?.[c]?.length ?? 0) > 0)) {
+    aiTags.value = ensureTags(s.tags)
+    aiNote.value = 'AI 推荐结果（仅依据文件名 + 描述，LLM 未读取音频）。点击「全部采用」合并到已勾选标签，或直接修改后保存。'
+  }
 }
 function closeEditor() {
   editor.value = null
@@ -441,10 +527,49 @@ async function doDeleteTag(cat: MusicTagCategory, name: string) {
 }
 
 // ---------------------------------------------------------------------------
-// 生命周期（keep-alive 缓存页：重新进入时刷新）
+// SSE 驱动（getter 式 watch）：AI 任务终态 → 重拉库口径（suggestions 候选）。
+// processed 集合防重复（快照重放 / 断线重连）；转回非终态（重试）时释放。
+// 批量 N 首不逐条弹 toast（N 大时刷屏）——行状态徽章即反馈。
+// ---------------------------------------------------------------------------
+const aiProcessed = new Set<string>()
+let aiWatcherArmed = false
+
+watch(
+  () =>
+    taskStore.tasks
+      .filter((t) => t.module === AI_MODULE)
+      .map((t) => `${t.id}:${t.status}`)
+      .join('|'),
+  () => {
+    if (!aiWatcherArmed) {
+      aiWatcherArmed = true
+      for (const t of taskStore.tasks) {
+        if (t.module === AI_MODULE && AI_TERMINAL.has(t.status)) aiProcessed.add(t.id)
+      }
+      return
+    }
+    let dirty = false
+    for (const t of taskStore.tasks) {
+      if (t.module !== AI_MODULE) continue
+      if (!AI_TERMINAL.has(t.status)) {
+        aiProcessed.delete(t.id)
+        continue
+      }
+      if (aiProcessed.has(t.id)) continue
+      aiProcessed.add(t.id)
+      if (t.status === 'succeeded') dirty = true
+    }
+    if (dirty) void refresh()
+  },
+)
+
+// ---------------------------------------------------------------------------
+// 生命周期（keep-alive 缓存页：重新进入时刷新；F5 后 taskStore.refresh() 使
+// 在途 AI 任务按 label 派生重挂，无本地 job 列表）
 // ---------------------------------------------------------------------------
 
-onMounted(() => {
+onMounted(async () => {
+  await taskStore.refresh()
   void refresh()
 })
 onActivated(() => {
@@ -468,8 +593,9 @@ onActivated(() => {
       <CardHeader>
         <CardTitle class="flex items-center gap-2"><Disc3 class="h-5 w-5" />曲目</CardTitle>
         <CardDescription>
-          勾选后可批量加/删标签、启用/禁用、删除。标签分四类：场景 / 气氛 / 情绪 / 自定义（自动匹配按
-          气氛 3 · 场景 2 · 情绪 1 · 自定义 1 加权）。
+          勾选后可批量加/删标签、启用/禁用、删除，或一键 AI 识别标签（仅依据文件名 + 描述，
+          LLM 不读取音频；候选需确认后才生效）。标签分四类：场景 / 气氛 / 情绪 / 自定义
+          （自动匹配按 气氛 3 · 场景 2 · 情绪 1 · 自定义 1 加权）。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
@@ -545,6 +671,10 @@ onActivated(() => {
             <Button variant="destructive" size="sm" :disabled="batchBusy" @click="doBatchDelete">
               <Trash2 class="h-3.5 w-3.5" />批量删除
             </Button>
+            <span class="h-4 w-px bg-border" />
+            <Button variant="outline" size="sm" :disabled="aiBatchBusy" @click="doAiSuggestBatch">
+              <Sparkles class="h-3.5 w-3.5" />AI 推荐（{{ selectedNames.length }} 首）
+            </Button>
             <Button variant="ghost" size="sm" @click="clearSelection">清空选择</Button>
           </div>
 
@@ -564,6 +694,7 @@ onActivated(() => {
                 <TableHead>文件名</TableHead>
                 <TableHead class="w-14">时长</TableHead>
                 <TableHead>标签</TableHead>
+                <TableHead class="w-40">AI 识别</TableHead>
                 <TableHead class="w-16">启用</TableHead>
                 <TableHead class="w-28 text-right">操作</TableHead>
               </TableRow>
@@ -604,6 +735,45 @@ onActivated(() => {
                     </Badge>
                   </div>
                   <Badge v-else variant="secondary" class="opacity-60">未打标</Badge>
+                </TableCell>
+                <TableCell>
+                  <!-- AI 识别行状态：识别中（在途任务）> 识别失败（可重试）> AI 已推荐（候选待确认）> — -->
+                  <div
+                    v-if="aiTasks.active.has(name)"
+                    class="flex items-center gap-1.5 text-xs text-primary"
+                  >
+                    <Loader2 class="h-3.5 w-3.5 animate-spin" />
+                    <span class="truncate" :title="aiTasks.active.get(name)!.current || '识别中…'">
+                      {{ aiTasks.active.get(name)!.current || '识别中…' }}
+                    </span>
+                    <Button variant="ghost" size="sm" class="h-6 px-1.5 text-xs" @click="cancelAiTask(name)">
+                      取消
+                    </Button>
+                  </div>
+                  <div v-else-if="aiTasks.failed.get(name)" class="flex items-center gap-1.5">
+                    <Badge
+                      variant="destructive"
+                      class="text-xs"
+                      :title="aiTasks.failed.get(name)!.error || 'AI 识别失败'"
+                    >
+                      识别失败
+                    </Badge>
+                    <Button variant="ghost" size="sm" class="h-6 px-1.5 text-xs" @click="retryAiTask(name)">
+                      重试
+                    </Button>
+                  </div>
+                  <Badge
+                    v-else-if="suggestionHasTags(name)"
+                    variant="secondary"
+                    class="border-amber-500/30 bg-amber-500/15 text-amber-600 text-xs dark:text-amber-400"
+                    :title="`AI 候选：${suggestionSummary(name)}（编辑标签查看并确认采用）`"
+                  >
+                    <Sparkles class="mr-1 h-3 w-3" />AI 已推荐
+                  </Badge>
+                  <span
+                    v-else-if="suggestionOf(name)"
+                    class="text-xs text-muted-foreground"
+                  >AI 未推荐到标签</span>
                 </TableCell>
                 <TableCell>
                   <Switch

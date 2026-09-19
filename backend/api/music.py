@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -19,17 +21,21 @@ from pydantic import BaseModel
 
 from ..core import paths as core_paths
 from ..core.config import get_config
+from ..core.concurrency import gate, set_concurrency
+from ..core.tasks import TERMINAL, get_task_manager
 from ..engines import music as music_engine
 from ..engines.audio import probe_duration
 from ..engines.script import _llm_chat_completion
-from ..engines.voices import extract_json_object
+from .bgm import _run_bgm_coordinator
 
 router = APIRouter(prefix="/api/music", tags=["music"])
 
 MEDIA_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav"}
 
-# Per-category caps for AI-suggested tags (防 LLM 造词/过量).
-_SUGGEST_CAPS = {"scene": 2, "mood": 3, "emotion": 2, "custom": 2}
+# Batch AI tag recognition label contract (承重 — backend regex ↔ frontend
+# derivation ↔ tests): module ``music-ai-tags`` with label ``AI 推荐标签：{name}``.
+AI_TAGS_MODULE = "music-ai-tags"
+AI_TAGS_LABEL = "AI 推荐标签"
 
 
 # --------------------------------------------------------------------------- #
@@ -141,8 +147,16 @@ class SuggestTagsReq(BaseModel):
 
 @router.get("/library")
 def get_library() -> dict:
-    """The full index: tag registry + all tracks (read-only)."""
-    return music_engine.load_index()
+    """The full index + pending AI suggestions (read-only).
+
+    ``suggestions`` = the candidates from the batch AI tag recognition
+    (``music_tag_suggestions.json``) filtered to EXISTING tracks (orphans of
+    deleted tracks are hidden, never removed). Candidates only — nothing is
+    applied to track tags until the user confirms in the UI.
+    """
+    idx = music_engine.load_index()
+    sugg = music_engine.load_suggestions().get("tracks") or {}
+    return {**idx, "suggestions": {n: e for n, e in sugg.items() if n in idx["tracks"]}}
 
 
 @router.post("/upload")
@@ -230,6 +244,10 @@ def update_track(name: str, body: TrackUpdate) -> dict:
             tr["description"] = body.description
 
     idx = music_engine.update_index(_mutate)
+    if body.tags is not None:
+        # The user made a tag decision — the AI candidate for this track is
+        # consumed (the 弹层「全部采用/确认并修改」both end in this PUT).
+        music_engine.clear_suggestion(name)
     return {"name": name, "track": idx["tracks"][name]}
 
 
@@ -446,7 +464,10 @@ def _delete_tag(idx: dict, category: str, name: str) -> None:
 def suggest_tags(body: SuggestTagsReq) -> dict:
     """LLM-recommended tags from the file NAME + user DESCRIPTION only — the
     LLM never reads the audio. Results are candidates (filtered to the
-    in-vocabulary names per category) for the user to confirm."""
+    in-vocabulary names per category) for the user to confirm.
+
+    Single-track, SYNCHRONOUS (in-request helper inside the tag editor); the
+    batch one-click path is ``/suggest-tags-batch`` (one Task per track)."""
     p = _track_path(body.name)
     if not p.is_file():
         raise HTTPException(404, f"音乐库中找不到 {body.name}")
@@ -457,15 +478,7 @@ def suggest_tags(body: SuggestTagsReq) -> dict:
     tr = idx["tracks"].get(body.name)
     description = (body.description or (tr or {}).get("description") or "").strip()
 
-    vocab = {c: idx["tags"].get(c, []) for c in music_engine.TAG_CATEGORIES if c != "custom"}
-    vocab_text = "\n".join(f"{c}: {'、'.join(v)}" for c, v in vocab.items())
-    system = (
-        "你是有声书背景音乐标签助手。根据音乐文件名和用户描述，从给定词表中选择标签。"
-        "只能从词表中选择，禁止创造新词。输出 JSON：{\"scene\": [...], \"mood\": [...], "
-        "\"emotion\": [...]}，scene 最多 2 个、mood 最多 3 个、emotion 最多 2 个，"
-        "选不出就留空数组。只输出 JSON，不要解释。"
-    )
-    user = f"文件名：{p.stem}\n用户描述：{description or '（无）'}\n\n词表：\n{vocab_text}"
+    system, user = music_engine.build_suggestion_prompts(p.stem, description, idx["tags"])
 
     last_err: str | None = None
     parse_failed = False
@@ -480,31 +493,79 @@ def suggest_tags(body: SuggestTagsReq) -> dict:
         except Exception as e:  # noqa: BLE001 — retry, then 502
             last_err = str(e)
             continue
-        try:
-            return _filter_suggestion(content, idx["tags"])
-        except HTTPException:
-            parse_failed = True  # 回复不可解析 = 一次失败尝试，重试
+        parsed = music_engine.parse_suggestion_reply(content, idx["tags"])
+        if parsed is not None:
+            return {"tags": parsed}
+        parse_failed = True  # 回复不可解析 = 一次失败尝试，重试
     if parse_failed:
         raise HTTPException(502, "AI 推荐失败，请手动打标。")
     raise HTTPException(502, f"AI 推荐失败，请手动打标（{last_err}）")
 
 
-def _filter_suggestion(content: str, registry: dict[str, list[str]]) -> dict:
-    """Parse the LLM reply (a JSON OBJECT — ``extract_json_object``, the
-    brace-scanning extractor; ``clean_json_string`` is array-only), keep ONLY
-    in-vocabulary names per category, cap each bucket (anti word-coining /
-    overflow)."""
-    data = extract_json_object(content)
-    if not isinstance(data, dict):
-        raise HTTPException(502, "AI 推荐失败，请手动打标。")
-    out: dict[str, list[str]] = {}
-    for cat in ("scene", "mood", "emotion"):
-        vals = data.get(cat)
-        vocab = [v for v in (registry.get(cat) or []) if isinstance(v, str)]
-        keep: list[str] = []
-        if isinstance(vals, list):
-            for v in vals:
-                if isinstance(v, str) and v.strip() and v.strip() in vocab and v.strip() not in keep:
-                    keep.append(v.strip())
-        out[cat] = keep[: _SUGGEST_CAPS[cat]]
-    return {"tags": out}
+# --------------------------------------------------------------------------- #
+# AI tag recognition — batch (one Task per selected track, shared LLM gate)
+# --------------------------------------------------------------------------- #
+
+class SuggestBatchReq(BaseModel):
+    names: list[str]
+
+
+def _inflight_ai_names() -> set[str]:
+    """Track names (the label tail ``：{name}``) of non-terminal
+    ``music-ai-tags`` tasks — the same-track in-flight guard (two tasks on one
+    track would race on the same suggestion entry / LLM slot).
+    Non-conflicting tracks may still join a running batch."""
+    out = set()
+    for t in get_task_manager().list():
+        if t.module == AI_TAGS_MODULE and t.status not in TERMINAL:
+            m = re.search(r"：(.+)$", t.label)
+            if m:
+                out.add(m.group(1))
+    return out
+
+
+@router.post("/suggest-tags-batch")
+def suggest_tags_batch(body: SuggestBatchReq) -> dict:
+    """Start one AI-tag Task per selected track (PENDING shells + the shared
+    BGM coordinator; gate = the process-wide LLM gate ``gate()``; slot scope =
+    the whole task).
+
+    Candidates land in ``music_tag_suggestions.json`` — the index is NOT
+    touched until the user confirms in the UI.
+
+    Guards: per-name (traversal 400 / missing 404) → empty selection 400 →
+    model not configured 400 → same-track in-flight 409 (non-conflicting
+    tracks allowed). Returns ``{"task_ids": [...], "tracks": [{name, task_id}]}``.
+    """
+    names: list[str] = []
+    for n in body.names or []:
+        try:
+            bare = music_engine.validate_music_name(n)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not (_library_dir() / bare).is_file():
+            raise HTTPException(404, f"音乐库中找不到 {bare}")
+        if bare not in names:
+            names.append(bare)
+    if not names:
+        raise HTTPException(400, "请选择要 AI 识别标签的音乐。")
+    cfg = get_config()
+    if not cfg.llm.model_name:
+        raise HTTPException(400, "尚未配置 LLM 模型（设置 → LLM → model_name）。")
+    conflicts = [n for n in names if n in _inflight_ai_names()]
+    if conflicts:
+        raise HTTPException(409, "以下音乐已有 AI 推荐任务在途：" + "、".join(conflicts))
+    set_concurrency(cfg.generation.max_concurrency)
+    mgr = get_task_manager()
+    created = [
+        {"name": n, "task_id": mgr.create(
+            AI_TAGS_MODULE, f"{AI_TAGS_LABEL}：{n}",
+            music_engine.suggest_track_tags, n, cfg.llm, start=False,
+        ).id}
+        for n in names
+    ]
+    threading.Thread(
+        target=_run_bgm_coordinator,
+        args=([c["task_id"] for c in created], gate), daemon=True,
+    ).start()
+    return {"task_ids": [c["task_id"] for c in created], "tracks": created}
