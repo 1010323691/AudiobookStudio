@@ -462,6 +462,15 @@ export interface TaskSnapshot {
   llm_chars?: number
   /** Cumulative processing seconds up to the last completed chunk — 处理速度 denominator. */
   llm_secs?: number
+  /** 已合成段数 (音频合成 进度指标, cumulative: pre-run done + this run's); 0 when the task
+   *  doesn't report segments (only 音频合成 tasks do). */
+  seg_done?: number
+  /** Total synthesizable segments of the run (音频合成 进度指标 denominator). */
+  seg_total?: number
+  /** 已合成字数 (音频合成 进度指标, cumulative; stripped code points of the done segments). */
+  seg_chars_done?: number
+  /** Total chars of the run's full segment table (音频合成 进度指标 denominator). */
+  seg_chars_total?: number
   result: Record<string, any>
   error: string
   created: number

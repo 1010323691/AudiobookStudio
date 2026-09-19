@@ -432,6 +432,8 @@ def test_move_project_synthesize_resume(sandbox, monkeypatch):
             self.progresses.append((frac, current))
         def check(self):
             pass
+        def segment_stats(self, done, total, chars_done, chars_total):
+            pass  # display-only metric — this test pins the path migration, not the metric
 
     result = tts_batch.synthesize(_Handle(), None, "s.json", None)  # default = resume
 

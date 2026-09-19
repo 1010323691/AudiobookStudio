@@ -42,6 +42,11 @@ MAX_CONCURRENCY = 64
 # 循环（任务日志与进度条逐行蠕动，而 worker 实际在全速张量批）。
 MANIFEST_FLUSH_INTERVAL = 2.0
 
+# 进度指标（已合成/总段数 · 已合成/总字数 → 合成页「开始音频合成」按钮下方）的 SSE 推送节流：
+# 每段完成都触发一次上报，但推送最多每 1 秒一次——一个子批的段行往往同秒内成串到达，而每条
+# 事件都携带全量累计值，节流不丢信息（启动时与收尾各强制推一次；终态快照/结果事件带最终值兜底）。
+STATS_FLUSH_INTERVAL = 1.0
+
 
 def clamp_concurrency(n) -> int:
     """Clamp a requested concurrency to ``[MIN_CONCURRENCY, MAX_CONCURRENCY]``.
@@ -251,7 +256,11 @@ class _PooledFile:
     old_entries: dict = field(default_factory=dict)
     seg_results: dict = field(default_factory=dict)
     pending: list = field(default_factory=list)
+    # Pre-run completion snapshot (the manifest's done set, and its total chars) — the
+    # baseline the 进度指标 (已合成/总段数 · 字数) counts on top of this run's completions.
+    done_set: set = field(default_factory=set)
     done_count: int = 0
+    done_chars: int = 0
     all_count: int = 0
     error: str | None = None
     dirty: bool = False
@@ -672,6 +681,30 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
     by_index = {s["index"]: s for s in segments}
     in_flight: set = set()  # indices the current child was generating (from its [watchdog] line)
 
+    # 进度指标（合成页「开始音频合成」按钮下方）：累计已合成 = 运行前 manifest 已完成
+    # ∪ 本次运行 ok 的段（union 口径，显式 indices 重做已完成段时不会重复计数），对
+    # 整表总数（全部可合成段 / 其 strip 后字数之和）。每段完成触发一次上报（SSE
+    # 「segments」 事件），推送节流至最多每 STATS_FLUSH_INTERVAL 秒一次；启动时与收尾
+    # 各强制推一次（终态快照 / 结果事件携带最终值兜底）。
+    all_by_index = {s["index"]: s for s in all_segments}
+    seg_total = len(all_segments)
+    chars_total = sum(len(s["text"]) for s in all_segments)
+    last_stats = [0.0]  # time.monotonic() of the last stats push
+
+    def _report_stats(force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_stats[0] < STATS_FLUSH_INTERVAL:
+            return
+        last_stats[0] = now
+        done = chars = 0
+        for i in all_indices:
+            if i in done_set or (seg_results.get(i) or {}).get("ok"):
+                done += 1
+                chars += len(all_by_index[i]["text"])
+        handle.segment_stats(done, seg_total, chars, chars_total)
+
+    _report_stats(force=True)  # the baseline (a resume run shows its pre-run progress at once)
+
     # In-memory truth updates on every [segment] line, but the full-file disk rewrite is
     # throttled to at most once per MANIFEST_FLUSH_INTERVAL: under disk / AV-scanner load a
     # 1MB rewrite per line stalled this line-processing loop (task log and progress bar crept
@@ -694,6 +727,7 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
         if line.startswith("[segment]"):
             _handle_segment(line, by_index, run_total, seg_results, handle)
             _write_manifest()
+            _report_stats()
         elif line.startswith("[watchdog]"):
             # The child names the batch that hung before it exits 124: remember the in-flight
             # indices so a strike at workers==1 targets the right segment(s).
@@ -796,12 +830,16 @@ def _synthesize_one(handle, indices=None, script=None, concurrency=None, seed=No
         # Cancel / engine failure / attempt cap: flush whatever finished since the last
         # throttled write, then let the exception settle the task as before.
         _write_manifest(force=True)
+        _report_stats(force=True)  # the terminal snapshot carries the exact final counters
         raise
 
     # Final manifest (the throttled writes may lag up to the interval; this one is
     # authoritative — also a safety net in case the child exits before its last line is
     # drained).
     _write_manifest(force=True)
+    # The last 进度指标 push (the terminal snapshot / result events carry the same
+    # final counters, so the page's card stays correct after the task settles).
+    _report_stats(force=True)
 
     completed = 0
     failed = []
@@ -923,6 +961,10 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
             done_set = {i for i in all_indices if is_done(f.old_entries.get(i))}
             f.pending = sorted(plan_to_synthesize(all_indices, done_set))
             f.all_count = len(f.all_segments)
+            # Pre-run completion snapshot (进度指标 baseline: this file's done 段/字).
+            f.done_set = done_set
+            f.done_count = len(done_set)
+            f.done_chars = sum(len(f.by_index[i]["text"]) for i in done_set)
             if f.pending:
                 if done_set:
                     handle.log(f"续合：已完成 {len(done_set)} 段，待合成 {len(f.pending)} 段（共 {f.all_count} 段）")
@@ -995,6 +1037,7 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
         if line.startswith("[segment]"):
             _handle_segment_pool(line, pool_map, pool_total, handle)
             flush_manifests()
+            _report_stats()  # resolved at call time (defined before the loop below)
         elif line.startswith("[watchdog]"):
             in_flight.update(_parse_watchdog_indices(line))
             handle.log(line, "WARNING")
@@ -1035,6 +1078,31 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
     out_dir_fallback = next(f.out_dir for f in files if f.pending and not f.error)
     handle.log(f"引擎：.venv-tts（一次性子进程，全池统一调度，模型只加载一次）· 批内上限 {workers} 段")
     handle.log(f"运行日志（排障用，含每次重启的完整引擎输出）：{run_log}")
+
+    # 进度指标（合成页「开始音频合成」按钮下方）：全池累计已合成 = 各文件运行前已完成
+    # ∪ 本次运行 ok 的段（union 口径），对全池总数（prep fatal 的文件不进总数——
+    # 它们没有可合成段）。每段完成触发一次上报（SSE 「segments」 事件），推送节流至
+    # 最多每 STATS_FLUSH_INTERVAL 秒一次；启动时与收尾各强制推一次。
+    seg_total = sum(f.all_count for f in files if not f.error)
+    chars_total = sum(len(s["text"]) for f in files if not f.error for s in f.all_segments)
+    last_stats = [0.0]  # time.monotonic() of the last stats push
+
+    def _report_stats(force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_stats[0] < STATS_FLUSH_INTERVAL:
+            return
+        last_stats[0] = now
+        done = chars = 0
+        for f in files:
+            if f.error:
+                continue
+            for i, seg in f.by_index.items():
+                if i in f.done_set or (f.seg_results.get(i) or {}).get("ok"):
+                    done += 1
+                    chars += len(seg["text"])
+        handle.segment_stats(done, seg_total, chars, chars_total)
+
+    _report_stats(force=True)  # the baseline (resume runs show their pre-run progress at once)
 
     MAX_ATTEMPTS = 8
     excluded: set = set()  # pool indices isolated after two strikes
@@ -1118,9 +1186,13 @@ def synthesize_multi(handle, scripts, concurrency=None, seed=None) -> dict:
         # Cancel / engine failure / attempt cap: force-flush every pooled file's manifest,
         # then let the exception settle the task (TaskCancelled re-raised verbatim).
         flush_manifests(force=True)
+        _report_stats(force=True)  # the terminal snapshot carries the exact final counters
         raise
 
     # Final authoritative manifests (the throttled writes may lag up to the interval; also a
     # safety net in case the child exits before its last line is drained).
     flush_manifests(force=True)
+    # The last 进度指标 push (the terminal snapshot / result events carry the same final
+    # counters, so the page's card stays correct after the task settles).
+    _report_stats(force=True)
     return _settle_pool(handle, files)

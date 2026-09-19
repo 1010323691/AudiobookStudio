@@ -111,11 +111,12 @@ from backend.engines.tts import WorkerWatchdogTimeout  # noqa: E402
 
 
 class _Handle:
-    """A minimal TaskHandle stand-in: records log/progress, never cancels or pauses."""
+    """A minimal TaskHandle stand-in: records log/progress/segment stats, never cancels or pauses."""
 
     def __init__(self):
         self.logs = []
         self.progresses = []
+        self.stats = []  # (done, total, chars_done, chars_total) — every segment_stats call
 
     def log(self, msg, level="INFO"):
         self.logs.append((level, msg))
@@ -125,6 +126,9 @@ class _Handle:
 
     def check(self):
         pass
+
+    def segment_stats(self, done, total, chars_done, chars_total):
+        self.stats.append((done, total, chars_done, chars_total))
 
 
 @pytest.fixture
@@ -803,6 +807,134 @@ def test_synthesize_resume_all_done_short_circuits(workspace, monkeypatch):
     assert result["completed"] == 2 and result["failed"] == []
     assert result["done_count"] == 2 and result["all_count"] == 2
     assert any("已全部完成" in msg for _lvl, msg in h.logs)
+
+
+# --------------------------------------------------------------------------- #
+# 进度指标 (segment stats) — 合成页「开始音频合成」按钮下方的
+# 已合成/总段数 · 已合成/总字数（SSE 「segments」 事件，节流推送）
+# --------------------------------------------------------------------------- #
+
+def test_synthesize_segment_stats_baseline_and_throttled_final(workspace, monkeypatch):
+    """First push = the run baseline (fresh run: 0/2 段, 0/10 字); a whole sub-batch of
+    segment lines landing inside the 1 s throttle window yields NO mid push; the final
+    forced push carries the full cumulative state. The totals are the FULL segment table
+    (2 segments, 5+5 stripped chars) — not just this run's rows."""
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    h = _Handle()
+    tts_batch.synthesize(h, None, "s.json", 4)
+    assert h.stats == [(0, 2, 0, 10), (2, 2, 10, 10)]
+
+
+def test_synthesize_segment_stats_pushes_per_segment(workspace, monkeypatch):
+    """With the push throttle at 0 every completed segment pushes at once — the
+    实时 path: the card steps up per finished segment/sub-batch. Cumulatives step by
+    one segment and its stripped chars, monotonically, ending at the full table."""
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+    h = _Handle()
+    tts_batch.synthesize(h, None, "s.json", 4)
+    # baseline → one push per completed segment → the forced final push (same full state)
+    assert h.stats == [
+        (0, 2, 0, 10),
+        (1, 2, 5, 10),
+        (2, 2, 10, 10),
+        (2, 2, 10, 10),
+    ]
+
+
+def test_synthesize_segment_stats_resume_baseline_counts_prior_done(workspace, monkeypatch):
+    """A resume run's baseline already counts the pre-run completed work: segment 1 done
+    in the manifest → first push (1, 2, 5, 10), not (0, …). The final push = the whole
+    table done. (Union semantics: re-doing an already-done segment can never double-count.)
+    """
+    ws = workspace
+    _seed_done_package(ws, "s", [(0, "A", "hello", "0001.mp3")])
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+    h = _Handle()
+    tts_batch.synthesize(h, None, "s.json", 4)
+    assert h.stats[0] == (1, 2, 5, 10)  # the baseline includes the pre-run done segment
+    assert h.stats[-1] == (2, 2, 10, 10)  # the final = everything done
+    for (d0, _t, c0, _tc), (d1, _t2, c1, _tc2) in zip(h.stats, h.stats[1:]):
+        assert d1 >= d0 and c1 >= c0  # monotone
+
+
+def test_synthesize_segment_stats_failed_segments_not_counted(workspace, monkeypatch):
+    """A failed segment is NOT 已合成: it adds nothing to the done 段/字 cumulatives
+    (it only shows up in the run's failed list / manifest ok:false). 1-of-2 ok still
+    succeeds, and the final push counts exactly the one ok segment."""
+    captured = {}
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+
+    def run_worker(cmd, handle, on_line, *, temp_files=(), fail_prefix="TTS 引擎", **kw):
+        captured["cmd"] = cmd
+        with open(cmd[cmd.index("--segments-file") + 1], encoding="utf-8") as f:
+            segs = json.load(f)
+        out_dir = cmd[cmd.index("--out-dir") + 1]
+        on_line(f"[segment] 0 ok {os.path.join(out_dir, '0001.mp3')}")
+        on_line("[segment] 1 error 引擎炸了")
+
+    monkeypatch.setattr(tts_batch, "resolve_engine", lambda: (Path("/fake/python"), Path("/fake/worker")))
+    monkeypatch.setattr(tts_batch, "run_worker", run_worker)
+    h = _Handle()
+    result = tts_batch.synthesize(h, None, "s.json", 4)
+    assert result["completed"] == 1 and len(result["failed"]) == 1  # the run succeeds
+    assert (1, 2, 5, 10) in h.stats  # after segment 0 ok: 1 done 段 / 5 done 字
+    assert h.stats[-1] == (1, 2, 5, 10)  # the failed segment added nothing; final = same
+
+
+def test_synthesize_multi_segment_stats_pool_wide(workspace, monkeypatch):
+    """The pooled run reports POOL-wide cumulatives: the totals span every healthy file
+    (s: 2 段/10 字, t: 2 段/6 字); per-segment pushes step across chapter boundaries;
+    the final = the whole pool done."""
+    ws = workspace
+    _seed_second_file(ws)
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+    h = _Handle()
+    tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert h.stats[0] == (0, 4, 0, 16)  # the baseline: both files' full tables
+    assert h.stats[-1] == (4, 4, 16, 16)  # the final: the whole pool done
+    assert len(h.stats) == 6  # baseline + 4 per-segment + the forced final
+    # the four per-segment pushes step strictly (every pool row completes, in pool order);
+    # the forced final repeats the last per-segment value (same full state)
+    for (d0, _t, c0, _tc), (d1, _t2, c1, _tc2) in zip(h.stats[:4], h.stats[1:5]):
+        assert d1 > d0 and c1 > c0
+    assert h.stats[5] == h.stats[4]
+
+
+def test_synthesize_multi_segment_stats_exclude_fatal_files(workspace, monkeypatch):
+    """A prep-fatal file contributes nothing to the progress totals (it has no
+    synthesizable segments): the totals cover only the healthy files, while the fatal
+    file is still isolated per file (its result entry carries the error)."""
+    ws = workspace
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+    h = _Handle()
+    result = tts_batch.synthesize_multi(h, ["s.json", "missing.json"], 4)
+    assert h.stats[0] == (0, 2, 0, 10)  # only s.json's table (missing.json is fatal → excluded)
+    assert h.stats[-1] == (2, 2, 10, 10)
+    assert result["files"][1]["error"]  # the fatal file stays isolated (existing semantics)
+
+
+def test_synthesize_multi_segment_stats_resume_baselines(workspace, monkeypatch):
+    """Pooled resume: each file's pre-run done set is in its baseline (s: 1/2 done
+    → 5/10 字; t: none) → the pool baseline is (1, 4, 5, 16)."""
+    ws = workspace
+    _seed_second_file(ws)
+    _seed_done_package(ws, "s", [(0, "A", "hello", "0001.mp3")])
+    calls = []
+    _stub_engine_pool(monkeypatch, calls)
+    monkeypatch.setattr(tts_batch, "STATS_FLUSH_INTERVAL", 0.0)
+    h = _Handle()
+    tts_batch.synthesize_multi(h, ["s.json", "t.json"], 4)
+    assert h.stats[0] == (1, 4, 5, 16)  # the pool baseline counts s's pre-run done segment
+    assert h.stats[-1] == (4, 4, 16, 16)
 
 
 def test_is_done_requires_ok_and_file(workspace):

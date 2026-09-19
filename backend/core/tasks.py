@@ -109,6 +109,19 @@ class TaskHandle:
         """
         self._t.set_llm_chars(chars, secs)
 
+    def segment_stats(self, done: int, total: int, chars_done: int, chars_total: int) -> None:
+        """Report cumulative 已合成段数 / 字数 against the run's totals (音频合成 metrics).
+
+        The tts_batch engine calls this (throttled, at most once a second) as segments
+        complete, so the 合成页's 已合成/总段数 · 已合成/总字数 card below the
+        开始音频合成 button updates per finished sub-batch purely from these events
+        (no polling). Display-only, like ``llm_rate``. ``done`` / ``chars_done`` are
+        cumulative (the pre-run manifest completions + this run's) against the run's
+        full segment table (``total`` / ``chars_total``); every event carries the full
+        cumulative state, so a dropped event self-heals on the next one or the snapshot.
+        """
+        self._t.set_segment_stats(done, total, chars_done, chars_total)
+
     def check(self) -> None:
         """Cooperative cancellation + pause point. Call between units of work."""
         if self._t.cancel_event.is_set():
@@ -165,6 +178,15 @@ class Task:
     # total that ``record_llm_rate`` advances on every flush (reset on retry). Backs the
     # 10-second window diff below; not sent to the client on its own.
     llm_gen_total: int = 0
+    # Cumulative 已合成段数 / 字数 against the run's full segment table (音频合成: the
+    # 合成页 button-below 已合成/总段数 · 已合成/总字数 card). Advanced by the tts_batch
+    # engine on every completed segment (``set_segment_stats``) and replayed in the
+    # snapshot / terminal events, so the card survives a page reload and stays correct
+    # after the task settles. 0 for tasks that don't report segments.
+    seg_done: int = 0
+    seg_total: int = 0
+    seg_chars_done: int = 0
+    seg_chars_total: int = 0
     # (monotonic_ts, cumulative_gen_chars) samples retained within the last ``RATE_WINDOW``
     # seconds — the 吞吐量 window's source. Oldest-first; samples older than the window are
     # evicted on each update, so the diff (last - first) / (t_last - t_first) is the true
@@ -277,6 +299,26 @@ class Task:
         self.llm_secs = max(0.0, float(secs))
         self._emit({"type": "llm_chars", "chars": self.llm_chars, "secs": self.llm_secs})
 
+    def set_segment_stats(self, done: int, total: int, chars_done: int, chars_total: int) -> None:
+        """Set the 音频合成 cumulative 段数 / 字数 progress and forward over SSE.
+
+        Every event carries the FULL cumulative state (``done``/``total``,
+        ``chars_done``/``chars_total``), so the client just overwrites — and a dropped
+        event (display-only, see ``TaskManager._DISPLAY_ONLY``) self-heals on the next
+        event or the snapshot / terminal replay.
+        """
+        self.seg_done = max(0, int(done))
+        self.seg_total = max(0, int(total))
+        self.seg_chars_done = max(0, int(chars_done))
+        self.seg_chars_total = max(0, int(chars_total))
+        self._emit({
+            "type": "segments",
+            "done": self.seg_done,
+            "total": self.seg_total,
+            "chars_done": self.seg_chars_done,
+            "chars_total": self.seg_chars_total,
+        })
+
     def _set_status(self, status: TaskStatus) -> None:
         self.status = status
         if status in TERMINAL:
@@ -314,6 +356,10 @@ class Task:
             "llm_cps_10s": self.llm_cps_10s,
             "llm_chars": self.llm_chars,
             "llm_secs": self.llm_secs,
+            "seg_done": self.seg_done,
+            "seg_total": self.seg_total,
+            "seg_chars_done": self.seg_chars_done,
+            "seg_chars_total": self.seg_chars_total,
             "result": self.result,
             "error": self.error,
             "created": self.created,
@@ -334,10 +380,12 @@ class Task:
 class TaskManager:
     # Event types that are display-only and self-healing: a dropped slice is
     # repaired by the next ``snapshot`` / ``snapshot_all`` / ``final`` (which
-    # replays the authoritative, backend-capped LLM stream). ``log`` / ``progress``
-    # / ``status`` / ``final`` are NOT in this set — they must survive queue
+    # replays the authoritative, backend-capped LLM stream) or the next event of
+    # the same kind (``segments`` carries the full cumulative counters, so any
+    # single drop is made up by the following push). ``log`` / ``progress`` /
+    # ``status`` / ``final`` are NOT in this set — they must survive queue
     # pressure (see ``_bus_put_one``).
-    _DISPLAY_ONLY = ("llm_chunk", "llm_rate")
+    _DISPLAY_ONLY = ("llm_chunk", "llm_rate", "segments")
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
@@ -526,6 +574,10 @@ class TaskManager:
                 task.llm_gen_hist.clear()
                 task.llm_chars = 0
                 task.llm_secs = 0.0
+                task.seg_done = 0
+                task.seg_total = 0
+                task.seg_chars_done = 0
+                task.seg_chars_total = 0
                 task.result = {}
                 task.started = time.time()
                 task.finished = 0.0

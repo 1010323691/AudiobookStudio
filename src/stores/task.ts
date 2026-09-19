@@ -96,6 +96,17 @@ export const useTaskStore = defineStore('task', () => {
         t.llm_chars = typeof e.chars === 'number' ? e.chars : 0
         t.llm_secs = typeof e.secs === 'number' ? e.secs : 0
         break
+      case 'segments':
+        // 音频合成 进度指标 (已合成/总段数 · 已合成/总字数, the button-below card): the
+        // backend re-sends the FULL cumulative counters on each (throttled) event, so a
+        // plain overwrite always converges — the card updates per finished sub-batch with
+        // no timer. Snapshots / terminal events replay the same counters, so this
+        // self-corrects after a reconnect too.
+        t.seg_done = typeof e.done === 'number' ? e.done : 0
+        t.seg_total = typeof e.total === 'number' ? e.total : 0
+        t.seg_chars_done = typeof e.chars_done === 'number' ? e.chars_done : 0
+        t.seg_chars_total = typeof e.chars_total === 'number' ? e.chars_total : 0
+        break
       case 'status':
         // A terminal status arrives with the full snapshot (result / error); apply it
         // atomically so the completion handler never reads a stale, empty result.

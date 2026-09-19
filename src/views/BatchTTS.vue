@@ -21,6 +21,7 @@ import Input from '@/components/ui/Input.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
+import { formatNumber } from '@/utils/format'
 import {
   Layers,
   Loader2,
@@ -701,6 +702,30 @@ watch(
                 @update:modelValue="seedInput = String($event)"
               />
             </label>
+          </div>
+
+          <!-- 进度指标（按钮下方）：已合成/总段数 · 已合成/总字数 —— 纯 SSE 驱动（后端每段
+               完成经 「segments」 事件推送全量累计值、按 1 秒节流，每批段结束后即时刷新），
+               无定时器。任务结束（taskId 清空）后隐藏，由结果卡接管。 -->
+          <div v-if="task && (task.seg_total ?? 0) > 0" class="flex flex-wrap gap-3">
+            <div class="min-w-[10rem] flex-1 rounded-md border bg-muted/30 px-3 py-2">
+              <div
+                class="text-xs text-muted-foreground"
+                title="累计：运行前已完成的段 + 本次运行完成的段 / 全部可合成段"
+              >已合成 / 总段数</div>
+              <div class="mt-0.5 text-lg font-semibold tabular-nums">
+                {{ formatNumber(task.seg_done) }} / {{ formatNumber(task.seg_total) }}
+              </div>
+            </div>
+            <div class="min-w-[12rem] flex-1 rounded-md border bg-muted/30 px-3 py-2">
+              <div
+                class="text-xs text-muted-foreground"
+                title="累计已合成段的字数 / 全部字数（字数 = 去除空白后的 Unicode 码点数）"
+              >已合成 / 总字数</div>
+              <div class="mt-0.5 text-lg font-semibold tabular-nums">
+                {{ formatNumber(task.seg_chars_done) }} / {{ formatNumber(task.seg_chars_total) }}
+              </div>
+            </div>
           </div>
 
           <LiveLogPanel :task="task" :max-height-class="'h-96'">
