@@ -124,6 +124,10 @@ class UIConfig(BaseModel):
     # 解析页「解析进度」日志区（每文件实时日志 + 流式反馈）是否显示；默认关。
     # 关时三性能指标移到「开始处理」按钮下方（每文件行内的进度/速度/状态不受影响）。
     show_parse_logs: bool = False
+    # 侧边栏是否显示「音频分集」导航项；默认关（隐藏）。
+    # 关 = 导航栏隐藏该项（音频合并页的「前往音频分集」按钮随之隐藏），
+    # 页面路由保留——直接访问 URL 仍可打开；开 = 导航栏显示该项。
+    show_audio_split: bool = False
 
 
 class LLMConfig(BaseModel):

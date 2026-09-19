@@ -90,3 +90,20 @@ def set_concurrency(n: int) -> None:
 def gate() -> ConcurrencyGate:
     """The process-wide gate."""
     return _gate
+
+
+# A second, independent gate for the audio-merge engine (batch merge). Kept fully
+# separate from the parse LLM gate: merges are CPU/ffmpeg/disk bound (no LLM, no GPU),
+# so they must not share the LLM slot budget — a big parse batch and a batch merge can
+# safely run side by side. Sized from the logical CPU count (see merge.concurrency_limit).
+_merge_gate = ConcurrencyGate()
+
+
+def set_merge_concurrency(n: int) -> None:
+    """Size the process-wide merge gate (call at the start of a merge batch)."""
+    _merge_gate.set_limit(n)
+
+
+def merge_gate() -> ConcurrencyGate:
+    """The process-wide merge gate."""
+    return _merge_gate

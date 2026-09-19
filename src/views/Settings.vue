@@ -159,6 +159,17 @@ async function save() {
               每文件行内的进度条 / 速度 / 状态始终显示，不受此开关影响。
             </p>
           </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">音频分集导航项</Label>
+              <Switch v-model="draft.ui.show_audio_split" />
+            </div>
+            <p class="text-xs text-muted-foreground">
+              开启 = 侧边栏显示「音频分集」导航项；
+              关闭（默认）= 隐藏该导航项（音频合并页的「前往音频分集」按钮随之隐藏），
+              页面本身仍保留、可直接访问。
+            </p>
+          </div>
         </CardContent>
       </Card>
 

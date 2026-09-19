@@ -409,6 +409,19 @@ export interface MergeResult {
   segments: number
   size: number
 }
+/** One row of the merge page's package list (GET /api/tts/merge-status): the package's
+ *  synthesis completion. `total` = the source parsed JSON's synthesizable segment count
+ *  (a manifest-length total would mark a mid-cancelled package "ready"). */
+export interface MergePackageStatus {
+  name: string
+  total: number
+  completed: number
+  remaining: number
+  complete: boolean
+}
+export interface MergeStatusPackages {
+  packages: MergePackageStatus[]
+}
 
 // ------------------------------ script (LLM -> JSON) ------------------------------
 export interface ScriptEntry {
@@ -550,7 +563,12 @@ export interface AppConfig {
     /** 解析内重判上下文窗口（角色匹配检查 / 断句失败校验 / 归属抽样共用）；不在设置页露出。 */
     check_context_window: number
   }
-  ui: { theme: string; show_parse_logs: boolean }
+  ui: {
+    theme: string
+    show_parse_logs: boolean
+    /** 侧边栏是否显示「音频分集」导航项（默认关 = 隐藏）。 */
+    show_audio_split: boolean
+  }
 }
 
 /** A recursively-partial ``AppConfig`` — mirrors the backend's deep-merge ``update_config``

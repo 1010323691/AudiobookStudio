@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   LayoutDashboard,
@@ -12,12 +13,14 @@ import {
   Headphones,
 } from 'lucide-vue-next'
 import { useAppStore } from '@/stores/app'
+import { useSettingsStore } from '@/stores/settings'
 import { cn } from '@/lib/utils'
 
 const route = useRoute()
 const app = useAppStore()
+const settings = useSettingsStore()
 
-const items = [
+const ALL_ITEMS = [
   { to: '/dashboard', label: '开始', icon: LayoutDashboard },
   { to: '/text', label: '排版与分册', icon: Type },
   { to: '/script', label: '文本解析', icon: ScanText },
@@ -27,6 +30,13 @@ const items = [
   { to: '/audio', label: '音频分集', icon: AudioLines },
   { to: '/settings', label: '设置', icon: Settings },
 ]
+
+// 「音频分集」导航项受设置 ui.show_audio_split 控制（默认关 = 隐藏）。
+const items = computed(() =>
+  settings.config?.ui.show_audio_split
+    ? ALL_ITEMS
+    : ALL_ITEMS.filter((it) => it.to !== '/audio'),
+)
 
 function isActive(to: string) {
   return route.path === to || (to !== '/dashboard' && route.path.startsWith(to))

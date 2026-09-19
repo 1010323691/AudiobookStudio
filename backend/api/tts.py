@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -22,8 +25,9 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, field_validator
 
 from ..core import pathio
+from ..core.concurrency import merge_gate, set_merge_concurrency
 from ..core.paths import ALL_PARSED_JSON, get_layout, resolve_parsed_json, resolve_parsed_json_all
-from ..core.tasks import TERMINAL, get_task_manager
+from ..core.tasks import TERMINAL, TaskStatus, get_task_manager
 from ..engines import merge as Merge
 from ..engines import tts as T
 from ..engines import tts_batch as Batch
@@ -771,16 +775,179 @@ def batch_status(script: str | None = None,
     return Batch.count_completion(Batch._build_segments(data), Batch.load_manifest(out_dir))
 
 
+# ---------------------------------------------------------------------------
+# 批量合并（batch merge）：PENDING 壳 + 协调者（无注册表 / 无 stop 标志 —— merge 无
+# cancel-batch 端点，取消 = 前端逐任务 control；壳被 cancel 就地终结后自然掉出投放搜索）
+# ---------------------------------------------------------------------------
+
+# Same prefetch invariant as the parse batch: tasks waiting for a merge slot stay ≤ 4.
+MERGE_PREFETCH_DEPTH = 4
+
+
+def _inflight_merge_packages() -> set[str]:
+    """Package names (the label tail ``：{package}``) of non-terminal merge tasks.
+
+    The same-package in-flight guard: two merge tasks on one package would write the same
+    ``06_audio_merge/<包>.mp3``. Non-conflicting packages may still join a running batch —
+    their tasks simply queue behind the gate. (The label format is the load-bearing
+    contract shared with the frontend's F5 reattach — change all sides together.)
+    """
+    out = set()
+    for t in get_task_manager().list():
+        if t.module == "merge" and t.status not in TERMINAL:
+            m = re.search(r"：(.+)$", t.label)
+            if m:
+                out.add(m.group(1))
+    return out
+
+
+def _run_merge_coordinator(ordered: list[str]) -> None:
+    """Dispatch a merge batch's PENDING shells in order, keeping the prefetch bounded.
+
+    Invariant maintained each round: the number of batch tasks *waiting for a merge slot*
+    (started but not yet slot-holding) is < MERGE_PREFETCH_DEPTH. Slot holders are read
+    from the process-wide ``merge_gate().active`` (only merge workers hold merge slots),
+    so the gate is the hard cap and this thread only paces the start-ups.
+    """
+    mgr = get_task_manager()
+    while True:
+        tasks = [mgr.get(tid) for tid in ordered]
+        if all(t is None or t.status in TERMINAL for t in tasks):
+            return
+        no_slot = sum(
+            1 for t in tasks
+            if t is not None and t.status in (TaskStatus.RUNNING, TaskStatus.PAUSED)
+        )
+        waiting = max(0, no_slot - merge_gate().active)
+        while waiting < MERGE_PREFETCH_DEPTH:
+            next_tid = next(
+                (tid for tid, t in zip(ordered, tasks)
+                 if t is not None and t.status is TaskStatus.PENDING),
+                None,
+            )
+            if next_tid is None:
+                break
+            try:
+                mgr.start(next_tid)
+            except (ValueError, KeyError):
+                break  # raced with a cancel — it will no longer be PENDING
+            tasks = [mgr.get(tid) for tid in ordered]
+            no_slot = sum(
+                1 for t in tasks
+                if t is not None and t.status in (TaskStatus.RUNNING, TaskStatus.PAUSED)
+            )
+            waiting = max(0, no_slot - merge_gate().active)
+        time.sleep(0.2)
+
+
 class MergeRequest(BaseModel):
     m4b: bool = False  # M4B output is a later phase; MP3 is produced for now.
-    # Which package (a sub-folder in 05_audio_chunk/, one per source JSON) to merge;
-    # None -> the most recent package (see merge._find_manifest).
+    # Multi-select: package names (sub-folder names in 05_audio_chunk/, one per source
+    # JSON) to merge — one Task each, run in parallel under the process-wide merge gate.
+    packages: list[str] | None = None
+    # Legacy single-select field, kept ONLY to detect an old pre-built frontend: any
+    # non-null value is refused with an actionable error (the new UI always sends
+    # explicit package names; the "most recent package" fallback is gone).
     package: str | None = None
 
 
 @router.post("/merge")
 def run_merge(req: MergeRequest) -> dict:
+    """Start one merge Task per selected package.
+
+    All task shells are created up front (PENDING, in request order) so the response
+    carries every task_id; a coordinator thread then starts them in order with a bounded
+    prefetch, and each worker takes the process-wide merge gate (hard cap =
+    ``Merge.concurrency_limit()``) around its whole engine run. Guards: no workspace 409
+    → legacy ``package`` field 400 (old frontend) → empty selection 400 (no most-recent
+    fallback) → illegal package name 400 (traversal) → same-package in-flight 409.
+    Returns ``{"task_ids": [...], "packages": [{package, task_id}, ...]}``.
+    """
     _common.require_workspace()
-    label = ("合并 M4B" if req.m4b else "合并音频（Merge）") + (f"：{req.package}" if req.package else "")
-    task = get_task_manager().create("merge", label, Merge.run, req.m4b, req.package)
-    return {"task_id": task.id}
+    if req.package is not None:
+        raise HTTPException(400, "前端版本过旧（仍在发送单选 package 字段）——请重新构建前端（npm run build）后刷新页面。")
+    pkgs = list(dict.fromkeys(req.packages or []))  # dedupe, preserving order
+    if not pkgs:
+        raise HTTPException(400, "请选择要合并的音频包。")
+    for p in pkgs:
+        if not p or p != Path(p).name:
+            raise HTTPException(400, f"非法包名：{p}")
+    conflicts = [p for p in pkgs if p in _inflight_merge_packages()]
+    if conflicts:
+        raise HTTPException(409, "以下包已有合并任务在途：" + "、".join(conflicts))
+    set_merge_concurrency(Merge.concurrency_limit())
+    mgr = get_task_manager()
+    created = [
+        {
+            "package": p,
+            "task_id": mgr.create(
+                "merge",
+                ("合并 M4B" if req.m4b else "合并音频（Merge）") + f"：{p}",
+                Merge.run, req.m4b, p, start=False,
+            ).id,
+        }
+        for p in pkgs
+    ]
+    threading.Thread(
+        target=_run_merge_coordinator, args=([c["task_id"] for c in created],), daemon=True,
+    ).start()
+    return {"task_ids": [c["task_id"] for c in created], "packages": created}
+
+
+def _package_merge_status(name: str, layout) -> dict:
+    """One row of the merge page's package list (``GET /merge-status?packages=…``).
+
+    ``total`` = the source parsed JSON's synthesizable segment count — the same rule as
+    ``/batch-status`` (a manifest-length total would mark a mid-cancelled package "ready"
+    and silently merge a half book). Only when the source JSON is missing / corrupt /
+    empty does the row degrade to the manifest length. ``completed`` = ok manifest entries
+    whose file is still on disk (``Batch.is_done``); ``complete`` = every segment done —
+    the 已就绪 badge.
+    """
+    out = {"name": name, "total": 0, "completed": 0, "remaining": 0, "complete": False}
+    manifest = Batch.load_manifest(layout.audio_chunk / name)
+    src = layout.parsed_json / f"{name}.json"
+    if src.exists():
+        try:
+            data = json.loads(src.read_text("utf-8"))
+        except Exception:  # noqa: BLE001 — a corrupt source just degrades to the manifest
+            data = None
+        if isinstance(data, list) and data:
+            c = Batch.count_completion(Batch._build_segments(data), manifest)
+            out["total"] = c["total"]
+            out["completed"] = c["completed"]
+            out["remaining"] = c["remaining"]
+            out["complete"] = c["total"] > 0 and c["completed"] == c["total"]
+            return out
+    out["total"] = len(manifest)  # degrade: source JSON missing / corrupt / empty
+    out["completed"] = sum(1 for e in manifest.values() if Batch.is_done(e))
+    out["remaining"] = out["total"] - out["completed"]
+    out["complete"] = out["total"] > 0 and out["completed"] == out["total"]
+    return out
+
+
+# ``packages`` MUST be declared as a QUERY param: in this FastAPI version a bare
+# ``list[...]`` default is treated as a JSON request body and the repeated ``?packages=``
+# params are silently ignored (same trap as ``/batch-status``). ``Annotated`` keeps the
+# plain ``None`` default, so direct (test) calls still work without going through FastAPI.
+@router.get("/merge-status")
+def merge_status(packages: Annotated[list[str] | None, Query()] = None) -> dict:
+    """Merge readiness of the chosen audio package(s) — the merge page's package rows.
+
+    Each row is ``{name, total, completed, remaining, complete}``: ``total`` is the
+    source parsed JSON's synthesizable segment count (see ``_package_merge_status``), so a
+    package whose synthesis was cancelled mid-way is NOT reported 已就绪. Degrades to zero
+    rows with no workspace (read-only, like ``/batch-status``); illegal (traversal) names
+    are 400. Rows come back in request order.
+    """
+    names = list(dict.fromkeys(packages or []))  # dedupe, preserving order
+    for p in names:
+        if not p or p != Path(p).name:
+            raise HTTPException(400, f"非法包名：{p}")
+    layout = get_layout()
+    if layout.audio_chunk is None:  # no workspace: nothing to read (read-only, degrades)
+        return {"packages": [
+            {"name": p, "total": 0, "completed": 0, "remaining": 0, "complete": False}
+            for p in names
+        ]}
+    return {"packages": [_package_merge_status(p, layout) for p in names]}

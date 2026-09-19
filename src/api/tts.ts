@@ -6,6 +6,7 @@ import type {
   MakeClonesOptions,
   BatchRunOptions,
   BatchStatusFiles,
+  MergeStatusPackages,
   MergeSpeakersResult,
   StressTestOptions,
 } from '@/types'
@@ -129,8 +130,24 @@ export function runStressTest(opts: StressTestOptions): Promise<{ task_id: strin
   })
 }
 
-/** 音频合并：start a merge Task for one package (MP3 now; M4B is a later phase).
- *  ``pkg`` names the sub-folder in 05_audio_chunk/ to merge; omitted → most recent. */
-export function runMerge(m4b = false, pkg?: string): Promise<{ task_id: string }> {
-  return http.post<{ task_id: string }>('/api/tts/merge', { m4b, package: pkg ?? null })
+/** 音频合并：start one merge Task per selected package (MP3 now; M4B is a later phase).
+ *  ``packages`` are sub-folder names in 05_audio_chunk/; the backend runs them in
+ *  parallel under a CPU-sized merge gate (one Task each, dispatched in order). */
+export function runMerge(m4b = false, packages: string[] = []): Promise<{
+  task_ids: string[]
+  packages: { package: string; task_id: string }[]
+}> {
+  return http.post<{ task_ids: string[]; packages: { package: string; task_id: string }[] }>(
+    '/api/tts/merge', { m4b, packages },
+  )
+}
+
+/** 音频合并进度（每包）：each package's 【已合成 / 总段数】→ 已就绪 readiness. ``total``
+ *  comes from the source parsed JSON (never the manifest length — see the backend), so a
+ *  mid-cancelled synthesis is not reported ready. FastAPI's ``list[str]`` query param =
+ *  one repeated ``packages=`` per package. */
+export function mergeStatusPackages(packages: string[]): Promise<MergeStatusPackages> {
+  const q = new URLSearchParams()
+  for (const p of packages) q.append('packages', p)
+  return http.get<MergeStatusPackages>(`/api/tts/merge-status?${q.toString()}`)
 }

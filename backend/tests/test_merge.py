@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import pytest
 
 from backend.core import config as core_config
 from backend.core import paths as core_paths
+from backend.core.concurrency import ConcurrencyGate
 import backend.engines.merge as merge
 
 
@@ -26,6 +29,7 @@ class _Handle:
     def __init__(self):
         self.logs = []
         self.progresses = []
+        self.cancelled = False  # stop_check lambda (queue-cancel) reads this
 
     def log(self, msg, level="INFO"):
         self.logs.append((level, msg))
@@ -35,6 +39,15 @@ class _Handle:
 
     def check(self):
         pass
+
+
+@pytest.fixture(autouse=True)
+def fresh_gate(monkeypatch):
+    """A fresh merge gate per test (injected in place of the process-wide singleton) so
+    one test's held / leaked slot can never bleed into another test's ``run()``."""
+    gate = ConcurrencyGate()
+    monkeypatch.setattr(merge, "merge_gate", lambda: gate)
+    yield gate
 
 
 @pytest.fixture
@@ -239,3 +252,109 @@ def test_run_plain_lines_go_to_log(workspace, monkeypatch):
     handle = _Handle()
     merge.run(handle, False, "pkg")
     assert "一条普通日志行" in _log_msgs(handle)
+
+
+# --------------------------------------------------------------------------- #
+# run() — the process-wide merge gate (batch-merge concurrency scope)
+# --------------------------------------------------------------------------- #
+
+def test_run_gate_acquired_after_fast_fail(workspace, monkeypatch, fresh_gate):
+    """A fast-fail validation must not block on — or take — a merge slot: with the only
+    slot held elsewhere, a missing manifest still fails immediately and leaves the
+    gate untouched (the acquire sits after every fast-fail, before any file is written)."""
+    fresh_gate.acquire()  # an outside holder takes the only slot
+    try:
+        captured = {}
+        _stub_engine(monkeypatch, captured)
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="未找到合成结果清单"):
+            merge.run(_Handle(), False, "nope")
+        assert time.monotonic() - t0 < 1.0  # did not sit down waiting for the slot
+        assert fresh_gate.active == 1  # unchanged — never acquired
+    finally:
+        fresh_gate.release()
+
+
+def test_run_spawns_only_after_slot(workspace, monkeypatch, fresh_gate):
+    """With the only slot held, a valid merge waits at the gate: nothing is spawned
+    (no engine, no staging file) until the slot frees — then it runs to completion and
+    releases the slot again (balanced)."""
+    _seed_manifest(workspace, 30)
+    fresh_gate.acquire()  # an outside holder takes the only slot
+    captured = {}
+    _stub_engine(monkeypatch, captured)
+    handle = _Handle()
+    t = threading.Thread(target=merge.run, args=(handle, False, "pkg"), daemon=True)
+    t.start()
+    time.sleep(0.5)  # plenty of cooperative-poll cycles for the run to reach the gate
+    assert "cmd" not in captured  # nothing spawned while the slot is held
+    fresh_gate.release()  # frees the slot -> the queued run acquires it and spawns
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert "cmd" in captured  # spawned only after the slot freed
+    assert (workspace / "06_audio_merge" / "pkg.mp3").exists()
+    assert fresh_gate.active == 0  # the run released its slot on the way out
+
+
+def test_run_release_balanced(workspace, monkeypatch, fresh_gate):
+    """Every exit path releases the slot it took exactly once (no leak, no underflow)."""
+    _seed_manifest(workspace, 10)
+    _stub_engine(monkeypatch, {})
+    merge.run(_Handle(), False, "pkg")
+    assert fresh_gate.active == 0  # success path balances
+    _stub_engine(monkeypatch, {}, behaviour="fail")
+    with pytest.raises(RuntimeError):
+        merge.run(_Handle(), False, "pkg")
+    assert fresh_gate.active == 0  # engine-failure path balances too
+
+
+def test_run_cancel_while_queued_zero_output(workspace, monkeypatch, fresh_gate):
+    """Cancel while waiting for the slot: aborts within one poll cycle (<= ~1s) WITHOUT
+    taking the slot, without spawning the engine, and with zero file residue."""
+    _seed_manifest(workspace, 30)
+    fresh_gate.acquire()  # an outside holder keeps the only slot
+    try:
+        captured = {}
+        _stub_engine(monkeypatch, captured)
+        handle = _Handle()
+
+        def worker():
+            try:
+                merge.run(handle, False, "pkg")
+            except Exception as e:  # noqa: BLE001 — a daemon thread swallows it; record
+                handle.error = e
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        handle.cancelled = True
+        t.join(timeout=2)
+        assert not t.is_alive()
+        assert isinstance(getattr(handle, "error", None), merge.TaskCancelled)
+        assert "cmd" not in captured  # never spawned
+        assert fresh_gate.active == 1  # the outside holder's slot was never touched
+        assert list((workspace / "00_temp").glob("merge_segments_*")) == []
+        assert list((workspace / "00_temp").glob("merge_tmp_*")) == []
+        out = workspace / "06_audio_merge"
+        assert not out.exists() or list(out.iterdir()) == []
+    finally:
+        fresh_gate.release()
+
+
+def test_run_success_leaves_no_wav_in_output(workspace, monkeypatch, fresh_gate):
+    """Requirement pin: the merge result is MP3 directly — the two-stage whole-book WAV
+    lives only in the 00_temp staging dir and dies with it; no big WAV lingers in
+    06_audio_merge on the success path (the encode-failure WAV is the only kept one)."""
+    _seed_manifest(workspace, 120)
+    _stub_engine(monkeypatch, {})  # behaviour="ok" -> MP3 written at --out
+    result = merge.run(_Handle(), False, "pkg")
+    assert result["file"].endswith(".mp3")
+    assert list((workspace / "06_audio_merge").glob("*.wav")) == []
+    assert list((workspace / "00_temp").glob("merge_tmp_*")) == []
+
+
+def test_concurrency_limit_formula(monkeypatch):
+    """Parallelism = logical CPU count / 2, clamped to [1, 4] (constant policy)."""
+    for cores, expected in ((2, 1), (3, 1), (4, 2), (8, 4), (16, 4), (64, 4), (None, 2)):
+        monkeypatch.setattr(merge.os, "cpu_count", lambda c=cores: c)
+        assert merge.concurrency_limit() == expected

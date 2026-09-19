@@ -25,13 +25,27 @@ from pathlib import Path
 
 from ..core import pathio
 from ..core.config import get_config
+from ..core.concurrency import merge_gate
 from ..core.paths import get_layout
+from ..core.tasks import TaskCancelled
 from .tts import resolve_engine, run_worker
 
 IMPLEMENTED = True
 
 # Segments per part WAV in the two-stage merge (passed as the worker's --merge-batch-size).
 MERGE_BATCH_SIZE = 100
+
+
+def concurrency_limit() -> int:
+    """Parallelism of the batch merge = logical CPU count / 2, clamped to [1, 4].
+
+    One merge ≈ pydub (1 core) + ffmpeg libmp3lame (1–2 cores) + disk I/O, and the
+    stage-2 whole-book WAV lives fully in RAM — so the cap leaves CPU / disk / memory
+    headroom instead of saturating the box (8 cores → 4, 16 → 4, 4 → 2, 2 → 1).
+    Deliberately a constant policy, not a config item (auto-evaluation, per the
+    batch-merge requirement).
+    """
+    return max(1, min(4, (os.cpu_count() or 4) // 2))
 
 # Windows-illegal filename characters (a package name becomes an output file name).
 _BAD_FILENAME_CHARS = set('\\/:*?"<>|')
@@ -150,33 +164,18 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
     if m > 1:
         handle.log(f"两阶段合并：{len(segs)} 段 → {m} 批（每批 {MERGE_BATCH_SIZE} 段）→ 整书")
 
-    seg_file = layout.temp / f"merge_segments_{uuid.uuid4().hex[:12]}.json"
-    seg_file.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
-    tmp_dir = layout.temp / f"merge_tmp_{uuid.uuid4().hex[:12]}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    out_path = layout.audio_merge / _output_name(manifest_path, layout)
-
-    python, worker = resolve_engine()
-    cmd = [
-        str(python), str(worker),
-        "--mode", "merge",
-        "--segments-file", str(seg_file),
-        "--out", str(out_path),
-        "--pause-ms", str(pause_ms),
-        "--same-same-ms", str(same_ms),
-        "--tmp-dir", str(tmp_dir),
-        "--merge-batch-size", str(MERGE_BATCH_SIZE),
-    ]
-    if ws:
-        # The workspace root, so a (transient) relative segment path resolves correctly
-        # inside the worker too (its own cwd is the project root, not the workspace).
-        cmd += ["--workspace", str(ws)]
-    if cfg.ffmpeg.ffmpeg_path:
-        cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
-
-    handle.progress(0.05, "启动引擎")
+    # Concurrency gate (process-wide hard cap, sized by concurrency_limit): acquired only
+    # AFTER every fast-fail validation (missing/corrupt/empty manifest, no ok segments)
+    # and BEFORE any staging file is written — a cancel while queued (cooperative
+    # stop_check polling) aborts with zero file residue. Release is balanced in the
+    # finally below (no throwable statement sits between the acquire and the try).
+    handle.progress(0.02, "排队中（等待合并槽位）")
+    acquired = merge_gate().acquire(stop_check=lambda: handle.cancelled)
+    if not acquired:
+        raise TaskCancelled()
 
     result_path = ""
+    tmp_dir: Path | None = None
 
     def on_line(line: str) -> None:
         nonlocal result_path
@@ -186,11 +185,40 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
             handle.log(line)
 
     try:
+        seg_file = layout.temp / f"merge_segments_{uuid.uuid4().hex[:12]}.json"
+        seg_file.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
+        tmp_dir = layout.temp / f"merge_tmp_{uuid.uuid4().hex[:12]}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = layout.audio_merge / _output_name(manifest_path, layout)
+
+        python, worker = resolve_engine()
+        cmd = [
+            str(python), str(worker),
+            "--mode", "merge",
+            "--segments-file", str(seg_file),
+            "--out", str(out_path),
+            "--pause-ms", str(pause_ms),
+            "--same-same-ms", str(same_ms),
+            "--tmp-dir", str(tmp_dir),
+            "--merge-batch-size", str(MERGE_BATCH_SIZE),
+        ]
+        if ws:
+            # The workspace root, so a (transient) relative segment path resolves
+            # correctly inside the worker too (its own cwd is the project root, not
+            # the workspace).
+            cmd += ["--workspace", str(ws)]
+        if cfg.ffmpeg.ffmpeg_path:
+            cmd += ["--ffmpeg", cfg.ffmpeg.ffmpeg_path]
+
+        handle.progress(0.05, "启动引擎")
+
         run_worker(cmd, handle, on_line, temp_files=(seg_file,), fail_prefix="Merge 引擎")
     finally:
+        if acquired:
+            merge_gate().release()
         # On an MP3-encode failure the worker keeps the whole-book WAV inside the
         # staging dir and reports it via [result] — relocate it before the dir goes.
-        if result_path:
+        if result_path and tmp_dir is not None:
             kept = Path(result_path)
             if kept.is_file() and str(kept).startswith(str(tmp_dir) + os.sep):
                 target = layout.audio_merge / kept.name
@@ -198,7 +226,8 @@ def run(handle, m4b: bool = False, package: str | None = None) -> dict:
                 result_path = str(target)
         # The backend owns the staging dir's cleanup on every exit path
         # (success / failure / cancel-kill of the child).
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     produced = Path(result_path or out_path)
     if not produced.exists():

@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSettingsStore } from '@/stores/settings'
 import { useProjectStore } from '@/stores/project'
 import { useTaskStore } from '@/stores/task'
 import { useToast } from '@/components/ui/toast'
-import { runMerge, ttsStatus } from '@/api/tts'
+import { mergeStatusPackages, runMerge, ttsStatus } from '@/api/tts'
+import { listDir } from '@/api/files'
 import { downloadFile, downloadUrl } from '@/utils/fileops'
-import type { DirListResult, MergeResult, TTSStatus } from '@/types'
+import type { MergePackageStatus, MergeResult, TaskSnapshot, TTSStatus } from '@/types'
 
 import Button from '@/components/ui/Button.vue'
 import Card from '@/components/ui/Card.vue'
@@ -18,19 +19,21 @@ import CardContent from '@/components/ui/CardContent.vue'
 import CardFooter from '@/components/ui/CardFooter.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Alert from '@/components/ui/Alert.vue'
+import Progress from '@/components/ui/Progress.vue'
 import LiveLogPanel from '@/components/ui/LiveLogPanel.vue'
-import DirPicker from '@/components/DirPicker.vue'
+import MiniAudioPlayer from '@/components/ui/MiniAudioPlayer.vue'
 import WorkspaceGateAlert from '@/components/ui/WorkspaceGateAlert.vue'
 import { useWorkspaceGate } from '@/composables/useWorkspaceGate'
 import {
   Combine,
-  Loader2,
-  XCircle,
-  CheckCircle2,
   Download,
+  Eraser,
+  Loader2,
+  ListChecks,
+  RefreshCw,
+  XCircle,
   ArrowRight,
   ArrowLeft,
-  RefreshCw,
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -42,81 +45,281 @@ const { push: toast } = useToast()
 
 const status = ref<TTSStatus | null>(null)
 
-// Pre-run check: is there a batch manifest to merge?
-const manifestChecked = ref(false)
-const manifestReady = ref(false)
-const manifestCount = ref(0)
+// 行数据（磁盘口径，onMounted / onActivated / 手动刷新时拉取）：
+// 包名列表 + 每包的合成进度 + 06_audio_merge/ 下的 MP3 存在性。
+const pkgNames = ref<string[]>([])
+const pkgStats = ref<Record<string, MergePackageStatus>>({})
+const diskMp3 = ref<Record<string, string>>({}) // 包名 -> 06 下的产物文件名（.mp3）
+// 「已合并」标记（内存口径，由 SSE 任务终态驱动）：包名 -> 产物文件名。
+const mergedNames = ref<Record<string, string>>({})
 
-// Which audio package (a sub-folder in 05_audio_chunk/, one per parsed JSON) to
-// merge; '' = the most recent package (backend fallback). ``packages`` lists the
-// available package folders (captured from the picker's scan).
-const pkg = ref('')
-const packages = ref<string[]>([])
-
-const busy = ref(false)
+const selected = reactive<Record<string, boolean>>({})
+const submitting = ref(false)
+const rowsLoading = ref(false)
+const rowsError = ref('')
 const error = ref('')
-const taskId = ref<string | null>(null)
-const result = ref<MergeResult | null>(null)
 
-const task = computed(() => taskStore.tasks.find((t) => t.id === taskId.value) ?? null)
-const playUrl = computed(() => (result.value ? downloadUrl('06_audio_merge', result.value.file) : ''))
+// ---------------------------------------------------------------------------
+// 行任务派生：store 中 merge 任务按 label 尾部「：{包名}」归位（F5 刷新后 store 的
+// refresh 已拉回全量任务 → 派生式重挂，无需本地 job 列表）。
+// 在途（非终态）取 seq 升序首个；失败取 seq 降序最新（重试走同一任务 id，
+// 故同一任务不会同时处于两种集合）。
+// ---------------------------------------------------------------------------
 
-// Human label for what will be merged (the selected package, or the most recent one).
-const manifestLabel = computed(() => {
-  if (!pkg.value) {
-    if (packages.value.length > 0) return `最近的包（共 ${packages.value.length} 个包可选）`
-    return manifestReady.value ? `已合成的 ${manifestCount.value} 段` : '合成结果'
+const TERMINAL = new Set(['cancelled', 'succeeded', 'failed'])
+
+function pkgOfLabel(label: string): string {
+  // 与后端 _inflight_merge_packages 的 re.search(r"：(.+)$") 同一口径：取第一个「：」。
+  const i = label.indexOf('：')
+  return i >= 0 ? label.slice(i + 1) : ''
+}
+
+const tasksByPkg = computed(() => {
+  const active = new Map<string, TaskSnapshot>()
+  const failed = new Map<string, TaskSnapshot>()
+  for (const t of taskStore.tasks) {
+    if (t.module !== 'merge') continue
+    const pkg = pkgOfLabel(t.label)
+    if (!pkg) continue
+    if (t.status === 'failed') {
+      const cur = failed.get(pkg)
+      if (!cur || t.seq > cur.seq) failed.set(pkg, t)
+    } else if (!TERMINAL.has(t.status)) {
+      const cur = active.get(pkg)
+      if (!cur || t.seq < cur.seq) active.set(pkg, t)
+    }
   }
-  return manifestReady.value ? `「${pkg.value}」包的 ${manifestCount.value} 段` : `「${pkg.value}」包`
+  return { active, failed }
 })
 
-async function readManifestCount(relName: string): Promise<{ ready: boolean; count: number }> {
-  try {
-    const res = await fetch(downloadUrl('05_audio_chunk', relName))
-    if (res.ok) {
-      const m: any = await res.json()
-      if (Array.isArray(m)) return { ready: m.length > 0, count: m.length }
+type RowVariant = 'default' | 'secondary' | 'success' | 'warning' | 'destructive' | 'outline'
+
+interface MergeRow {
+  pkg: string
+  task: TaskSnapshot | undefined
+  failedTask: TaskSnapshot | undefined
+  stat: MergePackageStatus | undefined
+  merged: string | undefined
+  label: string
+  variant: RowVariant
+  ready: boolean
+  mergedState: boolean
+}
+
+// 行状态优先级：合并中（有在途任务）> 已合并（内存标记或 06 下有 .mp3）> 已就绪
+// （total 全完成，total 取源解析 JSON 口径）> 已合成 C/T 段。WAV 兜底产物不算已合并。
+const rows = computed<MergeRow[]>(() => {
+  const { active, failed } = tasksByPkg.value
+  return pkgNames.value.map((pkg) => {
+    const task = active.get(pkg)
+    const stat = pkgStats.value[pkg]
+    const merged = task ? undefined : (mergedNames.value[pkg] ?? diskMp3.value[pkg])
+    let label: string
+    let variant: RowVariant
+    let ready = false
+    let mergedState = false
+    if (task) {
+      label = '合并中'
+      variant = 'secondary'
+    } else if (merged) {
+      label = '已合并'
+      variant = 'success'
+      mergedState = true
+    } else if (stat?.complete) {
+      label = '已就绪'
+      variant = 'default'
+      ready = true
+    } else if (stat && stat.total > 0) {
+      label = `已合成 ${stat.completed}/${stat.total} 段`
+      variant = 'secondary'
+    } else {
+      label = '未合成'
+      variant = 'secondary'
     }
-  } catch {
-    /* not ready */
+    return { pkg, task, failedTask: task ? undefined : failed.get(pkg), stat, merged, label, variant, ready, mergedState }
+  })
+})
+
+const selectedNames = computed(() => pkgNames.value.filter((p) => !!selected[p]))
+const readyPkgs = computed(() => rows.value.filter((r) => r.ready).map((r) => r.pkg))
+const mergedSelectedCount = computed(
+  () => rows.value.filter((r) => r.mergedState && selected[r.pkg]).length,
+)
+const mergeActive = computed(() => taskStore.activeTasks('merge'))
+
+const allReadySelected = computed(
+  () => readyPkgs.value.length > 0 && readyPkgs.value.every((p) => !!selected[p]),
+)
+const allSelected = computed(
+  () => pkgNames.value.length > 0 && pkgNames.value.every((p) => !!selected[p]),
+)
+
+// ---------------------------------------------------------------------------
+// 行刷新（磁盘口径）：listDir(05) -> listDir(06, .mp3) -> mergeStatusPackages。
+// 仅在「无在途任务」的包上用磁盘值更新内存合并标记（在途包的内存态不被磁盘旧态覆盖）。
+// ---------------------------------------------------------------------------
+
+async function refreshRows() {
+  rowsLoading.value = true
+  rowsError.value = ''
+  try {
+    const [chunks, mergedDir] = await Promise.all([listDir('05_audio_chunk'), listDir('06_audio_merge')])
+    const names = chunks.items.filter((i) => i.is_dir).map((i) => i.name)
+    pkgNames.value = names
+    const mp3s: Record<string, string> = {}
+    for (const i of mergedDir.items) {
+      if (!i.is_dir && i.name.endsWith('.mp3')) mp3s[i.name.replace(/\.mp3$/, '')] = i.name
+    }
+    diskMp3.value = mp3s
+    const { active } = tasksByPkg.value
+    for (const pkg of names) {
+      if (active.has(pkg)) continue // 在途包的内存标记保持（磁盘可能是上一轮的旧产物）
+      if (mp3s[pkg]) mergedNames.value[pkg] = mp3s[pkg]
+      else delete mergedNames.value[pkg]
+    }
+    if (names.length) {
+      const res = await mergeStatusPackages(names)
+      const stats: Record<string, MergePackageStatus> = {}
+      for (const p of res.packages) stats[p.name] = p
+      pkgStats.value = stats
+    } else {
+      pkgStats.value = {}
+    }
+    // 剔除已消失目录的选中项（绝不删用户数据——这里只是清 UI 勾选）。
+    for (const k of Object.keys(selected)) {
+      if (!names.includes(k)) delete selected[k]
+    }
+  } catch (e: any) {
+    rowsError.value = e?.message || '刷新失败'
+  } finally {
+    rowsLoading.value = false
   }
-  return { ready: false, count: 0 }
 }
 
-// Re-check readiness: the selected package's manifest, else the most recent
-// package, else the legacy top-level manifest (older projects).
-async function checkManifest() {
-  if (pkg.value) {
-    const r = await readManifestCount(`${pkg.value}/manifest.json`)
-    manifestReady.value = r.ready
-    manifestCount.value = r.count
-  } else if (packages.value.length > 0) {
-    manifestReady.value = true
-    manifestCount.value = 0
+// ---------------------------------------------------------------------------
+// 工具栏：全选 = 清空后只勾「已就绪」行；全量全选 = 无视状态全勾；清空 = 全部取消。
+// ---------------------------------------------------------------------------
+
+function clearSelection() {
+  for (const k of Object.keys(selected)) delete selected[k]
+}
+
+function onSelectChange(pkg: string, e: Event) {
+  if ((e.target as HTMLInputElement).checked) selected[pkg] = true
+  else delete selected[pkg]
+}
+
+function selectReady() {
+  const ready = readyPkgs.value
+  if (!ready.length) return
+  if (allReadySelected.value) {
+    for (const p of ready) delete selected[p]
   } else {
-    const r = await readManifestCount('manifest.json')
-    manifestReady.value = r.ready
-    manifestCount.value = r.count
+    clearSelection()
+    for (const p of ready) selected[p] = true
   }
-  manifestChecked.value = true
 }
 
-// The package list arrives from the DirPicker's scan; capture it, then re-check.
-function onScanned(r: DirListResult) {
-  packages.value = r.items.filter((i) => i.is_dir).map((i) => i.name)
-  checkManifest()
+function selectAllAll() {
+  const all = pkgNames.value
+  if (!all.length) return
+  clearSelection()
+  if (!allSelected.value) for (const p of all) selected[p] = true
 }
 
-// 刷新恢复：页面重载后本地 taskId 丢失，但后端合并任务仍在跑（store 的 refresh 已拉回全量
-// 任务）。按 module 重新挂接在途任务，并从 label 尾部「：{package}」还原所选包。
-function reattachTask() {
-  const t = taskStore.activeTasks('merge')[0]
-  if (!t || taskId.value) return
-  taskId.value = t.id
-  busy.value = true
-  const m = t.label.match(/：(.+)$/)
-  if (m) pkg.value = m[1]
+function clearAll() {
+  clearSelection()
 }
+
+// ---------------------------------------------------------------------------
+// 提交 / 取消 / 重试
+// ---------------------------------------------------------------------------
+
+async function doRun() {
+  if (submitting.value || !selectedNames.value.length) return
+  submitting.value = true
+  error.value = ''
+  try {
+    await runMerge(false, selectedNames.value)
+    await taskStore.refresh()
+    // 完成由下方的 SSE 驱动 watcher 处理（逐包终态 → 行状态流转）。
+  } catch (e: any) {
+    const msg = e?.message || '启动失败'
+    error.value = msg
+    if (msg.includes('在途')) {
+      toast({ title: '提交被拒绝', variant: 'destructive', description: msg })
+    }
+  } finally {
+    submitting.value = false
+  }
+}
+
+function cancelRow(task: TaskSnapshot) {
+  taskStore.control(task.id, 'cancel')
+}
+
+function retryRow(task: TaskSnapshot) {
+  taskStore.control(task.id, 'retry')
+}
+
+function cancelAll() {
+  // 无专用 cancel-batch 端点：逐任务 cancel（PENDING 壳就地终结 + RUNNING 协作取消，必然收敛）。
+  for (const t of mergeActive.value) taskStore.control(t.id, 'cancel')
+}
+
+function downloadRow(row: MergeRow) {
+  if (row.merged) downloadFile('06_audio_merge', row.merged)
+}
+
+// ---------------------------------------------------------------------------
+// SSE 驱动（getter 式 watch —— 日志数组每次追加都会触发 deep watch，绝不能用）：
+// 终态 merge 任务按 label 尾部归位到行。succeeded + .mp3 → 置「已合并」并记录交接；
+// succeeded + .wav（编码失败兜底）/ failed / cancelled → 清除标记（行回落，可重合并）。
+// processed 集合防重复（快照重放 / 断线重连）；任务转回非终态（重试）时释放标记。
+// ---------------------------------------------------------------------------
+
+const processed = new Set<string>()
+let watcherArmed = false
+
+watch(
+  () => taskStore.tasks.filter((t) => t.module === 'merge').map((t) => `${t.id}:${t.status}`).join('|'),
+  () => {
+    // 首次触发 = 页面加载/重连后的快照回放：把当下已终态的任务全部预标记为「已处理」
+    // （其磁盘产物由 refreshRows 的 06 目录扫描恢复），避免对陈旧结果重复弹 toast。
+    if (!watcherArmed) {
+      watcherArmed = true
+      for (const t of taskStore.tasks) {
+        if (t.module === 'merge' && TERMINAL.has(t.status)) processed.add(t.id)
+      }
+      return
+    }
+    for (const t of taskStore.tasks) {
+      if (t.module !== 'merge') continue
+      const pkg = pkgOfLabel(t.label)
+      if (!pkg) continue
+      if (!TERMINAL.has(t.status)) {
+        processed.delete(t.id) // 重试转回运行态 → 允许再次处理其终态
+        continue
+      }
+      if (processed.has(t.id)) continue
+      processed.add(t.id)
+      if (t.status === 'succeeded') {
+        const file = (t.result?.file as string) || ''
+        if (file.endsWith('.mp3')) {
+          mergedNames.value[pkg] = file
+          project.recordMerge(t.result as MergeResult)
+          toast({ title: '音频合并完成', variant: 'success', description: `已生成 ${file}` })
+        } else {
+          // 编码失败兜底：WAV 是唯一产物，行回落「已就绪」，重合并（-y 覆盖）自愈。
+          delete mergedNames.value[pkg]
+          toast({ title: '音频合并完成（MP3 编码失败，已保留 WAV）', variant: 'destructive', description: pkg })
+        }
+      } else {
+        delete mergedNames.value[pkg]
+      }
+    }
+  },
+)
 
 onMounted(async () => {
   if (!settings.loaded) await settings.load()
@@ -126,71 +329,29 @@ onMounted(async () => {
     status.value = { implemented: false, message: '后端未连接' }
   }
   await taskStore.refresh()
-  reattachTask()
+  await refreshRows()
 })
 
-watch(pkg, checkManifest)
-
-async function doRun(m4b = false) {
-  if (busy.value) return
-  busy.value = true
-  error.value = ''
-  result.value = null
-  try {
-    const { task_id } = await runMerge(m4b, pkg.value || undefined)
-    taskId.value = task_id
-    await taskStore.refresh()
-    // Completion is handled by the watcher on task.status.
-  } catch (e: any) {
-    error.value = e?.message || '启动失败'
-    busy.value = false
-  }
-}
-
-function cancel() {
-  if (task.value) taskStore.control(task.value.id, 'cancel')
-}
-
-watch(
-  () => task.value?.status,
-  (st) => {
-    const t = task.value
-    if (!st || !t) return
-    if (st === 'succeeded') {
-      result.value = t.result as MergeResult
-      taskId.value = null
-      busy.value = false
-      project.recordMerge(result.value)
-      toast({ title: '音频合并完成', variant: 'success', description: `已生成 ${result.value?.file || '有声书'}` })
-    } else if (st === 'failed') {
-      error.value = t.error || '音频合并失败'
-      taskId.value = null
-      busy.value = false
-      toast({ title: '音频合并失败', variant: 'destructive', description: error.value })
-    } else if (st === 'cancelled') {
-      taskId.value = null
-      busy.value = false
-    }
-  },
-)
-
-function download() {
-  if (result.value) downloadFile('06_audio_merge', result.value.path)
-}
+// keep-alive 缓存页：重新进入时刷新磁盘口径（零定时器 → 无需 onDeactivated 清理）。
+onActivated(() => {
+  if (settings.loaded) void refreshRows()
+})
 </script>
 
 <template>
   <div class="space-y-4">
     <div>
       <h1 class="flex items-center gap-3 text-2xl font-bold tracking-tight">
-        音频合并
+        <Combine class="h-6 w-6" />音频合并
         <Badge :variant="status?.implemented ? 'success' : 'secondary'">
           {{ status?.implemented ? '可用' : '引擎未就绪' }}
         </Badge>
       </h1>
       <p class="mt-1 text-muted-foreground">
-        选择一个「音频包」（音频合成按每个解析 JSON 生成的子文件夹），将其所有段按顺序合并为一整本有声书
-        （换人停顿 500ms / 同人 250ms），输出 <code class="text-xs">06_audio_merge/&lt;包名&gt;.mp3</code> 到工作空间。
+        勾选要合并的「音频包」（<code class="text-xs">05_audio_chunk/</code> 下每解析 JSON 一个子文件夹），
+        每个包一个独立任务并行合并（并发按逻辑处理器数自动评估，上限 4），按顺序合并为一整本有声书
+        （换人停顿 500ms / 同人 250ms），直接输出
+        <code class="text-xs">06_audio_merge/&lt;包名&gt;.mp3</code>（MP3 直出，不留大体积 WAV）。
       </p>
     </div>
 
@@ -202,67 +363,125 @@ function download() {
     </Alert>
 
     <template v-else>
-      <Alert v-if="manifestChecked && !manifestReady" variant="warning">
-        未找到合成结果——请先到「音频合成」生成各段音频（当前：{{ pkg ? `「${pkg}」包` : '最近的包' }}），再回来合并。
-      </Alert>
-
       <Card>
         <CardHeader>
-          <CardTitle class="flex items-center gap-2"><Combine class="h-5 w-5" />开始合并</CardTitle>
+          <CardTitle class="flex items-center gap-2"><Combine class="h-5 w-5" />批量合并</CardTitle>
           <CardDescription>
-            将 <span class="font-medium text-foreground">{{ manifestLabel }}</span>
-            按顺序合并为一整本；缺失的段会跳过并告警。
+            行状态：已合成 C/T 段（合成未完成）· 已就绪（全部段已合成，可合并）· 合并中（任务在途）· 已合并（MP3 已生成）。
+            【全选】只勾「已就绪」的包；【全量全选】无视状态勾选全部（含已合并 / 未就绪）；
+            有在途任务的包不可再勾选（重复提交同一包会被 409 拒绝）。
           </CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
-          <DirPicker
-            module="05_audio_chunk"
-            pick-dirs
-            v-model="pkg"
-            label="音频包（05_audio_chunk/）"
-            empty-hint="05_audio_chunk/ 下暂无音频包——请先到「音频合成」生成。"
-            @scanned="onScanned"
-          />
-          <div class="flex flex-wrap items-center gap-3">
-            <Button :disabled="busy || !workspaceSet" @click="doRun(false)">
-              <Loader2 v-if="busy" class="h-4 w-4 animate-spin" />
-              <Combine v-else class="h-4 w-4" />
-              {{ busy ? '合并中…' : '合并为 MP3' }}
+          <Alert v-if="rowsError" variant="destructive">
+            <template #icon><XCircle class="h-4 w-4 shrink-0" /></template>
+            {{ rowsError }}
+          </Alert>
+
+          <div
+            v-else-if="pkgNames.length"
+            class="max-h-96 space-y-1 overflow-y-auto rounded-md border p-2"
+          >
+            <!-- 行 = 进度行：复选 + 包名 + 状态 Badge + 按状态追加的控件
+                 （行内按钮不包在 <label> 里，避免点按钮连带切换勾选）。 -->
+            <div v-for="row in rows" :key="row.pkg" class="rounded px-2 py-1.5 hover:bg-accent/50">
+              <div class="flex items-center gap-3">
+                <label class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                  <input
+                    type="checkbox"
+                    class="h-4 w-4 shrink-0 accent-primary"
+                    :checked="!!selected[row.pkg]"
+                    :disabled="submitting || !!row.task"
+                    @change="onSelectChange(row.pkg, $event)"
+                  />
+                  <span class="min-w-0 truncate text-sm font-medium" :title="row.pkg">{{ row.pkg }}</span>
+                </label>
+                <Badge :variant="row.variant" class="shrink-0">{{ row.label }}</Badge>
+                <template v-if="row.task">
+                  <Progress
+                    :value="row.task.progress"
+                    class="h-1.5 w-24 shrink-0 sm:w-32"
+                  />
+                  <span class="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                    {{ Math.round(row.task.progress * 100) }}%
+                  </span>
+                  <Button variant="outline" size="sm" class="shrink-0" @click="cancelRow(row.task)">
+                    <XCircle class="h-3.5 w-3.5" />取消
+                  </Button>
+                </template>
+                <template v-else-if="row.merged">
+                  <Button variant="outline" size="sm" class="shrink-0" @click="downloadRow(row)">
+                    <Download class="h-3.5 w-3.5" />下载
+                  </Button>
+                  <MiniAudioPlayer :src="downloadUrl('06_audio_merge', row.merged)" />
+                </template>
+                <Button
+                  v-else-if="row.failedTask"
+                  variant="outline"
+                  size="sm"
+                  class="shrink-0"
+                  @click="retryRow(row.failedTask)"
+                >
+                  <RefreshCw class="h-3.5 w-3.5" />重试
+                </Button>
+              </div>
+              <p v-if="row.failedTask" class="mt-1 pl-7 text-xs text-destructive">
+                {{ row.failedTask.error || '合并失败' }}
+              </p>
+              <!-- 日志面板仅在运行/暂停时渲染（防 N 个排队壳渲染 N 个空面板）。 -->
+              <div v-if="row.task && (row.task.status === 'running' || row.task.status === 'paused')" class="mt-2">
+                <LiveLogPanel :task="row.task" :max-height-class="'h-40'" />
+              </div>
+            </div>
+          </div>
+          <p v-else class="text-sm text-muted-foreground">
+            05_audio_chunk/ 下暂无音频包——请先到「音频合成」生成。
+          </p>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" :disabled="submitting || !pkgNames.length" @click="selectReady">
+              <ListChecks class="h-3.5 w-3.5" />{{ allReadySelected ? '已选' : '全选' }}
             </Button>
-            <Button variant="outline" size="sm" @click="checkManifest">
-              <RefreshCw class="h-4 w-4" />刷新
+            <Button variant="outline" size="sm" :disabled="submitting || !pkgNames.length" @click="selectAllAll">
+              <ListChecks class="h-3.5 w-3.5" />{{ allSelected ? '已全选' : '全量全选' }}
             </Button>
+            <Button variant="outline" size="sm" :disabled="submitting || !pkgNames.length" @click="clearAll">
+              <Eraser class="h-3.5 w-3.5" />清空
+            </Button>
+            <Button variant="outline" size="sm" :disabled="submitting || rowsLoading" @click="refreshRows">
+              <RefreshCw class="h-3.5 w-3.5" :class="rowsLoading ? 'animate-spin' : ''" />刷新
+            </Button>
+            <span class="ml-auto text-xs text-muted-foreground">
+              已选 {{ selectedNames.length }} / {{ pkgNames.length }} 个
+              <span v-if="readyPkgs.length"> · 已就绪 {{ readyPkgs.length }} 个</span>
+              <span v-if="mergedSelectedCount"> · 含已合并 {{ mergedSelectedCount }}</span>
+            </span>
           </div>
 
-          <LiveLogPanel :task="task" :max-height-class="'h-80'">
-            <template #actions>
-              <Button v-if="task" variant="outline" size="sm" @click="cancel">
-                <XCircle class="h-3.5 w-3.5" />取消
-              </Button>
-            </template>
-          </LiveLogPanel>
-
-          <!-- 结果（播放 + 下载） -->
-          <div v-if="result" class="space-y-3">
-            <Alert variant="default" class="items-center">
-              <template #icon>
-                <CheckCircle2 class="h-4 w-4 shrink-0 text-emerald-500" />
-              </template>
-              <span class="flex-1 truncate">
-                合并完成：{{ result.file }}（{{ (result.size / 1024 / 1024).toFixed(1) }} MB，{{ result.segments }} 段）
-              </span>
-              <Button variant="outline" size="sm" @click="download">
-                <Download class="h-3.5 w-3.5" />下载
-              </Button>
-            </Alert>
-            <audio :src="playUrl" controls class="w-full" />
+          <div class="flex flex-wrap gap-2">
+            <Button
+              class="min-w-[10rem] flex-1"
+              :disabled="!workspaceSet || submitting || !selectedNames.length"
+              @click="doRun"
+            >
+              <Loader2 v-if="submitting" class="h-4 w-4 animate-spin" />
+              <Combine v-else class="h-4 w-4" />
+              {{ submitting ? '投放中…' : `合并为 MP3（${selectedNames.length} 个包）` }}
+            </Button>
+            <Button v-if="mergeActive.length" variant="destructive" @click="cancelAll">
+              <XCircle class="h-4 w-4" />取消全部
+            </Button>
           </div>
         </CardContent>
         <CardFooter class="justify-between">
           <Button variant="outline" size="sm" @click="router.push('/batch')">
             <ArrowLeft class="h-4 w-4" />返回音频合成
           </Button>
-          <Button v-if="result" size="sm" @click="router.push('/audio')">
+          <Button
+            v-if="project.mergeResult && settings.config?.ui.show_audio_split"
+            size="sm"
+            @click="router.push('/audio')"
+          >
             前往音频分集<ArrowRight class="h-4 w-4" />
           </Button>
         </CardFooter>
