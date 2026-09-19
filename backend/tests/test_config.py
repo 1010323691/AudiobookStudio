@@ -14,7 +14,14 @@ import pytest
 
 from backend.core import config as core_config
 from backend.core import paths as core_paths
-from backend.core.config import AppConfig, GenerationConfig, TTSConfig, UIConfig, _deep_update
+from backend.core.config import (
+    AppConfig,
+    BGMConfig,
+    GenerationConfig,
+    TTSConfig,
+    UIConfig,
+    _deep_update,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -322,3 +329,58 @@ def test_template_seeded_from_defaults_when_missing(sandbox):
     data = _read(sandbox / "app.json")
     assert data["paths"]["working_dir"] == str(sandbox / "X")
     assert "tts" in data and "book" not in data  # the full model was seeded (no book section)
+
+
+# --------------------------------------------------------------------------- #
+# BGMConfig defaults (背景音乐系统)
+# --------------------------------------------------------------------------- #
+
+def test_bgm_config_defaults():
+    b = BGMConfig()
+    assert b.volume == 0.18
+    assert b.fade_in == 1.5
+    assert b.fade_out == 3.0
+    assert b.loop is True
+    assert b.min_match_score == 1
+    assert b.analysis_chars == 6000
+
+
+def test_app_config_round_trips_bgm():
+    data = AppConfig().model_dump()
+    data["bgm"]["volume"] = 0.3
+    data["bgm"]["fade_in"] = 0.5
+    data["bgm"]["fade_out"] = 5.0
+    data["bgm"]["loop"] = False
+    data["bgm"]["min_match_score"] = 3
+    data["bgm"]["analysis_chars"] = 9000
+    back = AppConfig.model_validate(data)
+    assert back.bgm.volume == 0.3
+    assert back.bgm.fade_in == 0.5
+    assert back.bgm.fade_out == 5.0
+    assert back.bgm.loop is False
+    assert back.bgm.min_match_score == 3
+    assert back.bgm.analysis_chars == 9000
+    # 再次落盘/重读不丢字段（schema 稳定）。
+    again = AppConfig.model_validate(back.model_dump())
+    assert again.bgm == back.bgm
+
+
+def test_app_config_missing_bgm_section_falls_back_to_defaults():
+    # 旧工作空间配置缺整个 bgm 段 → Pydantic 默认值填充，读取链不报错。
+    data = AppConfig().model_dump()
+    del data["bgm"]
+    cfg = AppConfig.model_validate(data)
+    assert cfg.bgm == BGMConfig()
+    # 缺单个字段同样降级默认。
+    data2 = AppConfig().model_dump()
+    del data2["bgm"]["volume"]
+    assert AppConfig.model_validate(data2).bgm.volume == 0.18
+
+
+def test_bgm_config_partial_round_trip():
+    # 设置页只改一个字段：model_validate 后其余字段保持默认（深合并补丁由 update_config 负责）。
+    data = AppConfig().model_dump()
+    data["bgm"]["volume"] = 0.5
+    cfg = AppConfig.model_validate(data)
+    assert cfg.bgm.volume == 0.5
+    assert cfg.bgm.fade_in == 1.5  # 其余字段未被波及

@@ -9,7 +9,9 @@ import {
   Layers,
   Combine,
   AudioLines,
+  Music4,
   Settings,
+  Disc3,
   Headphones,
 } from 'lucide-vue-next'
 import { useAppStore } from '@/stores/app'
@@ -28,10 +30,14 @@ const ALL_ITEMS = [
   { to: '/batch', label: '音频合成', icon: Layers },
   { to: '/merge', label: '音频合并', icon: Combine },
   { to: '/audio', label: '音频分集', icon: AudioLines },
+  { to: '/bgm', label: '背景音乐', icon: Music4 },
   { to: '/settings', label: '设置', icon: Settings },
+  // 音乐库 = 全局资源（工作空间外、跨工程共享）——与设置同级、放导航栏最下方。
+  { to: '/music', label: '音乐库', icon: Disc3 },
 ]
 
 // 「音频分集」导航项受设置 ui.show_audio_split 控制（默认关 = 隐藏）。
+// 背景音乐 / 音乐库恒显示（不受 show_audio_split 过滤）。
 const items = computed(() =>
   settings.config?.ui.show_audio_split
     ? ALL_ITEMS

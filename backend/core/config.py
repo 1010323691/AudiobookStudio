@@ -102,6 +102,17 @@ class TTSConfig(BaseModel):
     concurrency: int = 1
 
 
+class BGMConfig(BaseModel):
+    # 背景音乐系统（阶段 7）：章节级 BGM 匹配 + 最终混音（engines/bgm.py）。
+    # 混音 = ffmpeg 把 06_audio_merge/<章>.mp3（旁白）与音乐库曲目混成 08_bgm/<章>.mp3。
+    volume: float = 0.18  # BGM 增益（0~1）；amix 前对 BGM 侧施加
+    fade_in: float = 1.5  # 淡入秒数；混音时钳 min(fade_in, 时长/2)
+    fade_out: float = 3.0  # 淡出秒数；混音时钳 min(fade_out, 时长/2)
+    loop: bool = True  # 循环策略 = 重复策略：True = -stream_loop -1 循环铺满；False = 只播一遍，其余静音
+    min_match_score: int = 1  # 匹配最低分：低于此分不进候选（使用处钳 ≥1）
+    analysis_chars: int = 6000  # 章节 LLM 分析采样字数（头/中/尾三窗各 1/3）
+
+
 class PersonaPromptsConfig(BaseModel):
     # Voice-design (persona) prompts for the "角色配音" stage. Empty values fall back
     # to the bundled defaults in ``backend/engines/persona_prompts.py``.
@@ -204,6 +215,7 @@ class AppConfig(BaseModel):
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    bgm: BGMConfig = Field(default_factory=BGMConfig)
 
 
 # The root file: generic default config template + the workspace pointer (the only writable field).

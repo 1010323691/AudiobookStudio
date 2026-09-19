@@ -1,0 +1,510 @@
+"""Music library endpoints (背景音乐系统 · 音乐库).
+
+The library is a GLOBAL resource (project root, outside any workspace), so NO
+endpoint here calls ``require_workspace`` — the page works with the pipeline
+locked. The only workspace-aware part is the delete guard: a track referenced
+by a LOCKED chapter of the *current* workspace is skipped (unlocked references
+are not blocked — they degrade to ``music_missing`` and self-heal on re-match).
+"""
+from __future__ import annotations
+
+import json
+import math
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from ..core import paths as core_paths
+from ..core.config import get_config
+from ..engines import music as music_engine
+from ..engines.audio import probe_duration
+from ..engines.script import _llm_chat_completion
+from ..engines.voices import extract_json_object
+
+router = APIRouter(prefix="/api/music", tags=["music"])
+
+MEDIA_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav"}
+
+# Per-category caps for AI-suggested tags (防 LLM 造词/过量).
+_SUGGEST_CAPS = {"scene": 2, "mood": 3, "emotion": 2, "custom": 2}
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def _library_dir() -> Path:
+    # Call-time module attribute access (tests monkeypatch core_paths.MUSIC_LIBRARY_DIR).
+    return core_paths.MUSIC_LIBRARY_DIR
+
+
+def _track_path(name: str) -> Path:
+    """Guard + resolve a music file name inside the library (traversal -> 400)."""
+    try:
+        bare = music_engine.validate_music_name(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    d = _library_dir().resolve()
+    p = (d / bare).resolve()
+    if not str(p).startswith(str(d)):
+        raise HTTPException(400, "非法路径")
+    return p
+
+
+def _locked_references(name: str) -> list[str]:
+    """Current workspace's chapter stems whose assignment is LOCKED and points
+    at ``name`` (from ``08_bgm/bgm_assignments.json``). No workspace / no file
+    -> no references. Read-only, best-effort (a corrupt file degrades to [])."""
+    from ..core.paths import get_layout
+
+    layout = get_layout()
+    bgm = layout.bgm
+    if bgm is None or not bgm.exists():
+        return []
+    f = bgm / "bgm_assignments.json"
+    if not f.exists():
+        return []
+    try:
+        data = json.loads(f.read_bytes().decode("utf-8"))
+        chapters = data.get("chapters") if isinstance(data, dict) else None
+        if not isinstance(chapters, dict):
+            return []
+        return [
+            stem for stem, ch in chapters.items()
+            if isinstance(ch, dict) and ch.get("locked") and ch.get("music") == name
+        ]
+    except Exception:
+        return []
+
+
+def _delete_track(name: str) -> tuple[bool, str]:
+    """Delete one track (file + index entry). Returns ``(deleted, skip_reason)``.
+    LOCKED chapter references block the delete (skipped, not an error);
+    unlocked references are left to degrade (``music_missing``)."""
+    refs = _locked_references(name)
+    if refs:
+        shown = ", ".join(refs[:3]) + ("…" if len(refs) > 3 else "")
+        return False, f"被 {len(refs)} 章锁定引用（{shown}）"
+    p = _track_path(name)  # also validates (400 on traversal)
+    if p.exists():
+        p.unlink()
+    music_engine.update_index(
+        lambda idx: idx["tracks"].pop(name, None)
+    )
+    return True, ""
+
+
+# --------------------------------------------------------------------------- #
+# request models
+# --------------------------------------------------------------------------- #
+
+class TrackUpdate(BaseModel):
+    tags: dict | None = None
+    enabled: bool | None = None
+    description: str | None = None
+
+
+class BatchNames(BaseModel):
+    names: list[str]
+    enabled: bool | None = None  # batch-enable only
+
+
+class BatchTags(BaseModel):
+    tracks: list[str]  # 选中音乐（文件名）
+    names: list[str]  # 标签名
+    category: str
+    op: str = "add"  # add | remove
+
+
+class TagCreate(BaseModel):
+    category: str
+    name: str
+
+
+class TagRename(BaseModel):
+    category: str
+    name: str
+    new_name: str
+
+
+class SuggestTagsReq(BaseModel):
+    name: str
+    description: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# library
+# --------------------------------------------------------------------------- #
+
+@router.get("/library")
+def get_library() -> dict:
+    """The full index: tag registry + all tracks (read-only)."""
+    return music_engine.load_index()
+
+
+@router.post("/upload")
+async def upload_track(file: UploadFile = File(...)) -> dict:
+    """Upload one music file (mp3/wav). Same name -> 409 (never overwrites)."""
+    raw_name = file.filename or ""
+    try:
+        name = music_engine.validate_music_name(raw_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, f"上传内容为空（{name}）。")
+    d = _library_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / name
+
+    cfg = get_config()
+    ffprobe = cfg.ffmpeg.ffprobe_path
+
+    def _mutate(idx: dict) -> None:
+        if name in idx["tracks"] or dest.exists():
+            raise HTTPException(
+                409, f"已存在同名音乐（{name}）——请改名后上传（不会覆盖）。"
+            )
+        dest.write_bytes(data)
+        dur, _err = probe_duration(dest, ffprobe)
+        if not math.isfinite(dur):
+            dur = 0.0  # probe failure is non-blocking
+        idx["tracks"][name] = {
+            "duration": round(dur, 3),
+            "enabled": True,
+            "description": "",
+            "tags": music_engine._empty_track_tags(),
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    try:
+        idx = music_engine.update_index(_mutate)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # A write failure may leave the file on disk without an index entry —
+        # remove the orphan so a re-upload of the same name is not blocked.
+        try:
+            if dest.exists():
+                dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(500, f"音乐写入失败：{e}")
+    return {"name": name, "track": idx["tracks"][name]}
+
+
+@router.get("/preview/{name}")
+def preview_track(name: str):
+    """Stream a music file for in-page preview (the library is NOT served via
+    the workspace files API)."""
+    p = _track_path(name)
+    if not p.is_file():
+        raise HTTPException(404, f"音乐库中找不到 {name}")
+    return FileResponse(p, media_type=MEDIA_TYPES.get(p.suffix.lower(), "application/octet-stream"))
+
+
+# --------------------------------------------------------------------------- #
+# track edits
+# --------------------------------------------------------------------------- #
+
+@router.put("/tracks/{name}")
+def update_track(name: str, body: TrackUpdate) -> dict:
+    """Update a track's tags / enabled / description. Out-of-vocabulary tags
+    are folded into the custom bucket (engines.music.normalize_track_tags)."""
+    p = _track_path(name)
+    if not p.is_file():
+        raise HTTPException(404, f"音乐库中找不到 {name}")
+
+    def _mutate(idx: dict) -> None:
+        tr = idx["tracks"].get(name)
+        if not isinstance(tr, dict):
+            raise HTTPException(404, f"音乐库中找不到 {name}")
+        if body.tags is not None:
+            tr["tags"] = music_engine.normalize_track_tags(body.tags, idx["tags"])
+        if body.enabled is not None:
+            tr["enabled"] = bool(body.enabled)
+        if body.description is not None:
+            tr["description"] = body.description
+
+    idx = music_engine.update_index(_mutate)
+    return {"name": name, "track": idx["tracks"][name]}
+
+
+@router.delete("/tracks/{name}")
+def delete_track(name: str) -> dict:
+    """Delete one track. Locked chapter references skip it (unlocked ones do
+    not block — the chapter degrades to music_missing, re-match self-heals)."""
+    deleted, reason = _delete_track(name)
+    return {"deleted": [name] if deleted else [],
+            "skipped": [] if deleted else [{"name": name, "reason": reason}],
+            "missing": []}
+
+
+@router.post("/tracks/batch-enable")
+def batch_enable(body: BatchNames) -> dict:
+    if not body.names:
+        raise HTTPException(400, "未选择音乐。")
+    known = set(music_engine.load_index()["tracks"])
+    missing = [n for n in body.names if n not in known]
+    enabled = bool(body.enabled)
+
+    def _mutate(idx: dict) -> None:
+        for n in body.names:
+            tr = idx["tracks"].get(n)
+            if isinstance(tr, dict):
+                tr["enabled"] = enabled
+
+    music_engine.update_index(_mutate)
+    return {"updated": len(body.names) - len(missing), "enabled": enabled,
+            "missing": missing}
+
+
+@router.post("/tracks/batch-tags")
+def batch_tags(body: BatchTags) -> dict:
+    """Add/remove tag names to/from the SELECTED tracks (body.tracks = 选中音乐,
+    body.names = 标签名). Out-of-vocabulary tag names are allowed here (the
+    registry is not required) — the per-track normalize on a later PUT would
+    fold them into custom, so the UI only offers registry names."""
+    tracks = [n.strip() for n in body.tracks if isinstance(n, str) and n.strip()]
+    if not tracks:
+        raise HTTPException(400, "未选择音乐。")
+    if body.category not in music_engine.TAG_CATEGORIES:
+        raise HTTPException(400, f"未知标签分类：{body.category}")
+    if body.op not in ("add", "remove"):
+        raise HTTPException(400, f"未知操作：{body.op}")
+    names = [n.strip() for n in body.names if isinstance(n, str) and n.strip()]
+    if not names:
+        raise HTTPException(400, "未提供标签。")
+    known = set(music_engine.load_index()["tracks"])
+    missing = [n for n in tracks if n not in known]
+
+    def _mutate(idx: dict) -> None:
+        for n in tracks:
+            tr = idx["tracks"].get(n)
+            if not isinstance(tr, dict) or not isinstance(tr.get("tags"), dict):
+                continue
+            bucket = tr["tags"].setdefault(body.category, [])
+            if body.op == "add":
+                for t in names:
+                    if t not in bucket:
+                        bucket.append(t)
+            else:
+                tr["tags"][body.category] = [t for t in bucket if t not in names]
+
+    music_engine.update_index(_mutate)
+    return {"updated": len(tracks) - len(missing), "op": body.op,
+            "category": body.category, "names": names, "missing": missing}
+
+
+@router.post("/tracks/batch-delete")
+def batch_delete(body: BatchNames) -> dict:
+    """Delete many tracks with the same locked-reference skip semantics as the
+    single delete (shared via _delete_track)."""
+    if not body.names:
+        raise HTTPException(400, "未选择音乐。")
+    known = set(music_engine.load_index()["tracks"])
+    missing = [n for n in body.names if n not in known]
+    deleted: list[str] = []
+    skipped: list[dict] = []
+    for n in body.names:
+        if n in missing:
+            continue
+        try:
+            ok, reason = _delete_track(n)
+        except HTTPException as e:
+            # Traversal-shaped names are reported per item, not aborting the batch.
+            skipped.append({"name": n, "reason": e.detail})
+            continue
+        if ok:
+            deleted.append(n)
+        else:
+            skipped.append({"name": n, "reason": reason})
+    return {"deleted": deleted, "skipped": skipped, "missing": missing}
+
+
+# --------------------------------------------------------------------------- #
+# tag management
+# --------------------------------------------------------------------------- #
+
+def _propagate_chapter_analysis(old: str, new: str | None, category: str) -> None:
+    """Rewrite a (renamed) tag in the current workspace's own analysis cache
+    (``08_bgm/chapter_music_analysis.json``). Best-effort: no workspace / no
+    file / corrupt file -> nothing to do. Assignments snapshots are NOT
+    rewritten (they are a historical record)."""
+    from ..core.paths import get_layout
+
+    layout = get_layout()
+    bgm = layout.bgm
+    if bgm is None or not bgm.exists():
+        return
+    f = bgm / "chapter_music_analysis.json"
+    if not f.exists():
+        return
+    try:
+        data = json.loads(f.read_bytes().decode("utf-8"))
+    except Exception:
+        return
+    chapters = data.get("chapters") if isinstance(data, dict) else None
+    if not isinstance(chapters, dict):
+        return
+    changed = False
+    for ch in chapters.values():
+        if not isinstance(ch, dict):
+            continue
+        lst = ch.get(category)
+        if not isinstance(lst, list):
+            continue
+        if old in lst:
+            ch[category] = [new if v == old else v for v in lst] if new else \
+                [v for v in lst if v != old]
+            changed = True
+    if changed:
+        try:
+            f.write_bytes(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+        except OSError:
+            pass
+
+
+@router.post("/tags")
+def create_tag(body: TagCreate) -> dict:
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "标签名不能为空。")
+    if body.category not in music_engine.TAG_CATEGORIES:
+        raise HTTPException(400, f"未知标签分类：{body.category}")
+    idx = music_engine.update_index(lambda i: _add_tag(i, body.category, name))
+    return {"tags": idx["tags"]}
+
+
+def _add_tag(idx: dict, category: str, name: str) -> None:
+    """Registry add with the global-uniqueness rule (409 on any-bucket clash)."""
+    if name in music_engine.all_tag_names(idx["tags"]):
+        raise HTTPException(409, f"标签「{name}」已存在。")
+    idx["tags"].setdefault(category, []).append(name)
+
+
+@router.post("/tags/rename")
+def rename_tag(body: TagRename) -> dict:
+    old = (body.name or "").strip()
+    new = (body.new_name or "").strip()
+    if not old or not new:
+        raise HTTPException(400, "标签名不能为空。")
+    if body.category not in music_engine.TAG_CATEGORIES:
+        raise HTTPException(400, f"未知标签分类：{body.category}")
+    if old == new:
+        return {"tags": music_engine.load_index()["tags"]}
+    affected = music_engine.update_index(
+        lambda idx: _rename_tag(idx, body.category, old, new)
+    )
+    _propagate_chapter_analysis(old, new, body.category)
+    return {"tags": affected["tags"], "affected_tracks": _affected_count(affected, body.category, old, new)}
+
+
+def _rename_tag(idx: dict, category: str, old: str, new: str) -> None:
+    bucket = idx["tags"].get(category)
+    if not isinstance(bucket, list) or old not in bucket:
+        raise HTTPException(404, f"标签「{old}」不在 {category} 分类中。")
+    if new in music_engine.all_tag_names(idx["tags"]):
+        raise HTTPException(409, f"标签「{new}」已存在。")
+    music_engine.apply_tag_rename(idx, category, old, new)
+
+
+def _affected_count(idx: dict, category: str, old: str, new: str) -> int:
+    # Recompute the affected-track count from the post-rename index.
+    n = 0
+    for tr in idx.get("tracks", {}).values():
+        if isinstance(tr, dict) and isinstance(tr.get("tags"), dict):
+            if new in (tr["tags"].get(category) or []):
+                n += 1
+    return n
+
+
+@router.delete("/tags/{category}/{name}")
+def delete_tag(category: str, name: str) -> dict:
+    if category not in music_engine.TAG_CATEGORIES:
+        raise HTTPException(400, f"未知标签分类：{category}")
+    idx = music_engine.update_index(lambda i: _delete_tag(i, category, name))
+    _propagate_chapter_analysis(name, None, category)
+    return {"tags": idx["tags"], "deleted_track_refs": _affected_count(idx, category, name, None)}
+
+
+def _delete_tag(idx: dict, category: str, name: str) -> None:
+    bucket = idx["tags"].get(category)
+    if not isinstance(bucket, list) or name not in bucket:
+        raise HTTPException(404, f"标签「{name}」不在 {category} 分类中。")
+    music_engine.apply_tag_delete(idx, category, name)
+
+
+# --------------------------------------------------------------------------- #
+# AI tag recommendation (text-only: filename + description + vocabulary)
+# --------------------------------------------------------------------------- #
+
+@router.post("/suggest-tags")
+def suggest_tags(body: SuggestTagsReq) -> dict:
+    """LLM-recommended tags from the file NAME + user DESCRIPTION only — the
+    LLM never reads the audio. Results are candidates (filtered to the
+    in-vocabulary names per category) for the user to confirm."""
+    p = _track_path(body.name)
+    if not p.is_file():
+        raise HTTPException(404, f"音乐库中找不到 {body.name}")
+    cfg = get_config()
+    if not cfg.llm.model_name:
+        raise HTTPException(400, "尚未配置 LLM 模型（设置 → LLM → model_name）。")
+    idx = music_engine.load_index()
+    tr = idx["tracks"].get(body.name)
+    description = (body.description or (tr or {}).get("description") or "").strip()
+
+    vocab = {c: idx["tags"].get(c, []) for c in music_engine.TAG_CATEGORIES if c != "custom"}
+    vocab_text = "\n".join(f"{c}: {'、'.join(v)}" for c, v in vocab.items())
+    system = (
+        "你是有声书背景音乐标签助手。根据音乐文件名和用户描述，从给定词表中选择标签。"
+        "只能从词表中选择，禁止创造新词。输出 JSON：{\"scene\": [...], \"mood\": [...], "
+        "\"emotion\": [...]}，scene 最多 2 个、mood 最多 3 个、emotion 最多 2 个，"
+        "选不出就留空数组。只输出 JSON，不要解释。"
+    )
+    user = f"文件名：{p.stem}\n用户描述：{description or '（无）'}\n\n词表：\n{vocab_text}"
+
+    last_err: str | None = None
+    parse_failed = False
+    for _attempt in range(2):
+        try:
+            content, _finish, _usage = _llm_chat_completion(
+                cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model_name,
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}],
+                temperature=0.2, top_p=0.9, presence_penalty=0.0, max_tokens=300,
+            )
+        except Exception as e:  # noqa: BLE001 — retry, then 502
+            last_err = str(e)
+            continue
+        try:
+            return _filter_suggestion(content, idx["tags"])
+        except HTTPException:
+            parse_failed = True  # 回复不可解析 = 一次失败尝试，重试
+    if parse_failed:
+        raise HTTPException(502, "AI 推荐失败，请手动打标。")
+    raise HTTPException(502, f"AI 推荐失败，请手动打标（{last_err}）")
+
+
+def _filter_suggestion(content: str, registry: dict[str, list[str]]) -> dict:
+    """Parse the LLM reply (a JSON OBJECT — ``extract_json_object``, the
+    brace-scanning extractor; ``clean_json_string`` is array-only), keep ONLY
+    in-vocabulary names per category, cap each bucket (anti word-coining /
+    overflow)."""
+    data = extract_json_object(content)
+    if not isinstance(data, dict):
+        raise HTTPException(502, "AI 推荐失败，请手动打标。")
+    out: dict[str, list[str]] = {}
+    for cat in ("scene", "mood", "emotion"):
+        vals = data.get(cat)
+        vocab = [v for v in (registry.get(cat) or []) if isinstance(v, str)]
+        keep: list[str] = []
+        if isinstance(vals, list):
+            for v in vals:
+                if isinstance(v, str) and v.strip() and v.strip() in vocab and v.strip() not in keep:
+                    keep.append(v.strip())
+        out[cat] = keep[: _SUGGEST_CAPS[cat]]
+    return {"tags": out}

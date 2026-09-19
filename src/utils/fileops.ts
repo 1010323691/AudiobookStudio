@@ -49,6 +49,27 @@ export async function pickFile(filters: FileFilter[] = []): Promise<PickedFile |
   })
 }
 
+/**
+ * Pick MULTIPLE files (no upload — the caller decides where each File goes;
+ * used by the 音乐库 bulk upload, which uploads per-file for 409/400 semantics).
+ * Resolves to the chosen File list (empty when the user cancels).
+ */
+export function pickFiles(accept = '.mp3,.wav', multiple = true): Promise<File[]> {
+  return new Promise<File[]>((resolve) => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = accept
+    input.multiple = multiple
+    input.onchange = () => {
+      const files = Array.from(input.files ?? [])
+      resolve(files)
+    }
+    // The dialog's cancel fires no change event in some browsers — treat a
+    // click-then-no-pick as an empty selection via the input going out of scope.
+    input.click()
+  })
+}
+
 /** URL to download a module output file. */
 export function downloadUrl(module: string, name: string): string {
   return `${API_BASE}/api/files/download/${module}/${encodeURIComponent(name)}`

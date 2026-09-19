@@ -11,6 +11,7 @@ One root — the user's chosen workspace (``paths.working_dir`` in the root
     05_audio_chunk/    # per-segment batch audio (+ manifest)
     06_audio_merge/    # merged audiobook file
     07_output/         # final episode files
+    08_bgm/            # background-music analysis cache + assignments + final mixes
     logs/              # the project's app.log
     config/            # the project's config/app.json
 
@@ -27,7 +28,7 @@ from pathlib import Path
 # backend/core/paths.py  ->  parents[0]=core  parents[1]=backend  parents[2]=<project>
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# The eight directories (seven artifacts + scratch) that follow the user's
+# The nine directories (eight artifacts + scratch) that follow the user's
 # workspace: (Layout attribute, on-disk directory name), in pipeline order.
 WORKSPACE_DIRS = (
     ("temp", "00_temp"),
@@ -38,7 +39,18 @@ WORKSPACE_DIRS = (
     ("audio_chunk", "05_audio_chunk"),
     ("audio_merge", "06_audio_merge"),
     ("output", "07_output"),
+    ("bgm", "08_bgm"),
 )
+
+# The global music library (背景音乐系统): a top-level project-root directory that
+# lives OUTSIDE any workspace — music files and their shared tag registry are
+# project-level resources shared by every workspace. Deliberately NOT a
+# workspace dir and NOT configurable: config is per-workspace, while the
+# library is global (a per-project setting that pins a global path is
+# self-contradictory). Fixed constant, code-managed (like ``TEMPLATE_FILE``).
+# Engines/tests access it via module attribute at call time
+# (``core_paths.MUSIC_LIBRARY_DIR``) so monkeypatching stays effective.
+MUSIC_LIBRARY_DIR = PROJECT_ROOT / "music_library"
 
 # On-disk directory names only (for creation / validation).
 WORKSPACE_DIR_NAMES = tuple(name for _, name in WORKSPACE_DIRS)
@@ -64,6 +76,7 @@ class Layout:
             self.audio_chunk = None
             self.audio_merge = None
             self.output = None
+            self.bgm = None
             self.logs = None
             self.config = None
             return
@@ -76,12 +89,13 @@ class Layout:
         self.audio_chunk = workspace / "05_audio_chunk"
         self.audio_merge = workspace / "06_audio_merge"
         self.output = workspace / "07_output"
+        self.bgm = workspace / "08_bgm"
         self.logs = workspace / "logs"
         self.config = workspace / "config"
 
     # -- directory creation (mkdir only — nothing is ever deleted) ------------
     def ensure(self) -> "Layout":
-        """Create the eight artifact dirs + logs + config under the workspace."""
+        """Create the nine artifact dirs + logs + config under the workspace."""
         if self.workspace is None:
             return self
         for name in (*WORKSPACE_DIR_NAMES, "logs", "config"):

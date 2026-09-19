@@ -15,9 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .api import audio as api_audio
+from .api import bgm as api_bgm
 from .api import book as api_book
 from .api import config as api_config
 from .api import files as api_files
+from .api import music as api_music
 from .api import script as api_script
 from .api import tasks as api_tasks
 from .api import text as api_text
@@ -38,9 +40,11 @@ ROUTERS = [
     api_text.router,
     api_book.router,
     api_audio.router,
+    api_bgm.router,
     api_tts.router,
     api_script.router,
     api_workspace.router,
+    api_music.router,
 ]
 
 

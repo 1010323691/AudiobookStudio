@@ -55,10 +55,22 @@ const router = createRouter({
           meta: { title: '音频分集' },
         },
         {
+          path: 'bgm',
+          name: 'bgm',
+          component: () => import('@/views/BGM.vue'),
+          meta: { title: '背景音乐' },
+        },
+        {
           path: 'settings',
           name: 'settings',
           component: () => import('@/views/Settings.vue'),
           meta: { title: '设置' },
+        },
+        {
+          path: 'music',
+          name: 'music',
+          component: () => import('@/views/MusicLibrary.vue'),
+          meta: { title: '音乐库' },
         },
       ],
     },

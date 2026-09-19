@@ -39,6 +39,7 @@ export const http = {
     request<T>(p, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   put: <T>(p: string, body?: unknown) =>
     request<T>(p, { method: 'PUT', body: JSON.stringify(body) }),
+  del: <T>(p: string) => request<T>(p, { method: 'DELETE' }),
 }
 
 export function health(): Promise<{ ok: boolean; service: string; port: number }> {

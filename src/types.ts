@@ -569,6 +569,21 @@ export interface AppConfig {
     /** 侧边栏是否显示「音频分集」导航项（默认关 = 隐藏）。 */
     show_audio_split: boolean
   }
+  /** 背景音乐系统（阶段 7）：章节级 BGM 匹配 + 最终混音。 */
+  bgm: {
+    /** BGM 增益（0~1）。 */
+    volume: number
+    /** 淡入秒数（混音时钳 min(fade_in, 时长/2)）。 */
+    fade_in: number
+    /** 淡出秒数（混音时钳 min(fade_out, 时长/2)）。 */
+    fade_out: number
+    /** 循环策略 = 重复策略：true = 循环铺满；false = 只播一遍，其余静音。 */
+    loop: boolean
+    /** 匹配最低分：低于此分不进候选（钳 ≥1）。 */
+    min_match_score: number
+    /** 章节 LLM 分析采样字数（头/中/尾三窗）。 */
+    analysis_chars: number
+  }
 }
 
 /** A recursively-partial ``AppConfig`` — mirrors the backend's deep-merge ``update_config``
@@ -593,4 +608,90 @@ export interface WorkspaceInfo {
   is_default: boolean
   /** Artifact directory name → absolute path (01_input, 02_split_text, …); empty when unset. */
   dirs: Record<string, string>
+}
+
+// ------------------------------ music library（全局音乐库） ------------------------------
+/** The four tag categories (buckets). */
+export type MusicTagCategory = 'scene' | 'mood' | 'emotion' | 'custom'
+/** A track's tag buckets — one list per category. */
+export type TrackTags = Record<MusicTagCategory, string[]>
+/** One entry of ``music_library/music_index.json`` ``tracks``. */
+export interface MusicTrack {
+  /** Duration in seconds (0 when the probe failed — non-blocking). */
+  duration: number
+  enabled: boolean
+  description: string
+  tags: TrackTags
+  added_at: string
+}
+/** Response of ``GET /api/music/library``. */
+export interface MusicLibrary {
+  version: number
+  tags: Record<MusicTagCategory, string[]>
+  tracks: Record<string, MusicTrack>
+}
+/** Response of a music delete / batch-delete (some names may be skipped). */
+export interface MusicDeleteResult {
+  deleted: string[]
+  skipped: { name: string; reason: string }[]
+  missing: string[]
+}
+/** Response of ``POST /api/music/suggest-tags`` (AI candidate tags, text-only). */
+export interface SuggestTagsResult {
+  tags: Record<MusicTagCategory, string[]>
+}
+
+// ------------------------------ bgm（背景音乐：章节匹配 + 混音） ------------------------------
+/** LLM chapter-atmosphere analysis (one chapter of ``chapter_music_analysis.json``). */
+export interface ChapterAnalysis {
+  scene: string[]
+  mood: string[]
+  emotion: string[]
+  custom: string[]
+  analyzed_at: string
+  edited: boolean
+  edited_at?: string
+}
+/** A chapter's BGM assignment (one chapter of ``bgm_assignments.json``). */
+export interface BgmAssignment {
+  /** Snapshot of the chapter tags at match time. */
+  tags: { scene: string[]; mood: string[]; emotion: string[]; custom: string[] }
+  /** Bare music-library file name; null = no BGM; absent entry = never matched. */
+  music: string | null
+  locked: boolean
+  manual: boolean
+  score: number | null
+  reason: string
+  matched_at: string
+}
+/** One row of ``GET /api/bgm/chapters`` (disk-state basis = 02_split_text stems). */
+export interface BgmChapterRow {
+  /** Chapter stem (02_split_text/<stem>.txt without .txt). */
+  stem: string
+  /** True once 06_audio_merge/<stem>.mp3 (or .wav) exists — mixing needs the narration. */
+  narration_exists: boolean
+  /** True once 08_bgm/<stem>.mp3 exists (a no-BGM chapter's copy2 also counts). */
+  mix_exists: boolean
+  analysis: ChapterAnalysis | null
+  assignment: BgmAssignment | null
+  /** The assignment points at a music file that no longer exists in the library. */
+  music_missing: boolean
+}
+/** Response of ``GET /api/bgm/chapters``. */
+export interface BgmChaptersResult {
+  chapters: BgmChapterRow[]
+  /** Current matching mode: "random" | "llm" (persisted in bgm_assignments.json). */
+  mode: string
+}
+/** Response of ``POST /api/bgm/match``. */
+export interface BgmMatchResult {
+  mode: string
+  matched: number
+  no_bgm: number
+  skipped_locked: number
+}
+/** Response of batch analyze / mix endpoints: one independent task per chapter. */
+export interface BgmBatchResult {
+  task_ids: string[]
+  chapters: { stem: string; task_id: string }[]
 }

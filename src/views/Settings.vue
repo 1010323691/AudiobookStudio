@@ -34,6 +34,7 @@ import {
   MessageSquareText,
   AudioWaveform,
   AudioLines,
+  Music4,
 } from 'lucide-vue-next'
 
 const settings = useSettingsStore()
@@ -394,6 +395,50 @@ async function save() {
             <div class="flex items-center gap-3">
               <Label class="w-24 shrink-0">起始编号</Label>
               <Input v-model="draft.audio.start_number" class="max-w-[100px]" />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- 背景音乐 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2"><Music4 class="h-5 w-5" />背景音乐</CardTitle>
+          <CardDescription>
+            章节级 BGM 匹配与最终混音的默认参数（混音 = 06 旁白 + 音乐库曲目 → 08_bgm）。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">BGM 音量</Label>
+              <Input v-model.number="draft.bgm.volume" type="number" step="0.01" min="0" max="1" class="max-w-[100px]" />
+              <span class="text-xs text-muted-foreground">0~1</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">循环策略</Label>
+              <Switch v-model="draft.bgm.loop" />
+              <span class="text-xs text-muted-foreground">开 = 循环铺满；关 = 只播一遍，其余静音</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">淡入时间</Label>
+              <Input v-model.number="draft.bgm.fade_in" type="number" step="0.5" min="0" class="max-w-[100px]" />
+              <span class="text-xs text-muted-foreground">秒（混音时钳 章节时长/2）</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">淡出时间</Label>
+              <Input v-model.number="draft.bgm.fade_out" type="number" step="0.5" min="0" class="max-w-[100px]" />
+              <span class="text-xs text-muted-foreground">秒（混音时钳 章节时长/2）</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">最低匹配分</Label>
+              <Input v-model.number="draft.bgm.min_match_score" type="number" min="1" step="1" class="max-w-[100px]" />
+              <span class="text-xs text-muted-foreground">低于此分的音乐不进候选</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="w-24 shrink-0">分析采样字数</Label>
+              <Input v-model.number="draft.bgm.analysis_chars" type="number" min="500" step="500" class="max-w-[100px]" />
+              <span class="text-xs text-muted-foreground">章节 LLM 气氛分析的头/中/尾采样字数</span>
             </div>
           </div>
         </CardContent>

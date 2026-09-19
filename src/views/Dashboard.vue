@@ -28,6 +28,7 @@ const WS_DIR_LABELS: [string, string][] = [
   ['05_audio_chunk', '音频合成片段'],
   ['06_audio_merge', '音频合并成品'],
   ['07_output', '最终分集'],
+  ['08_bgm', '背景音乐成品'],
 ]
 
 const wsPath = computed(() => ws.value?.path || settings.config?.paths?.working_dir || '')

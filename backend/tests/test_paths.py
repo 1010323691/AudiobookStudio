@@ -56,6 +56,7 @@ def test_layout_maps_single_root(tmp_path):
     assert layout.audio_chunk == ws / "05_audio_chunk"
     assert layout.audio_merge == ws / "06_audio_merge"
     assert layout.output == ws / "07_output"
+    assert layout.bgm == ws / "08_bgm"
     assert layout.temp == ws / "00_temp"
     # Config + log now live inside the workspace too:
     assert layout.logs == ws / "logs"
@@ -67,6 +68,7 @@ def test_layout_unset_is_inert(tmp_path):
     assert layout.workspace is None
     assert layout.input is None
     assert layout.output is None
+    assert layout.bgm is None
     assert layout.logs is None
     assert layout.config is None
     assert layout.dirs() == {}
@@ -80,6 +82,23 @@ def test_dirs_helper_lists_artifact_dirs(tmp_path):
     assert set(d) == set(core_paths.WORKSPACE_DIR_NAMES)
     assert d["01_input"] == str(ws / "01_input")
     assert d["06_audio_merge"] == str(ws / "06_audio_merge")
+    assert d["08_bgm"] == str(ws / "08_bgm")
+    # 08_bgm 必须在 dirs() 里（files API 的 list/download 依赖 WORKSPACE_DIRS 派生）。
+    assert "08_bgm" in core_paths.WORKSPACE_DIR_NAMES
+
+
+def test_music_library_dir_is_project_root_level(sandbox, monkeypatch):
+    # 音乐库 = 项目根级全局目录（工作空间外、跨工程共享），固定常量不可配置。
+    # 常量在 import 时按真实 PROJECT_ROOT 求值，故测试直接 monkeypatch 该属性
+    # （引擎侧一律模块属性访问 core_paths.MUSIC_LIBRARY_DIR，与此一致）。
+    monkeypatch.setattr(core_paths, "MUSIC_LIBRARY_DIR", sandbox / "music_library")
+    assert core_paths.MUSIC_LIBRARY_DIR == sandbox / "music_library"
+    # 它不是工作空间目录（不进 WORKSPACE_DIRS / Layout / pathio markers）。
+    assert "music_library" not in core_paths.WORKSPACE_DIR_NAMES
+    assert "music_library" not in core_paths.WORKSPACE_DIRS
+    from backend.core import pathio as core_pathio
+
+    assert "music_library" not in core_pathio.WORKSPACE_MARKERS
 
 
 def test_ensure_creates_everything_and_is_idempotent(tmp_path):
