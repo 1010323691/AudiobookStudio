@@ -34,10 +34,12 @@ from backend.engines.script import (
     _load_spot_history,
     _parse_entries_reply,
     _pick_majority,
+    _quote_parity,
     _reparse_vote,
     _risk_tier,
     _strip_leading_saying_tag,
     _tag_in,
+    absorb_punct_entries,
     boundary_check_speakers,
     build_batch_window,
     check_chunk_fidelity,
@@ -47,6 +49,8 @@ from backend.engines.script import (
     generate_file,
     group_retry_indices,
     is_suspicious_entry_text,
+    long_entry_indices,
+    long_paragraph_resplit,
     merge_adjacent_narrator,
     parse_speaker,
     parse_speaker_map_full,
@@ -60,6 +64,8 @@ from backend.engines.script import (
     spot_check_speakers,
     split_chunk_balanced,
     split_into_chunks,
+    split_long_entries,
+    split_long_text,
     strip_outer_quotes,
     suspicious_entry_indices,
     validate_sentence_splits,
@@ -2114,7 +2120,10 @@ def _expected_entries() -> list:
 
 
 # 被测阶段之外的检查阶段全部关闭（调用数才能钉死）
-_STAGES_OFF = dict(revalidate_splits=False, delete_saying_tags=False, spot_check_rate=0.0)
+_STAGES_OFF = dict(
+    revalidate_splits=False, delete_saying_tags=False, spot_check_rate=0.0,
+    check_long_paragraphs=False, absorb_punct_entries=False,
+)
 
 
 def _boundary_e2e(tmp_path, monkeypatch, workspace, rejudge_reply,
@@ -2387,6 +2396,434 @@ def test_boundary_stage_ordering_before_revalidate(tmp_path, monkeypatch, worksp
 
 
 # --------------------------------------------------------------------------- #
+# 超长段落检查（阶段 A：LLM 重切 + 机械分段兜底）与纯标点条目吸收（阶段 B）
+# --------------------------------------------------------------------------- #
+
+# 固定超长样例（212 字 > 200）：旁白长独白 + 内嵌一句台词 + 收尾旁白
+LONG_HEAD = ("夜色像潮水一样漫进街巷。" + "风从窗缝里挤进来，吹得烛火摇个不停。" * 10
+             + "林某说：")
+LONG_SRC = LONG_HEAD + " " + LQ + "我们明天再谈。" + RQ + "他点了点头。"
+assert len(LONG_SRC) == 212 and len(LONG_HEAD) == 196
+
+_SKEL = lambda t: "".join(c for c in t if c.isalnum())
+
+
+def test_split_long_text_unit():
+    # 短文本（≤ 上限）原样单段
+    assert split_long_text("短文本。", 200) == ["短文本。"]
+    assert split_long_text("", 200) == []
+    # ① 句末 tier：取最接近目标宽度的边界（300 字 @ 200 → [200, 100]，无损、各段 ≤ 200）
+    t = "一。" * 150
+    parts = split_long_text(t, 200)
+    assert [len(p) for p in parts] == [200, 100]
+    assert _SKEL("".join(parts)) == _SKEL(t)
+    assert all(len(p) <= 200 for p in parts)
+    # ② 子句 tier（无句末标点、全逗号）
+    t2 = "甲，" * 150
+    parts2 = split_long_text(t2, 200)
+    assert [len(p) for p in parts2] == [200, 100]
+    assert _SKEL("".join(parts2)) == _SKEL(t2)
+    # ③ 定宽硬切（无任何边界字符）
+    t3 = "甲" * 300
+    parts3 = split_long_text(t3, 200)
+    assert [len(p) for p in parts3] == [200, 100]
+    # 唯一边界远离目标宽度 → 仍取该边界（段 190 字 + 剩余再硬切）
+    t4 = "一" * 189 + "。" + "乙" * 210
+    parts4 = split_long_text(t4, 200)
+    assert [len(p) for p in parts4] == [190, 200, 10]
+    assert _SKEL("".join(parts4)) == _SKEL(t4)
+    # ASCII 词内点号不切（3.14 无边界）；定宽 200 处恰在其后
+    t5 = "甲" * 100 + " 3.14 " + "乙" * 150
+    parts5 = split_long_text(t5, 200)
+    assert _SKEL("".join(parts5)) == _SKEL(t5)
+    assert all(len(p) <= 200 for p in parts5)
+    # 引号 parity：句末切点在引号内不安全 → 让位定宽；定宽 ±20 窗内找引号安全位
+    t6 = "甲" * 195 + LQ + "乙。" * 5 + RQ + "丙" * 150  # LQ@195, RQ@206
+    parts6 = split_long_text(t6, 200)
+    assert parts6[0] == "甲" * 195  # 离定宽位最近的安全位 = 195（开引号之前）
+    assert parts6[1].startswith(LQ)
+    assert _SKEL("".join(parts6)) == _SKEL(t6)
+    # 整条包裹在引号内（内部句末全不安全）→ 裸定宽切，骨架仍无损
+    t7 = LQ + "一。" * 150 + RQ
+    parts7 = split_long_text(t7, 200)
+    assert _SKEL("".join(parts7)) == _SKEL(t7)
+    assert all(len(p) <= 200 for p in parts7)
+    # max_chars ≤ 0 钳 10（退化值无意义）
+    parts8 = split_long_text("甲" * 250, 0)
+    assert all(len(p) == 10 for p in parts8[:24]) and _SKEL("".join(parts8)) == _SKEL("甲" * 250)
+
+
+def test_quote_parity_unit():
+    par = _quote_parity(LQ + "甲" + RQ)
+    assert par == [0, 1, 1, 0]
+    # 开闭各 5 种引号（ASCII 引号开 == 闭，计为开——与既有协议同一保守口径）
+    par2 = _quote_parity("".join(op for op, _c in [
+        (chr(0x201C), 0), (chr(0x300C), 0), (chr(0x300E), 0),
+        (chr(0x2018), 0), (chr(0x0022), 0)]))
+    assert par2[-1] == 5
+    # 闭合 → 奇偶回零
+    par3 = _quote_parity(LQ + "甲" + RQ + "乙")
+    assert par3[-1] == 0
+
+
+def test_long_entry_indices_unit():
+    entries = [
+        {"speaker": "NARRATOR", "text": "短。"},
+        {"speaker": "NARRATOR", "text": "甲" * 201},
+        {"speaker": "林某", "text": " " * 5 + "乙" * 199 + " " * 5},  # strip 后 199 ≤ 200
+        {"speaker": "NARRATOR", "text": "丙" * 200},  # 恰好 200 = 不超长
+    ]
+    assert long_entry_indices(entries, 200) == [1]
+
+
+def test_split_long_entries_unit():
+    # speaker / instruct 继承（instruct 只给首段）；输入列表不动；硬保证 ≤ 上限
+    e = [
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "calm"},
+        {"speaker": "林某", "text": "短。", "instruct": "x"},
+    ]
+    out, n = split_long_entries(e, 200, is_chapter_title)
+    assert n == 1
+    assert e[0]["text"] == LONG_SRC  # 输入列表保持原样
+    assert len(out) == 3
+    assert all(x["speaker"] == "NARRATOR" for x in out[:2])
+    assert out[0]["instruct"] == "calm" and out[1]["instruct"] == ""
+    assert all(len(x["text"].strip()) <= 200 for x in out)
+    assert _SKEL(out[0]["text"] + out[1]["text"]) == _SKEL(LONG_SRC)
+    assert out[2] == {"speaker": "林某", "text": "短。", "instruct": "x"}
+    # 零命中 → 原列表对象 + 0
+    short = [{"speaker": "NARRATOR", "text": "短。", "instruct": ""}]
+    out2, n2 = split_long_entries(short, 200, is_chapter_title)
+    assert out2 is short and n2 == 0
+
+
+def test_absorb_punct_entries_unit():
+    N = lambda t: {"speaker": "NARRATOR", "text": t, "instruct": ""}
+    # 并入前邻（追加到其尾）
+    out, a, d = absorb_punct_entries(
+        [N("夜色。"), N("……"), {"speaker": "林某", "text": "你好。", "instruct": ""}],
+        is_chapter_title)
+    assert (a, d) == (1, 0)
+    assert [(x["speaker"], x["text"]) for x in out] == [
+        ("NARRATOR", "夜色。……"), ("林某", "你好。")]
+    # 无前邻 NARRATOR → 并入后邻（置于其开头）
+    out, a, d = absorb_punct_entries(
+        [{"speaker": "林某", "text": "你好。", "instruct": ""}, N("……"), N("夜色。")],
+        is_chapter_title)
+    assert (a, d) == (1, 0)
+    assert out[1]["text"] == "……夜色。"
+    # 无 NARRATOR 邻接 → 删除
+    out, a, d = absorb_punct_entries(
+        [{"speaker": "林某", "text": "你好。", "instruct": ""}, N("？"),
+         {"speaker": "李四", "text": "嗯。", "instruct": ""}],
+        is_chapter_title)
+    assert (a, d) == (0, 1)
+    assert len(out) == 2
+    # 标题守卫：邻接条目是章标题 → 不吸收（此处无其他邻接 → 删除）
+    out, a, d = absorb_punct_entries([N("第 5 章 风暴"), N("……")], is_chapter_title)
+    assert (a, d) == (0, 1) and out[0]["text"] == "第 5 章 风暴"
+    # 前邻普通 NARRATOR、后邻标题 → 吸收前邻（前邻优先）
+    out, a, d = absorb_punct_entries(
+        [N("夜色。"), N("……"), N("第 5 章 风暴")], is_chapter_title)
+    assert (a, d) == (1, 0) and out[0]["text"] == "夜色。……"
+    # 纯标点链（punct, punct, NARR）：逐跳并入、内容不丢失
+    out, a, d = absorb_punct_entries([N("……"), N("？"), N("夜色。")], is_chapter_title)
+    assert (a, d) == (1, 0)
+    assert _SKEL("".join(x["text"] for x in out)) == _SKEL("……？夜色。")
+    # 同一目标两侧吸收（punct, NARR, punct）→ 累加
+    out, a, d = absorb_punct_entries([N("……"), N("夜色。"), N("？")], is_chapter_title)
+    assert (a, d) == (2, 0)
+    assert out == [N("……夜色。？")]
+    # 零命中 → 原列表对象
+    plain = [{"speaker": "林某", "text": "你好。", "instruct": ""}]
+    out, a, d = absorb_punct_entries(plain, is_chapter_title)
+    assert out is plain and (a, d) == (0, 0)
+    # 输入列表不动
+    src = [N("夜色。"), N("……")]
+    absorb_punct_entries(src, is_chapter_title)
+    assert src[0]["text"] == "夜色。" and src[1]["text"] == "……"
+
+
+def test_long_resplit_zero_hit_leaves_log(monkeypatch):
+    # 零命中：一行「0 条…（无 LLM 重切，零 LLM 调用）」日志、零调用、原列表对象
+    def boom(*a, **k):
+        raise AssertionError("no LLM call may happen")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    entries = [{"speaker": "NARRATOR", "text": "短文本。", "instruct": ""}]
+    handle = _LogHandle()
+    out, checked, fixed = long_paragraph_resplit(
+        handle, _LLM, GenerationConfig(), "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}",
+        entries, 200)
+    assert out is entries and (checked, fixed) == (0, 0)
+    assert handle.logs == [("INFO", "超长段落检查：0 条超过 200 字条目（无 LLM 重切，零 LLM 调用）")]
+
+
+def test_long_resplit_majority_replaces_entry(monkeypatch):
+    # 一条超长条目（213 字）→ 2 次相同重切回复（2:0 即止）→ 整体替换为 3 条；
+    # 上下文窗口带「LONGER than 200 characters」注记 + 花名册。
+    entries = [
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+        {"speaker": "林某", "text": "我先走了。", "instruct": "c"},
+    ]
+    resplit = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_HEAD, "instruct": "g"},
+        {"speaker": "林某", "text": "我们明天再谈。", "instruct": "h"},
+        {"speaker": "NARRATOR", "text": "他点了点头。", "instruct": "i"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+    seen_users = []
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        seen_users.append(user)
+        return _BodyResp(_chat_payload(resplit))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    handle = _LogHandle()
+    out, checked, fixed = long_paragraph_resplit(
+        handle, _LLM, GenerationConfig(check_context_window=1),
+        "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}", entries, 200)
+    assert calls["n"] == 2  # 2:0 严格多数即止
+    assert (checked, fixed) == (1, 1)
+    assert [(x["speaker"], x["text"]) for x in out] == [
+        ("NARRATOR", LONG_HEAD), ("林某", "我们明天再谈。"),
+        ("NARRATOR", "他点了点头。"), ("林某", "我先走了。")]
+    assert entries[0]["text"] == LONG_SRC  # 原列表对象保持原样
+    # 窗口：超长注记 + 花名册 + 后邻上下文条
+    user = seen_users[0]
+    assert "LONGER than 200 characters" in user
+    assert "Characters in this book: 林某" in user
+    assert "我先走了" in user
+    assert any("条目 1（超长 212 字）" in m for _l, m in handle.logs)
+
+
+def test_long_resplit_no_consensus_keeps_entry(monkeypatch):
+    # 4 次回复均未过忠实性门（角色不在花名册）→ 零票、4 次后保留原条目（从不猜）
+    entries = [
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+        {"speaker": "林某", "text": "我先走了。", "instruct": "c"},
+    ]
+    bad = json.dumps([{"speaker": "陌生人", "text": LONG_SRC}], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        if calls["n"] > 4:
+            raise AssertionError(f"LLM called {calls['n']} times, expected 4")
+        return _BodyResp(_chat_payload(bad))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    handle = _LogHandle()
+    out, checked, fixed = long_paragraph_resplit(
+        handle, _LLM, GenerationConfig(), "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}",
+        entries, 200)
+    assert calls["n"] == 4
+    assert out is entries and (checked, fixed) == (1, 0)
+    assert any("超长段落重切4 次仍无共识" in m for _l, m in handle.logs)
+
+
+def test_long_resplit_cancel_propagates(monkeypatch):
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload("[]"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    entries = [{"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"}]
+    with pytest.raises(TaskCancelled):
+        long_paragraph_resplit(
+            _Handle(cancelled=True), _LLM, GenerationConfig(),
+            "sys", "CTX={context}\nSOURCE TEXT:\n{chunk}", entries, 200)
+    assert calls["n"] == 0  # 取消在任何调用之前上抛
+
+
+def test_generate_file_long_paragraph_llm_resplit(tmp_path, monkeypatch, workspace):
+    # A 段 LLM 重切路径 e2e：1 解析 + 2 重切（2:0）= 3 次调用；重切后全部 ≤ 200 字
+    # → 机械分段 0 条（long_split=0）。
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+        {"speaker": "林某", "text": "我先走了。", "instruct": "c"},
+    ], ensure_ascii=False)
+    resplit_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_HEAD, "instruct": "g"},
+        {"speaker": "林某", "text": "我们明天再谈。", "instruct": "h"},
+        {"speaker": "NARRATOR", "text": "他点了点头。", "instruct": "i"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        chunk = user.rsplit("SOURCE TEXT:", 1)[1].strip()
+        if chunk == LONG_SRC:
+            return _BodyResp(_chat_payload(resplit_reply))
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "longchap.txt"
+    src.write_bytes((LONG_SRC + "\n我先走了。\n").encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(chunk_size=5000, revalidate_splits=False,
+                         delete_saying_tags=False, spot_check_rate=0.0,
+                         check_boundary_speakers=False),
+    )
+    assert calls["n"] == 3
+    assert result["long_checked"] == 1 and result["long_fixed"] == 1
+    assert result["long_split"] == 0  # LLM 重切后已在上限内
+    assert all(len(e["text"].strip()) <= 200 for e in result["entries"])
+    out = json.loads((workspace / "03_parsed_json" / "longchap.json").read_text("utf-8"))
+    assert [(e["speaker"], e["text"]) for e in out[:3]] == [
+        ("NARRATOR", LONG_HEAD), ("林某", "我们明天再谈。"), ("NARRATOR", "他点了点头。"),
+    ]
+    assert out[0]["instruct"] == "g"
+
+
+def test_generate_file_long_paragraph_mech_fallback(tmp_path, monkeypatch, workspace):
+    # A 段机械兜底路径 e2e：重切回复 = 原样单条（同人独白过不了多主体门）→ 投票
+    # 采纳（long_fixed=1）后仍 212 字 → 机械分段切开（long_split=1）；硬保证成立。
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+        {"speaker": "林某", "text": "我先走了。", "instruct": "c"},
+    ], ensure_ascii=False)
+    resplit_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        user = json.loads(req.data.decode("utf-8"))["messages"][1]["content"]
+        chunk = user.rsplit("SOURCE TEXT:", 1)[1].strip()
+        if chunk == LONG_SRC:
+            return _BodyResp(_chat_payload(resplit_reply))
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "longchap.txt"
+    src.write_bytes((LONG_SRC + "\n我先走了。\n").encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(chunk_size=5000, revalidate_splits=False,
+                         delete_saying_tags=False, spot_check_rate=0.0,
+                         check_boundary_speakers=False),
+    )
+    assert calls["n"] == 3
+    assert result["long_checked"] == 1 and result["long_fixed"] == 1
+    assert result["long_split"] == 1
+    assert result["count"] == 3  # 2 段切分 + 1 台词条
+    out = json.loads((workspace / "03_parsed_json" / "longchap.json").read_text("utf-8"))
+    assert all(len(e["text"].strip()) <= 200 for e in out)  # 硬保证
+    assert _SKEL(out[0]["text"] + out[1]["text"]) == _SKEL(LONG_SRC)
+    assert out[0]["speaker"] == "NARRATOR" and out[1]["speaker"] == "NARRATOR"
+    assert out[0]["instruct"] == "a" and out[1]["instruct"] == ""
+    assert out[2] == {"speaker": "林某", "text": "我先走了。", "instruct": "c"}
+    # 机械合并不会回粘（切段和 213 > 100）
+    assert result["merged_narrator"] == 0
+
+
+def test_generate_file_long_paragraph_off_skips_stage(tmp_path, monkeypatch, workspace):
+    # check_long_paragraphs=False → 整体跳过（含机械分段）：零重切调用、超长条目
+    # 原样落盘、结果字段全 0、一行「已关闭（配置）」日志。
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": LONG_SRC, "instruct": "a"},
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def urlopen(req, *a, **k):
+        calls["n"] += 1
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "longchap.txt"
+    src.write_bytes(LONG_SRC.encode("utf-8"))
+    handle = _LogHandle()
+    result = generate_file(
+        handle, str(src), _LLM, PromptsConfig(),
+        GenerationConfig(chunk_size=5000, revalidate_splits=False,
+                         delete_saying_tags=False, spot_check_rate=0.0,
+                         check_boundary_speakers=False, check_long_paragraphs=False),
+    )
+    assert calls["n"] == 1  # 只有解析
+    assert result["long_checked"] == 0 and result["long_fixed"] == 0
+    assert result["long_split"] == 0
+    out = json.loads((workspace / "03_parsed_json" / "longchap.json").read_text("utf-8"))
+    assert out[0]["text"] == LONG_SRC  # 超长条目原样（开关关闭 = 不做任何处理）
+    assert any("超长段落检查已关闭（配置）" in m for _l, m in handle.logs)
+
+
+def test_generate_file_absorb_punct_e2e(tmp_path, monkeypatch, workspace):
+    # B 段 e2e：解析产物含独立「……」NARRATOR 条 → 并入前邻（punct_absorbed=1）。
+    parse_reply = json.dumps([
+        {"speaker": "NARRATOR", "text": "夜色像潮水一样漫进街巷。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "……", "instruct": "b"},
+        {"speaker": "林某", "text": "你好。", "instruct": "c"},
+    ], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "punct.txt"
+    src.write_bytes("夜色像潮水一样漫进街巷。\n……\n林某：你好。\n".encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(revalidate_splits=False, delete_saying_tags=False,
+                         spot_check_rate=0.0, check_boundary_speakers=False,
+                         check_long_paragraphs=False),
+    )
+    assert result["punct_absorbed"] == 1 and result["punct_deleted"] == 0
+    out = json.loads((workspace / "03_parsed_json" / "punct.json").read_text("utf-8"))
+    assert out[0]["text"] == "夜色像潮水一样漫进街巷。……"
+    assert result["count"] == 2
+
+
+def test_generate_file_absorb_punct_off_keeps_entry(tmp_path, monkeypatch, workspace):
+    # absorb_punct_entries=False → 纯标点条保留（此处无 NARRATOR 邻接可合并）；
+    # 对照：开关开时 = 删除（punct_deleted=1）。
+    parse_reply = json.dumps([
+        {"speaker": "林某", "text": "你好。", "instruct": "a"},
+        {"speaker": "NARRATOR", "text": "……", "instruct": "b"},
+        {"speaker": "李四", "text": "嗯。", "instruct": "c"},
+    ], ensure_ascii=False)
+
+    def urlopen(req, *a, **k):
+        return _BodyResp(_chat_payload(parse_reply))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (workspace / "02_split_text").mkdir(parents=True)
+    src = workspace / "02_split_text" / "punctoff.txt"
+    src.write_bytes("林某：你好。\n……\n李四：嗯。\n".encode("utf-8"))
+    result = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(revalidate_splits=False, delete_saying_tags=False,
+                         spot_check_rate=0.0, check_boundary_speakers=False,
+                         check_long_paragraphs=False, absorb_punct_entries=False),
+    )
+    assert result["punct_absorbed"] == 0 and result["punct_deleted"] == 0
+    out = json.loads((workspace / "03_parsed_json" / "punctoff.json").read_text("utf-8"))
+    assert [e["text"] for e in out] == ["你好。", "……", "嗯。"]
+
+    # 对照（开关开）：无 NARRATOR 邻接 → 删除
+    result2 = generate_file(
+        _Handle(), str(src), _LLM, PromptsConfig(),
+        GenerationConfig(revalidate_splits=False, delete_saying_tags=False,
+                         spot_check_rate=0.0, check_boundary_speakers=False,
+                         check_long_paragraphs=False),
+    )
+    assert result2["punct_deleted"] == 1
+    out2 = json.loads((workspace / "03_parsed_json" / "punctoff.json").read_text("utf-8"))
+    assert [e["text"] for e in out2] == ["你好。", "嗯。"]
+
+
+# --------------------------------------------------------------------------- #
 # generate_file 槽位作用域（预备阶段不占槽；chunk 循环一结束即 release；排队可即时取消）
 # --------------------------------------------------------------------------- #
 
@@ -2468,7 +2905,10 @@ def test_generate_file_slot_scope(tmp_path, monkeypatch, workspace):
     # release 先于检查阶段入口（phase("check") 标记 + progress 0.9 文案）——预取补位点
     # （引擎先发 phase 后发 progress，两者都在 release 之后；相对次序无功能意义）。
     # 源为单段 → 角色匹配检查无内部边界、静默零调用，不产生额外事件。
-    check_mark = pos("progress", "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 归属抽样）")
+    check_mark = pos(
+        "progress",
+        "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 超长段落检查 / 归属抽样 / 纯标点吸收）",
+    )
     assert pos("release", None) < pos("phase", "check")
     assert pos("release", None) < check_mark
     # 100% 只在真正完成时出现，且是最后一条事件。

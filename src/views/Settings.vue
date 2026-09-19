@@ -294,12 +294,33 @@ async function save() {
               <Label class="font-normal">纯归属标签删除</Label>
               <Switch v-model="draft.generation.delete_saying_tags" />
             </div>
+            <div class="flex items-center justify-between">
+              <div class="flex flex-col">
+                <Label class="font-normal">超长段落检查</Label>
+                <span class="text-xs text-muted-foreground">
+                  超长条目先 LLM 语义重切、后机械分段兜底
+                </span>
+              </div>
+              <div class="flex items-center gap-2">
+                <Input
+                  v-model.number="draft.generation.max_paragraph_chars"
+                  type="number" min="10" step="10" class="w-20"
+                />
+                <Switch v-model="draft.generation.check_long_paragraphs" />
+              </div>
+            </div>
+            <div class="flex items-center justify-between">
+              <Label class="font-normal">纯标点条目吸收</Label>
+              <Switch v-model="draft.generation.absorb_punct_entries" />
+            </div>
           </div>
           <p class="text-xs text-muted-foreground">
-            解析内的三个检查阶段：角色匹配检查（chunk 切割会切断跨段上下文，用跨 chunk 上下文窗口
+            解析内的五个检查阶段：角色匹配检查（chunk 切割会切断跨段上下文，用跨 chunk 上下文窗口
             重判边界两侧条目，上下文仅辅助判断、只有目标条目可被修改）、断句失败校验（疑似断句失败的
-            条目逐条重判）与纯归属标签删除（独立短标签条确定性删除，不经 LLM）。关闭 = 解析时跳过该
-            阶段并记录日志。
+            条目逐条重判）、纯归属标签删除（独立短标签条确定性删除，不经 LLM）、超长段落检查
+            （超过右侧字数上限的条目先带上下文重跑 LLM 重切，仍超长则按句界 / 子句界 / 定宽机械
+            切开——硬保证最终没有任何段落超过上限）、纯标点条目吸收（整条无内容的「……」类条目
+            并入相邻 NARRATOR，无邻接则删除）。关闭 = 解析时跳过该阶段并记录日志。
           </p>
         </CardContent>
       </Card>

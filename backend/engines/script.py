@@ -1453,7 +1453,7 @@ def _batch_user_prompt(template: str, context: str, size: int, n: int,
 
 
 def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, context,
-                     roster) -> list | None:
+                     roster, stage: str = "断句校验") -> list | None:
     """Re-run the parse LLM on one flagged entry and resolve the re-derivation by
     majority vote — the 角色匹配检查 consensus rule: one first call plus two retries
     (three total), early-stopping the instant a strict majority is decided, and one
@@ -1465,7 +1465,8 @@ def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, c
     panel). Each reply is gated by :func:`_reparse_vote`; a failed call, an
     unparseable reply, or a gate failure contributes no vote. Returns the winning
     re-derived entries (the raw reply dicts), or ``None`` when no consensus forms —
-    the caller then keeps the entry unchanged.
+    the caller then keeps the entry unchanged. ``stage`` = the log label（断句校验 /
+    超长段落重切 等复用方传各自文案）.
     """
     messages = [
         {"role": "system", "content": sys_prompt},
@@ -1483,16 +1484,16 @@ def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, c
         except TaskCancelled:
             raise  # a cancel raised mid-stream must propagate, not be swallowed
         except Exception as e:  # noqa: BLE001 — a failed call contributes no vote
-            handle.log(f"  断句校验第 {attempt} 次调用失败，本轮无票：{e}", "WARNING")
+            handle.log(f"  {stage}第 {attempt} 次调用失败，本轮无票：{e}", "WARNING")
             return
         parts = _parse_entries_reply(reply)
         if not parts:
-            handle.log(f"  断句校验第 {attempt} 次响应无法解析为条目数组，本轮无票", "WARNING")
+            handle.log(f"  {stage}第 {attempt} 次响应无法解析为条目数组，本轮无票", "WARNING")
             return
         sig = _reparse_vote(parts, entry, roster)
         if sig is None:
             handle.log(
-                f"  断句校验第 {attempt} 次结果未通过忠实性校验"
+                f"  {stage}第 {attempt} 次结果未通过忠实性校验"
                 f"（文字无法拼回原文 / 角色不在花名册），本轮无票",
                 "WARNING",
             )
@@ -1506,12 +1507,12 @@ def revalidate_entry(handle, llm, generation, sys_prompt, usr_template, entry, c
             break  # 多数已决（2:0 / 2:1）——剩余调用无法翻盘，省掉
     if _pick_majority(votes) is None:
         # 没决出来（1:1:1 或有效票不足）→ 再跑第四次
-        handle.log("  断句校验 3 次无共识 → 再跑第 4 次")
+        handle.log(f"  {stage}3 次无共识 → 再跑第 4 次")
         handle.check()
         one_vote(4)
     winner = _pick_majority(votes)
     if winner is None:
-        handle.log("  断句校验 4 次仍无共识，条目保持原样", "WARNING")
+        handle.log(f"  {stage}4 次仍无共识，条目保持原样", "WARNING")
         return None
     return parts_by_sig[winner]
 
@@ -1603,6 +1604,320 @@ def validate_sentence_splits(handle, llm, generation, sys_prompt, usr_template, 
         else:
             handle.log(f"条目 {i + 1} 校验通过：重写为单条（剥离包裹引号 / 语气标签）")
     return (updated if updated is not None else entries), len(flagged), fixed
+
+
+# ---------------------------------------------------------------------------
+# 超长段落检查（解析内阶段 A，两半：LLM 重切 + 机械分段兜底）
+#
+# 前半 ``long_paragraph_resplit``：超过 ``max_paragraph_chars`` 字的条目是「文本切割
+# 失败」的嫌疑（旁白与台词合并成一条 / 多段叙述未拆开）→ 带上下文窗口重跑解析 LLM，
+# 经共享重判批协议（:func:`revalidate_entry`）严格多数裁决——忠实性门要求多段需
+# ≥2 个不同 speaker，故**同一说话人的长篇独白「拆分」无票**，超长会留到后半兜底
+# （分工是特性：LLM 管语义边界，机械保证长度上界）。
+# 后半 ``split_long_entries``：无论 LLM 改过与否，仍超长的条目确定性切分——
+# 三级边界逐级放宽（句末 → 子句界 → 定宽硬切），切点要求引号安全（防悬空引号被
+# TTS 念出），硬保证最终没有任何条目超过 ``max_paragraph_chars``
+# （硬约束 > 「不拦腰截句」，硬切是最后一级）。
+# ---------------------------------------------------------------------------
+
+
+def long_entry_indices(entries: list, max_chars: int) -> list[int]:
+    """整条 text（strip 后 Unicode 码点数）超过 ``max_chars`` 的条目下标。"""
+    return [
+        i for i, e in enumerate(entries)
+        if isinstance(e, dict) and len((e.get("text") or "").strip()) > max_chars
+    ]
+
+
+def long_paragraph_resplit(handle, llm, generation, sys_prompt, usr_template, entries,
+                           max_chars, context_window=4) -> tuple:
+    """超长条目的 LLM 重切（解析内，纯归属标签删除之后、归属抽样之前——重切可能
+    产生新归属的台词条目，需要被抽样审计；受 ``generation.check_long_paragraphs``
+    门控，由 ``generate_file`` 判断）。
+
+    每条超过 ``max_chars`` 字的条目重跑解析 LLM（±n 上下文窗口，与断句失败校验
+    同一形态），经 :func:`revalidate_entry`（stage = 超长段落重切）严格多数裁决：
+    胜出整体替换条目——单条胜出 = 干净重写（条目可能仍超长，由机械分段兜底），
+    多条胜出 = 语义重切；4 次无共识保留原条目（**从不猜**）。全部窗口 + 花名册
+    按**原始**条目列表预建，胜出者按**降序下标**应用（重切 1→N 不移动更小下标
+    条目的窗口）。取消立即上抛、不落盘任何文件（基文件在全部阶段返回后才写）。
+
+    返回 ``(entries, checked, fixed)`` —— 更新后的列表（无修改时原列表对象）、
+    送 LLM 的超长条目数、被替换的条目数。
+    """
+    max_chars = max(10, int(max_chars))
+    flagged = long_entry_indices(entries, max_chars)
+    if not flagged:
+        # 零命中也留一行日志（与其余阶段同一纪律：静默退出会被误读成阶段缺失）
+        handle.log(f"超长段落检查：0 条超过 {max_chars} 字条目（无 LLM 重切，零 LLM 调用）")
+        return entries, 0, 0
+
+    n = max(0, int(context_window))
+    roster = frozenset({"NARRATOR", *build_roster(entries)})
+    # All windows + context strings up front — from the pristine list.
+    contexts = {}
+    for i in flagged:
+        window = build_batch_window(entries, i, 1, n)
+        lines = [
+            "(Re-check of one entry: the SOURCE TEXT below is a single entry's stored "
+            f"text that is LONGER than {max_chars} characters — likely a failed split "
+            "that left narration and dialogue (or several paragraphs) in one entry. "
+            "Re-derive its entries exactly as if it were source text, splitting at "
+            "every utterance / scene boundary.)",
+        ]
+        if roster:
+            lines.append("Characters in this book: " + ", ".join(sorted(roster - {"NARRATOR"})))
+        before = [it for it in window if it["index"] < i]
+        after = [it for it in window if it["index"] > i]
+        if before:
+            lines.append("Entries immediately before it (context only — never re-emit them):")
+            lines.extend(json.dumps(it, ensure_ascii=False) for it in before)
+        if after:
+            lines.append("Entries immediately after it (context only — never re-emit them):")
+            lines.extend(json.dumps(it, ensure_ascii=False) for it in after)
+        contexts[i] = "\n".join(lines)
+
+    handle.log(
+        f"超长段落检查：{len(flagged)} 条超过 {max_chars} 字条目，"
+        f"逐条带上下文窗口（±{n} 条）重跑 LLM 重切…"
+    )
+    # The mechanical check stages share the [0.9, 1.0) progress band (see
+    # generate_file): this stage shares the [0.96, 0.98) band with
+    # sentence-split validation (runs after it in time, no overlap).
+    updated = None
+    fixed = 0
+    # Descending index order: applying a re-split (1 → N entries) never shifts the
+    # index a LATER (lower) entry's already-built window refers to.
+    for seq, i in enumerate(sorted(flagged, reverse=True), 1):
+        handle.check()
+        handle.progress(0.96 + 0.02 * seq / len(flagged), f"超长段落重切 {seq}/{len(flagged)}")
+        snippet = (entries[i].get("text") or "").replace("\n", " ")
+        text_len = len((entries[i].get("text") or "").strip())
+        handle.log(f"条目 {i + 1}（超长 {text_len} 字）：{snippet[:40]}{'…' if len(snippet) > 40 else ''}")
+        parts = revalidate_entry(handle, llm, generation, sys_prompt, usr_template,
+                                 entries[i], contexts[i], roster, stage="超长段落重切")
+        if parts is None:
+            continue  # 无共识 / 未过忠实性门 → 条目保持原样（机械分段兜底）
+        if updated is None:
+            updated = list(entries)
+        updated[i:i + 1] = [
+            {
+                "speaker": (p.get("speaker") or "").strip(),
+                "text": p.get("text") or "",
+                "instruct": p.get("instruct") or "",
+            }
+            for p in parts
+        ]
+        fixed += 1
+        if len(parts) > 1:
+            speakers = "、".join(dict.fromkeys(
+                (p.get("speaker") or "").strip() for p in parts))
+            handle.log(f"条目 {i + 1} 重切通过：拆分为 {len(parts)} 条（{speakers}）")
+        else:
+            handle.log(f"条目 {i + 1} 重切通过：重写为单条（仍超长则由机械分段兜底）")
+    return (updated if updated is not None else entries), len(flagged), fixed
+
+
+# --- 机械分段兜底（确定性，零 LLM 成本） ---
+
+_SENT_END_RE = re.compile(r"(?<=[。！？!?…])|(?<=[.!?])(?=\s)")
+_CLAUSE_END_RE = re.compile(r"(?<=[，、；：,;:])")
+_OPEN_QUOTE_CHARS = frozenset(op for op, _cl in _QUOTE_PAIRS)
+_CLOSE_QUOTE_CHARS = frozenset(cl for _op, cl in _QUOTE_PAIRS)
+
+
+def _quote_parity(text: str) -> list:
+    """引号奇偶前缀：``par[i]`` = ``text[:i]`` 内开引号数 − 闭引号数。
+
+    切点 ``i``（相对起点 ``start``）引号安全 = ``par[i] == par[start]``——切点前的
+    段不以悬空开引号结尾（悬空开引号留在段尾会被 TTS 照念或读成转义）。
+    """
+    par = [0] * (len(text) + 1)
+    for i, ch in enumerate(text):
+        d = 0
+        if ch in _OPEN_QUOTE_CHARS:
+            d = 1
+        elif ch in _CLOSE_QUOTE_CHARS:
+            d = -1
+        par[i + 1] = par[i] + d
+    return par
+
+
+def split_long_text(text: str, max_chars: int) -> list[str]:
+    """把超长 ``text`` 机械切成若干段，每段 strip 后 ≤ ``max_chars``（Unicode 码点数）。
+
+    三级边界逐级放宽（只在起点后 ``max_chars`` 字内找切点，取**最接近目标宽度**
+    ``start + max_chars`` 的合法候选、平手取较小偏移——段尽量填满上限）：
+
+    ① 句末（CJK ``[。！？!?…]`` 零宽 / ASCII ``[.!?]`` 须后随空白——与
+       ``split_into_chunks`` 同一口径，保护 ``3.14`` / ``e.g.``）
+    ② 子句界（``[，、；：,;:]``）
+    ③ 定宽硬切（最后手段：「绝不出现超长条目」的硬保证高于「不拦腰截句」——
+       切点先查 ±20 字窗内的引号安全位，找不到才裸定宽切）
+
+    ①② 的切点要求**引号安全**（引号奇偶与起点一致，见 :func:`_quote_parity`），
+    不安全则让位下一级。
+
+    不变量：各段去空白拼接骨架 == 原文骨架（无损）；每段 ≤ ``max_chars``；
+    切点严格前进、必然终止。短文本（≤ ``max_chars``）原样单段返回。
+    ``max_chars ≤ 0`` 钳 10（退化值无意义）。
+    """
+    max_chars = max(10, int(max_chars))
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    par = _quote_parity(text)
+    out: list[str] = []
+    start = 0
+    while True:
+        rem = text[start:]
+        if len(rem.strip()) <= max_chars:
+            out.append(rem.strip())
+            break
+        # 前 max_chars 字内找**最接近目标宽度**（start + max_chars）的合法切点——
+        # 段尽量填满上限（平手取较小偏移，与 split_into_chunks 同口径）；tier 内
+        # 无任何候选才让位下一 tier。
+        target = start + max_chars
+        best = None
+        for tier in (_SENT_END_RE, _CLAUSE_END_RE):
+            cands = []
+            for m in tier.finditer(text):
+                b = m.end()
+                if b <= start:
+                    continue
+                if b - start > max_chars:
+                    break
+                if par[b] != par[start]:
+                    continue  # 引号不安全 → 跳过该候选
+                if not text[start:b].strip() or not text[b:].strip():
+                    continue
+                cands.append(b)
+            if cands:
+                best = min(cands, key=lambda b: (abs(b - target), b))
+                break
+        if best is not None:
+            cut = best
+        else:
+            # 定宽硬切：±20 字窗内找引号安全位（取离定宽位最近者），找不到裸切。
+            cut = start + max_chars
+            lo, hi = max(start + 1, cut - 20), min(len(text), cut + 20)
+            safe = [p for p in range(lo, hi + 1) if par[p] == par[start]]
+            if safe:
+                cut = min(safe, key=lambda p: (abs(p - cut), p > cut))
+        piece = text[start:cut].strip()
+        if not piece:  # 退化：定宽窗内全空白（实际语料不会出现）→ 推到首字
+            while cut < len(text) and not text[start:cut].strip():
+                cut += 1
+            piece = text[start:cut].strip()
+        out.append(piece)
+        start = cut
+    return out
+
+
+def split_long_entries(entries: list, max_chars: int, title_test) -> tuple:
+    """超长条目的机械分段（确定性兜底，解析内阶段 A 的后半，归属抽样之后——
+    speaker 已定稿，切段只继承父条目的 speaker / instruct；受
+    ``generation.check_long_paragraphs`` 门控，由 ``generate_file`` 判断）。
+
+    对每条仍超过 ``max_chars`` 的条目调 :func:`split_long_text`：speaker /
+    instruct 继承（instruct 只给首段——声音指导随段重复会重复朗读），**非级联**
+    单遍（切出的段恒 ≤ ``max_chars``，不会再触发）。
+
+    与 ``merge_adjacent_narrator``（<100 字上限）的交互安全：本阶段在其**之后**
+    运行、只切 > ``max_chars``（默认 200）的条目 → 相邻段和 > 200 > 100，切出的段
+    绝不会被回粘合并回去。硬保证：返回后没有任何条目（strip 后）超过 ``max_chars``。
+
+    返回 ``(entries, split_count)`` —— 更新后的列表（无修改时原列表对象）、
+    被切分的条目数（切出的段总数 = 原条目数 + 各段增量，不在返回值里——日志带
+    逐条明细）。
+    """
+    max_chars = max(10, int(max_chars))
+    flagged = long_entry_indices(entries, max_chars)
+    if not flagged:
+        # 零命中也留一行日志（本半在 generate_file 的日志行之后，此处不重复）
+        return entries, 0
+    updated = list(entries)
+    split_count = 0
+    for i in sorted(flagged):
+        e = entries[i]
+        parts = split_long_text(e.get("text") or "", max_chars)
+        if len(parts) < 2:
+            continue
+        speaker = (e.get("speaker") or "").strip()
+        instruct = e.get("instruct") or ""
+        updated[i:i + 1] = [
+            {"speaker": speaker, "text": p, "instruct": instruct if k == 0 else ""}
+            for k, p in enumerate(parts)
+        ]
+        split_count += 1
+    return updated, split_count
+
+
+def absorb_punct_entries(entries: list, title_test) -> tuple:
+    """纯标点 / 无内容条目的吸收（解析内阶段 B，确定性零 LLM 成本；受
+    ``generation.absorb_punct_entries`` 门控，由 ``generate_file`` 判断）。
+
+    整条无任何词字符的条目（独立「……」/「？」/「…………」等——文本筛查报告里的
+    32 段纯标点 NARRATOR）对 TTS 只是一次停顿 + 两次换人停顿。处置：并入相邻
+    NARRATOR 条目（前邻优先，无前邻则后邻；**标题守卫**——``title_test`` 命中的
+    邻接条目不吸收：标题两侧是章节分界停顿）；无 NARRATOR 邻接 → 删除。
+    单遍非级联（邻接按删除前列表判定，与纯归属标签删除同一保守口径）；text
+    直接拼接（并入前邻 = 追加到其尾，并入后邻 = 置于其开头）。相邻的纯标点
+    条目链（punct, punct, NARRATOR）逐跳并入同一目标、内容不丢失。
+
+    返回 ``(entries, absorbed, deleted)`` —— 更新后的列表（无修改时原列表对象）、
+    被并入的条目数、被删除的条目数。
+    """
+    flagged = [
+        i for i, e in enumerate(entries)
+        if isinstance(e, dict) and not _skeleton((e.get("text") or "").strip())
+    ]
+    if not flagged:
+        return entries, 0, 0
+    texts = {i: (entries[i].get("text") or "").strip() for i in range(len(entries))}
+    removed: set = set()
+    consumed: set = set()  # 被吸收成目标的 flagged 条目（留盘、不再处理，防链式丢文本）
+    changed: dict = {}  # target index → 合并后的 text（可被多次吸收累加）
+    absorbed = deleted = 0
+    for i in sorted(flagged):
+        if i in removed or i in consumed:
+            continue
+        t = texts[i]
+        target = -1
+        for nb in (i - 1, i + 1):
+            if nb < 0 or nb >= len(entries) or nb in removed:
+                continue
+            nb_e = entries[nb]
+            if not isinstance(nb_e, dict):
+                continue
+            if (nb_e.get("speaker") or "").strip() != "NARRATOR":
+                continue
+            if title_test((nb_e.get("text") or "").strip()):
+                continue  # 标题两侧不吸收
+            target = nb
+            break
+        if target < 0:
+            removed.add(i)
+            deleted += 1
+            continue
+        cur = changed.get(target, texts[target])
+        changed[target] = (cur + t) if target == i - 1 else (t + cur)
+        if target in flagged:
+            # 目标本身也是纯标点条（尚未处理）：标记为已消费——它留在输出里承载
+            # 合并文本，跳过其自身的 flagged 处理（防链式吸收用旧文本覆盖丢内容）。
+            consumed.add(target)
+        removed.add(i)
+        absorbed += 1
+    if not removed:
+        return entries, 0, 0
+    out = []
+    for i, e in enumerate(entries):
+        if i in removed:
+            continue
+        if i in changed:
+            e = {**e, "text": changed[i]}
+        out.append(e)
+    return out, absorbed, deleted
 
 
 # ---------------------------------------------------------------------------
@@ -2237,13 +2552,14 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
     a task holds ONE slot for the **LLM chunk-parse stage only**: file read /
     decode / chunk-split happen before taking the slot (prep, so prefetched files
     from an ordered dispatch can be ready before their turn), and the slot is
-    released the moment the chunk loop ends, so the four mechanical check stages
+    released the moment the chunk loop ends, so the six mechanical check stages
     (whose re-judgment LLM calls are comparatively rare) run slot-free and a
     prefetched file can take the freed slot immediately. The result is written to
     ``03_parsed_json/<source-stem>.json`` (one file per source, no scratch dir).
     Progress is scaled so 100% means done: the parse stage owns [0, 0.9) and the
     check stages own [0.9, 1.0] (boundary check [0.9, 0.96), re-validation
-    [0.96, 0.98), spot audit [0.98, 0.998)).
+    [0.96, 0.98), long-paragraph re-split [0.96, 0.98) — time-disjoint from
+    re-validation, spot audit [0.98, 0.998)).
     ``llm`` / ``prompts`` / ``generation`` are the config section objects; empty
     ``prompts`` fall back to the bundled defaults.
 
@@ -2384,7 +2700,10 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
         gate().release()
         slot_released = True
         handle.phase("check")
-        handle.progress(0.9, "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 归属抽样）")
+        handle.progress(
+            0.9,
+            "机械检查（角色匹配检查 / 断句校验 / 标签删除 / 超长段落检查 / 归属抽样 / 纯标点吸收）",
+        )
 
         # 角色匹配检查（检查段最前——断句校验拆条、标签删除删条都会移动下标，
         # 本阶段窗口必须取自 pristine 列表）：用跨边界窗口重判每个内部 chunk
@@ -2433,6 +2752,22 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             handle.log("纯归属标签条删除已关闭（配置）——本任务跳过该阶段")
             tags_deleted, deleted_tag_texts = 0, []
 
+        # 超长段落检查·LLM 重切（归属抽样之前——重切可能产生新归属的台词条目，
+        # 需要被抽样审计；同一说话人的长篇独白「拆分」过不了重判忠实性门，
+        # 超长会留到本阶段后半的机械分段兜底——分工是特性：LLM 管语义边界，
+        # 机械保证长度硬上界）：超过 max_paragraph_chars 字的条目带上下文窗口
+        # 重跑解析 LLM，严格多数胜出者整体替换条目（4 次无共识保留原样，从不猜）。
+        max_para = int(generation.max_paragraph_chars or 200)
+        if generation.check_long_paragraphs:
+            all_entries, long_checked, long_fixed = long_paragraph_resplit(
+                handle, llm, generation, sys_prompt, usr_template, all_entries,
+                max_para, context_window=int(generation.check_context_window or 0),
+            )
+        else:
+            # 开关关闭：整体跳过并留一行日志（含机械分段兜底），结果字段保持 0。
+            handle.log("超长段落检查已关闭（配置）——本任务跳过该阶段（含机械分段兜底）")
+            long_checked, long_fixed = 0, 0
+
         # 归属抽样（机械旁白合并之前——重判可把 NARRATOR 条改成角色条，合并必须看到
         # 改后 speaker）：按 spot_check_rate 从全部条目抽 1/3 纯随机（整书错误率仪表）
         # + 2/3 风险加权（特征数级联），用捆绑重判提示词 + 共享重判批协议重判，
@@ -2441,6 +2776,48 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
         all_entries, spot_stats = spot_check_speakers(
             handle, llm, generation, all_entries, spot_rate, rng,
         )
+
+        # 纯标点条目吸收（确定性零 LLM 成本；必须在超长机械分段**之前**——吸收把
+        # 「……」拼进邻接 NARRATOR 可能把它推过上限，随后的机械分段兜底切回：
+        # 顺序反了会产生吸收后的超长条目无人兜底）：整条无词字符的条目（独立
+        # 「……」/「？」）并入相邻 NARRATOR（前邻优先，标题守卫），无邻接则删除。
+        if generation.absorb_punct_entries:
+            all_entries, punct_absorbed, punct_deleted = absorb_punct_entries(
+                all_entries, is_chapter_title,
+            )
+            if punct_absorbed or punct_deleted:
+                handle.log(
+                    f"纯标点条目吸收：并入相邻 NARRATOR {punct_absorbed} 条、"
+                    f"无 NARRATOR 邻接删除 {punct_deleted} 条（零 LLM 成本）"
+                )
+            else:
+                # 零命中也留一行日志：与其余阶段同一纪律——静默退出会被误读成阶段缺失。
+                handle.log("纯标点条目吸收：0 条无内容条目（无吸收 / 无删除，零 LLM 调用）")
+        else:
+            # 开关关闭：整体跳过并留一行日志，结果字段保持 0。
+            handle.log("纯标点条目吸收已关闭（配置）——本任务跳过该阶段")
+            punct_absorbed, punct_deleted = 0, 0
+
+        # 超长段落检查·机械分段兜底（管线末段，吸收之后——speaker 已定稿，切段
+        # 只继承父条目 speaker / instruct；硬保证：最终没有任何条目超过
+        # max_paragraph_chars。切出的相邻段之和 > max > 100，不会被随后的
+        # 相邻旁白合并回粘——<100 合并条件不可能回粘）。
+        if generation.check_long_paragraphs:
+            all_entries, long_split = split_long_entries(
+                all_entries, max_para, is_chapter_title,
+            )
+            if long_split:
+                handle.log(
+                    f"超长段落机械分段：{long_split} 条 LLM 重切后仍超 {max_para} 字的"
+                    f"条目已按句界 / 子句界 / 定宽切开"
+                    f"（硬保证：最终无 {max_para} 字以上条目）"
+                )
+            else:
+                handle.log(
+                    f"超长段落机械分段：0 条仍超 {max_para} 字（无分段；硬保证已满足）"
+                )
+        else:
+            long_split = 0
 
         # 机械后处理：相邻旁白合并（确定性，不经 LLM；章标题两侧不合并）——去掉 TTS
         # 会在相邻旁白之间多插的同人停顿与段边界。
@@ -2484,6 +2861,15 @@ def generate_file(handle, path, llm: LLMConfig, prompts: PromptsConfig, generati
             "suspicious_fixed": suspicious_fixed,
             # 纯归属标签清理：确定性删除的独立短标签条数（零 LLM 成本；开关关闭时为 0）
             "tags_deleted": tags_deleted,
+            # 超长段落检查（LLM 重切 + 机械分段兜底；check_long_paragraphs 关闭时全 0）
+            # —— long_checked = 送 LLM 的超长条目数、long_fixed = 经投票替换条数、
+            # long_split = 机械切分的条目数（机械分段恒在 LLM 重切之后运行）
+            "long_checked": long_checked,
+            "long_fixed": long_fixed,
+            "long_split": long_split,
+            # 纯标点条目吸收（零 LLM 成本；absorb_punct_entries 关闭时为 0）
+            "punct_absorbed": punct_absorbed,
+            "punct_deleted": punct_deleted,
             "speakers": speakers,
             # 归属抽样（解析任务自有的基文件内修正，不违反「检查阶段不改写基文件」）
             "spot_checked": spot_stats["checked"],

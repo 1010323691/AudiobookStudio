@@ -198,6 +198,18 @@ class GenerationConfig(BaseModel):
     check_batch_size: int = 20
     check_context_window: int = 4
 
+    # 超长段落检查（解析内第五阶段，LLM 重切 + 机械分段兜底）：
+    # 超过 ``max_paragraph_chars`` 字的条目 = 疑似切割失败 → 先带上下文窗口重跑 LLM
+    # 语义重切（复用重判批协议；同人长独白过不了忠实性门 = 保留原样），之后无论是否
+    # 改过都过一道确定性机械分段，硬保证最终没有任何条目超过该字数。
+    check_long_paragraphs: bool = True
+    # 硬上限（字数 = strip 后 Unicode 码点数）：任何条目（含 LLM 重切后的单条）
+    # 最终不得超过此值——机械分段兜底保证。
+    max_paragraph_chars: int = 200
+    # 纯标点条目吸收（解析内第六阶段，确定性零 LLM 成本）：整条无任何词字符的条目
+    # （独立「……」/「？」等）并入相邻 NARRATOR 条目（标题守卫），无 NARRATOR 邻接则删除。
+    absorb_punct_entries: bool = True
+
 
 class AppConfig(BaseModel):
     # NOTE: the ``book`` section (target_chars) was removed with the switch to

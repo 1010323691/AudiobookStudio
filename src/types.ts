@@ -562,6 +562,15 @@ export interface AppConfig {
     check_batch_size: number
     /** 解析内重判上下文窗口（角色匹配检查 / 断句失败校验 / 归属抽样共用）；不在设置页露出。 */
     check_context_window: number
+    /** 超长段落检查开关（解析内阶段 A）：超长条目先 LLM 语义重切、后机械分段兜底；
+     *  关闭 = 整体跳过（含机械分段），最终不保证字数上界。 */
+    check_long_paragraphs: boolean
+    /** 段落硬上限（字数 = strip 后 Unicode 码点数）：任何条目最终不得超过此值，
+     *  由超长段落检查的机械分段兜底保证。 */
+    max_paragraph_chars: number
+    /** 纯标点条目吸收开关（解析内阶段 B，确定性零 LLM 成本）：无词字符条目并入相邻
+     *  NARRATOR（标题守卫），无邻接则删除。 */
+    absorb_punct_entries: boolean
   }
   ui: {
     theme: string

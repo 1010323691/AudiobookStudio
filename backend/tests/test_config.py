@@ -86,6 +86,16 @@ def test_generation_config_check_stage_defaults():
     assert g.check_batch_size == 20
     assert g.check_context_window == 4
     assert g.spot_check_rate == 0.05
+    # 超长段落检查（LLM 重切 + 机械分段兜底）/ 纯标点条目吸收 default ON + 200 字硬上限
+    assert g.check_long_paragraphs is True
+    assert g.max_paragraph_chars == 200
+    assert g.absorb_punct_entries is True
+    # round-trip（自定义值不丢）
+    g2 = GenerationConfig(**json.loads(
+        json.dumps(g.model_dump(), ensure_ascii=False)))
+    assert g2.check_long_paragraphs is g.check_long_paragraphs
+    assert g2.max_paragraph_chars == g.max_paragraph_chars
+    assert g2.absorb_punct_entries is g.absorb_punct_entries
 
 
 # --------------------------------------------------------------------------- #
